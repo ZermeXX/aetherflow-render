@@ -1,52 +1,44 @@
-name: 4K Ambience Seamless Render Engine
+name: AetherFlow 4K Cloud Renderer (FFmpeg + Google Drive)
 
 on:
-workflow_dispatch:
+  workflow_dispatch:
     inputs:
       manifest_json:
-        description: 'Параметры рендера в формате JSON (манифест из приложения)'
+        description: 'Complete pipeline manifest JSON (escaped or base64)'
         required: false
         default: '{}'
+        type: string
       resolution:
-        description: 'Разрешение видео'
+        description: 'Render resolution (e.g. 3840x2160 for 4K UHD)'
         required: false
         default: '3840x2160'
+        type: string
       duration_minutes:
-        description: 'Длительность в минутах'
+        description: 'Target loop duration in minutes'
         required: false
-        default: '180'
+        default: '60'
+        type: string
 
 jobs:
-  render:
+  render_and_upload:
     runs-on: ubuntu-latest
-    timeout-minutes: 360 # До 6 часов непрерывной работы бесплатного раннера GitHub
+    timeout-minutes: 360
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Установка системных утилит (FFmpeg 7+, jq, rclone)
+      - name: Install High-Performance FFmpeg, jq & rclone
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg jq rclone curl ca-certificates
+          sudo apt-get install -y ffmpeg jq rclone curl bc python3 ca-certificates
 
-      - name: Парсинг параметров манифеста
-        id: parse_manifest
+      - name: Parse Manifest & Download Scene Media Assets
         run: |
-          echo '${{ github.event.inputs.manifest_json }}' > manifest.json
+          echo "Decoding and writing manifest.json..."
+          echo '${{ inputs.manifest_json }}' > manifest.json
           cat manifest.json
           
-          # Извлекаем параметры хронометража и ссылок
-          DURATION_HOURS=$(jq -r '.duration_hours // 3' manifest.json)
-          GDRIVE_FOLDER_ID=$(jq -r '.gdrive_folder_id' manifest.json)
-          SHUFFLE_MODE=$(jq -r '.shuffle_mode // false' manifest.json)
-          
-          echo "DURATION_HOURS=$DURATION_HOURS" >> $GITHUB_ENV
-          echo "GDRIVE_FOLDER_ID=$GDRIVE_FOLDER_ID" >> $GITHUB_ENV
-          echo "SHUFFLE_MODE=$SHUFFLE_MODE" >> $GITHUB_ENV
-
-      - name: Скачивание исходных медиафайлов (Видео + 3 слоя Аудио)
-        run: |
           mkdir -p raw_scenes audio_layers output
           
           # Парсим и скачиваем видео-фрагменты сцен
@@ -56,7 +48,7 @@ jobs:
             fi
           done
           
-          # Скачиваем аудиодорожки (Слой 1: Музыка, Слой 2: Фоновый шум, Слой 3: SFX)
+          # Скачиваем дорожки аудиомикшера
           MUSIC_URL=$(jq -r '.audio.music_url // empty' manifest.json)
           AMBIENCE_URL=$(jq -r '.audio.ambience_url // empty' manifest.json)
           SFX_URL=$(jq -r '.audio.sfx_url // empty' manifest.json)
@@ -65,35 +57,35 @@ jobs:
           [ -n "$AMBIENCE_URL" ] && curl -sL "$AMBIENCE_URL" -o audio_layers/ambience.mp3 || touch audio_layers/ambience.mp3
           [ -n "$SFX_URL" ] && curl -sL "$SFX_URL" -o audio_layers/sfx.mp3 || touch audio_layers/sfx.mp3
 
-      - name: Генерация бесшовного видеоцикла (Seamless Looping & Crossfade)
+      - name: Assemble 4K Master Video with Seamless XFade & Audio Normalization
         run: |
-          echo "Создание бесшовного базового видеофрагмента..."
+          echo "Executing FFmpeg 4K Master Assembly..."
           
-          # Берем первое сгенерированное видео (или склеиваем сцены, если их несколько)
-          FIRST_SCENE=$(ls raw_scenes/*.mp4 | head -n 1)
+          # Проверяем наличие скачанных сцен; если пусто — создаем тестовый фон под выбранное разрешение
+          FIRST_SCENE=$(ls raw_scenes/*.mp4 2>/dev/null | head -n 1)
           
-          # 1. Алгоритм Seamless Crossfade:
-          # Берем исходный ролик, отрезаем последние 1.5 секунды и плавно накладываем их на самое начало.
-          # В результате место склейки при зацикливании становится абсолютно незаметным.
-          SCENE_DUR=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$FIRST_SCENE")
-          OFFSET=$(echo "$SCENE_DUR - 1.5" | bc -l)
-          
-          ffmpeg -y -i "$FIRST_SCENE" \
-            -filter_complex "[0:v]split=2[v1][v2]; \
-                             [v1]trim=start=1.5,setpts=PTS-STARTPTS[main]; \
-                             [v2]trim=0:1.5,setpts=PTS-STARTPTS[head]; \
-                             [main][head]xfade=transition=fade:duration=1.5:offset=$OFFSET[seamless]" \
-            -map "[seamless]" -c:v libx264 -crf 17 -preset fast output/seamless_base.mp4
+          if [ -n "$FIRST_SCENE" ]; then
+            echo "Processing video asset: $FIRST_SCENE"
+            SCENE_DUR=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$FIRST_SCENE")
+            OFFSET=$(echo "$SCENE_DUR - 1.5" | bc -l)
+            
+            # Круговой кроссфейд для бесшовного зацикливания
+            ffmpeg -y -i "$FIRST_SCENE" \
+              -filter_complex "[0:v]split=2[v1][v2]; \
+                               [v1]trim=start=1.5,setpts=PTS-STARTPTS[main]; \
+                               [v2]trim=0:1.5,setpts=PTS-STARTPTS[head]; \
+                               [main][head]xfade=transition=fade:duration=1.5:offset=$OFFSET[seamless]" \
+              -map "[seamless]" -c:v libx264 -crf 17 -preset fast output/base_video.mp4
+          else
+            echo "No scene URL found, generating ultra-high bitrate test canvas..."
+            ffmpeg -y -f lavfi -i color=c=0x08090C:s=${{ inputs.resolution }}:r=60 -t 10 -c:v libx264 -preset veryfast -crf 18 output/base_video.mp4
+          fi
 
-      - name: Микширование 3 аудио-слоев (Suno + Freesound + ElevenLabs SFX)
-        run: |
-          echo "Сведение звукового окружения..."
-          
+          # Сведение 3 аудио-слоев
           VOL_MUSIC=$(jq -r '.audio.vol_music // "0.4"' manifest.json)
           VOL_AMB=$(jq -r '.audio.vol_ambience // "0.8"' manifest.json)
           VOL_SFX=$(jq -r '.audio.vol_sfx // "0.5"' manifest.json)
           
-          # Сводим 3 слоя с индивидуальными уровнями громкости и мягким циклом
           ffmpeg -y \
             -stream_loop -1 -i audio_layers/music.mp3 \
             -stream_loop -1 -i audio_layers/ambience.mp3 \
@@ -104,32 +96,39 @@ jobs:
                              [a0][a1][a2]amix=inputs=3:duration=longest:dropout_transition=3[aout]" \
             -map "[aout]" -c:a aac -b:a 320k output/mixed_audio.aac -t 60
 
-      - name: Финальная сборка 4K мастер-файла на нужный хронометраж
-        run: |
-          TARGET_SECONDS=$(echo "${{ env.DURATION_HOURS }} * 3600" | bc)
-          echo "Рендеринг финального фильма длительностью ${{ env.DURATION_HOURS }} ч. ($TARGET_SECONDS сек)..."
+          # Финальная сборка на требуемый хронометраж (в минутах)
+          TARGET_SECONDS=$(echo "${{ inputs.duration_minutes }} * 60" | bc)
+          echo "Rendering final target duration: $TARGET_SECONDS seconds..."
           
-          # Зацикливаем бесшовный видеопоток и сведенный аудиопоток до целевой длины
           ffmpeg -y \
-            -stream_loop -1 -i output/seamless_base.mp4 \
+            -stream_loop -1 -i output/base_video.mp4 \
             -stream_loop -1 -i output/mixed_audio.aac \
             -t "$TARGET_SECONDS" \
             -c:v copy \
             -c:a copy \
             -movflags +faststart \
-            output/final_ambience_${{ env.DURATION_HOURS }}h.mp4
+            aetherflow_master_4k.mp4
 
-      - name: Настройка авторизации Google Drive через Service Account / OAuth
+      - name: Upload Master Video to Google Drive (5 TB Storage Tier)
         env:
           RCLONE_CONF: ${{ secrets.RCLONE_CONFIG }}
         run: |
+          echo "Configuring rclone credentials..."
           mkdir -p ~/.config/rclone
           echo "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
+          
+          GDRIVE_FOLDER_ID=$(jq -r '.gdrive_folder_id // empty' manifest.json)
+          
+          echo "Uploading aetherflow_master_4k.mp4 to Google Drive..."
+          if [ -n "$GDRIVE_FOLDER_ID" ]; then
+            rclone copy aetherflow_master_4k.mp4 "gdrive:" --drive-root-folder-id "$GDRIVE_FOLDER_ID" --progress
+          else
+            rclone copy aetherflow_master_4k.mp4 "gdrive:AetherFlow_Cinema/" --progress
+          fi
+          echo "✓ Successfully uploaded to Google Drive!"
 
-      - name: Выгрузка готового 4K фильма на Google Drive
-        run: |
-          echo "Загрузка фильма в Google Drive Workspace..."
-          rclone copy output/final_ambience_${{ env.DURATION_HOURS }}h.mp4 "gdrive:__app_folder_id__" \
-            --drive-root-folder-id "${{ env.GDRIVE_FOLDER_ID }}" \
-            --progress --transfers 4 --checkers 8
-          echo "✓ Фильм успешно загружен на ваш Google Drive!"
+      - name: Archive Production Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aetherflow-master-4k
+          path: aetherflow_master_4k.mp4
