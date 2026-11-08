@@ -3,13 +3,9 @@ name: AetherCombine 4K Heavy Loop to Google Drive
 on:
   workflow_dispatch:
     inputs:
-      hours:
-        description: 'Loop Duration (3 to 10 hours)'
-        required: true
-        default: '3'
       manifest_payload:
-        description: 'Base64 JSON Manifest'
-        required: false
+        description: 'Base64 Encoded JSON Manifest'
+        required: true
       gdrive_folder_id:
         description: 'Target Google Drive Folder ID'
         required: false
@@ -17,27 +13,64 @@ on:
 jobs:
   render_and_upload:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Setup FFmpeg
-        uses: FedericoCarboni/setup-ffmpeg@v3
-        with:
-          ffmpeg-version: release
-
-      - name: Install Rclone
+      - name: Install FFmpeg & Rclone
         run: |
           sudo apt-get update
-          sudo apt-get install -y rclone
+          sudo apt-get install -y ffmpeg rclone python3-pip
 
-      - name: Run FFmpeg Loop Render
+      - name: Setup Service Account for Rclone
+        env:
+          SA_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
         run: |
-          echo "Workflow render_loop.yml started successfully."
+          echo "$SA_JSON" > /tmp/sa_key.json
+          mkdir -p ~/.config/rclone
+          cat <<EOF > ~/.config/rclone/rclone.conf
+          [gdrive]
+          type = drive
+          scope = drive
+          service_account_file = /tmp/sa_key.json
+          EOF
 
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: render-log
-          path: "*.log"
+      - name: Parse Manifest & Download Assets
+        id: parse_step
+        env:
+          PAYLOAD: ${{ github.event.inputs.manifest_payload }}
+        run: |
+          python3 -c "
+          import base64, json, os
+
+          payload = os.environ.get('PAYLOAD', '')
+          data = json.loads(base64.b64decode(payload).decode('utf-8'))
+
+          with open('manifest.json', 'w') as f:
+              json.dump(data, f, indent=2)
+
+          folder_id = data.get('cloud_export', {}).get('target_folder_id', '')
+          output_name = data.get('export_settings', {}).get('output_filename', 'output_master.mp4')
+
+          with open(os.environ['GITHUB_ENV'], 'a') as env_file:
+              env_file.write(f'TARGET_FOLDER_ID={folder_id}\n')
+              env_file.write(f'OUTPUT_FILENAME={output_name}\n')
+          "
+
+      - name: Download Source Clips from Google Drive
+        run: |
+          echo "Синхронизация исходных клипов из Google Drive папки $TARGET_FOLDER_ID..."
+          mkdir -p input_clips
+          rclone copy gdrive: input_clips/ --drive-root-folder-id "$TARGET_FOLDER_ID" --include "*.mp4" -v
+
+      - name: Build and Run FFmpeg Pipeline
+        run: |
+          python3 assemble_pipeline.py
+
+      - name: Stream Output to Google Drive
+        run: |
+          echo "Выгрузка готового мастера $OUTPUT_FILENAME в Google Drive..."
+          rclone copy "$OUTPUT_FILENAME" gdrive: --drive-root-folder-id "$TARGET_FOLDER_ID" -P
+          rm -f /tmp/sa_key.json
