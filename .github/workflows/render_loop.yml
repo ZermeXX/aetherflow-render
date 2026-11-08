@@ -3,12 +3,12 @@ name: AetherCombine 4K Heavy Loop to Google Drive
 on:
   workflow_dispatch:
     inputs:
+      release_tag:
+        description: 'GitHub Release Tag with Assets'
+        required: false
       manifest_payload:
         description: 'Base64 Encoded JSON Manifest'
         required: true
-      gdrive_folder_id:
-        description: 'Target Google Drive Folder ID'
-        required: false
 
 jobs:
   render_and_upload:
@@ -19,26 +19,12 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Install FFmpeg & Rclone
+      - name: Install FFmpeg & Python
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg rclone python3-pip
+          sudo apt-get install -y ffmpeg python3
 
-      - name: Setup Service Account for Rclone
-        env:
-          SA_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
-        run: |
-          echo "$SA_JSON" > /tmp/sa_key.json
-          mkdir -p ~/.config/rclone
-          cat <<EOF > ~/.config/rclone/rclone.conf
-          [gdrive]
-          type = drive
-          scope = drive
-          service_account_file = /tmp/sa_key.json
-          EOF
-
-      - name: Parse Manifest & Download Assets
-        id: parse_step
+      - name: Parse Manifest
         env:
           PAYLOAD: ${{ github.event.inputs.manifest_payload }}
         run: |
@@ -48,29 +34,38 @@ jobs:
           payload = os.environ.get('PAYLOAD', '')
           data = json.loads(base64.b64decode(payload).decode('utf-8'))
 
-          with open('manifest.json', 'w') as f:
+          with open('manifest.json', 'w', encoding='utf-8') as f:
               json.dump(data, f, indent=2)
 
-          folder_id = data.get('cloud_export', {}).get('target_folder_id', '')
-          output_name = data.get('export_settings', {}).get('output_filename', 'output_master.mp4')
-
+          output_name = data.get('export_settings', {}).get('output_filename', 'SN_FINAL_Metel_3h_16x9.mp4')
           with open(os.environ['GITHUB_ENV'], 'a') as env_file:
-              env_file.write(f'TARGET_FOLDER_ID={folder_id}\n')
               env_file.write(f'OUTPUT_FILENAME={output_name}\n')
           "
 
-      - name: Download Source Clips from Google Drive
+      - name: Download Clips from Release Buffer
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.inputs.release_tag }}
         run: |
-          echo "Синхронизация исходных клипов из Google Drive папки $TARGET_FOLDER_ID..."
           mkdir -p input_clips
-          rclone copy gdrive: input_clips/ --drive-root-folder-id "$TARGET_FOLDER_ID" --include "*.mp4" -v
+          if [ -n "$TAG" ]; then
+            echo "Скачивание исходных клипов из временного буфера релиза $TAG..."
+            gh release download "$TAG" --dir input_clips --repo ${{ github.repository }}
+          else
+            echo "Тег релиза не передан, поиск файлов в локальном репозитории..."
+          fi
+          ls -la input_clips/
 
       - name: Build and Run FFmpeg Pipeline
         run: |
           python3 assemble_pipeline.py
 
-      - name: Stream Output to Google Drive
+      - name: Upload Output Video to GitHub Release
+        if: github.event.inputs.release_tag != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.inputs.release_tag }}
         run: |
-          echo "Выгрузка готового мастера $OUTPUT_FILENAME в Google Drive..."
-          rclone copy "$OUTPUT_FILENAME" gdrive: --drive-root-folder-id "$TARGET_FOLDER_ID" -P
-          rm -f /tmp/sa_key.json
+          echo "Прикрепление готового мастера к релизу $TAG..."
+          gh release upload "$TAG" "$OUTPUT_FILENAME" --clobber --repo ${{ github.repository }}
+          echo "Готово! Видео доступно для скачивания на вкладке Releases."
