@@ -1,0 +1,43 @@
+name: AetherCombine 4K Heavy Loop to Google Drive
+
+on:
+  workflow_dispatch:
+    inputs:
+      hours:
+        description: 'Loop Duration (3 to 10 hours)'
+        required: true
+        default: '3'
+      manifest_payload:
+        description: 'Base64 JSON Manifest'
+        required: false
+      gdrive_folder_id:
+        description: 'Target Google Drive Folder ID'
+        required: false
+
+jobs:
+  render_and_upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup FFmpeg
+        uses: FedericoCarboni/setup-ffmpeg@v3
+        with:
+          ffmpeg-version: release
+
+      - name: Install Rclone
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rclone
+
+      - name: Run FFmpeg Loop Render
+        run: |
+          echo "Workflow render_loop.yml started successfully."
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: render-log
+          path: "*.log"
