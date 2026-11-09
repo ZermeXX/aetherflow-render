@@ -3,13 +3,14 @@ name: AetherCombine 4K Heavy Loop to Google Drive
 on:
   workflow_dispatch:
     inputs:
-      manifest_json:
-        description: 'JSON манифест сборки напрямую из студии'
-        required: true
-        type: string
-      gdrive_folder_id:
-        description: 'ID папки Google Drive с исходниками и для выгрузки'
+      release_tag:
+        description: 'Tag of GitHub Release buffer (optional)'
         required: false
+        default: 'none'
+        type: string
+      manifest_payload:
+        description: 'Base64 encoded manifest payload from Studio'
+        required: true
         type: string
 
 jobs:
@@ -19,34 +20,46 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Install FFmpeg & Python
+      - name: Install FFmpeg, Python & Rclone
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg python3-pip rclone
+          sudo apt-get install -y ffmpeg python3-pip rclone jq
 
-      - name: Setup Rclone Config
+      - name: Decode Manifest Payload
+        run: |
+          echo "${{ inputs.manifest_payload }}" | base64 -d > current_manifest.json
+          echo "Декодированный манифест:"
+          cat current_manifest.json
+
+      - name: Setup User Rclone Config
         env:
           RCLONE_CONFIG_DATA: ${{ secrets.RCLONE_CONFIG_DATA }}
         run: |
           mkdir -p ~/.config/rclone
           echo "$RCLONE_CONFIG_DATA" > ~/.config/rclone/rclone.conf
 
-      - name: Prepare Manifest
-        run: |
-          cat << 'EOF' > current_manifest.json
-          ${{ inputs.manifest_json }}
-          EOF
-
-      - name: Sync Clips from Google Drive via Rclone
+      - name: Download Clips from Google Drive
         run: |
           mkdir -p input_clips
-          # Получаем ID папки из инпута или из самого манифеста
-          FOLDER_ID="${{ inputs.gdrive_folder_id }}"
+          # Извлекаем ID папки Google Drive из декодированного манифеста
+          FOLDER_ID=$(jq -r '.cloud_export.target_folder_id // empty' current_manifest.json)
           if [ -z "$FOLDER_ID" ]; then
-            FOLDER_ID=$(python3 -c "import json; m=json.load(open('current_manifest.json')); print(m.get('cloud_export', {}).get('target_folder_id', ''))")
+            echo "Папка Google Drive не найдена в манифесте, проверяем аргументы..."
+          else
+            echo "Скачиваем исходные ролики из Google Drive (папка: $FOLDER_ID)..."
+            rclone copy "gdrive:{$FOLDER_ID}" ./input_clips/ --include "*.mp4" -v || true
           fi
-          echo "Скачиваем исходные ролики из Google Drive папки $FOLDER_ID..."
-          rclone copy "gdrive:{$FOLDER_ID}" ./input_clips/ --include "*.mp4" -v
+
+      - name: Download Clips from Release Buffer (Fallback)
+        if: inputs.release_tag != 'none' && inputs.release_tag != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Проверка релиз-буфера ${{ inputs.release_tag }}..."
+          gh release download "${{ inputs.release_tag }}" --dir ./input_clips || true
+
+      - name: Check Input Files
+        run: |
           echo "Файлы в input_clips:"
           ls -la ./input_clips/
 
@@ -56,9 +69,10 @@ jobs:
 
       - name: Upload Output Video to Google Drive
         run: |
-          FOLDER_ID="${{ inputs.gdrive_folder_id }}"
-          if [ -z "$FOLDER_ID" ]; then
-            FOLDER_ID=$(python3 -c "import json; m=json.load(open('current_manifest.json')); print(m.get('cloud_export', {}).get('target_folder_id', ''))")
+          FOLDER_ID=$(jq -r '.cloud_export.target_folder_id // empty' current_manifest.json)
+          if [ -n "$FOLDER_ID" ]; then
+            echo "Выгрузка готового мастера в Google Drive..."
+            rclone copy ./output/ "gdrive:{$FOLDER_ID}" --include "*.mp4" -v
+          else
+            echo "ID целевой папки не задан, пропускаем выгрузку на диск."
           fi
-          echo "Выгрузка готового 3-часового файла в Google Drive..."
-          rclone copy ./output/ "gdrive:{$FOLDER_ID}" --include "*.mp4" -v
