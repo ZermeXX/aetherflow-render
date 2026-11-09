@@ -41,14 +41,24 @@ jobs:
       - name: Download Clips from Google Drive
         run: |
           mkdir -p input_clips
+
           # Извлекаем ID папки Google Drive из декодированного манифеста
           FOLDER_ID=$(jq -r '.cloud_export.target_folder_id // empty' current_manifest.json)
-          if [ -z "$FOLDER_ID" ]; then
-            echo "Папка Google Drive не найдена в манифесте, проверяем аргументы..."
-          else
-            echo "Скачиваем исходные ролики из Google Drive (папка: $FOLDER_ID)..."
-            rclone copy "gdrive:{$FOLDER_ID}" ./input_clips/ --include "*.mp4" -v || true
+          echo "Целевой ID папки Google Drive: '$FOLDER_ID'"
+
+          if [ -z "$FOLDER_ID" ] || [ "$FOLDER_ID" = "null" ]; then
+            echo "::error::ID папки Google Drive не найден в манифесте!"
+            exit 1
           fi
+
+          echo "Скачиваем исходные ролики из Google Drive..."
+          rclone copy "gdrive:" ./input_clips/ \
+            --drive-root-folder-id "$FOLDER_ID" \
+            --include "*.mp4" \
+            -v
+
+          echo "Файлы в папке input_clips после скачивания:"
+          ls -la ./input_clips/
 
       - name: Download Clips from Release Buffer (Fallback)
         if: inputs.release_tag != 'none' && inputs.release_tag != ''
@@ -60,8 +70,12 @@ jobs:
 
       - name: Check Input Files
         run: |
-          echo "Файлы в input_clips:"
+          echo "Итоговый список файлов для сборки:"
           ls -la ./input_clips/
+          if [ -z "$(ls -A ./input_clips/*.mp4 2>/dev/null)" ]; then
+            echo "::error::В папке input_clips нет файлов .mp4! Проверьте ID папки на Google Диске и загруженные файлы."
+            exit 1
+          fi
 
       - name: Build and Run FFmpeg Pipeline
         run: |
@@ -70,9 +84,12 @@ jobs:
       - name: Upload Output Video to Google Drive
         run: |
           FOLDER_ID=$(jq -r '.cloud_export.target_folder_id // empty' current_manifest.json)
-          if [ -n "$FOLDER_ID" ]; then
+          if [ -n "$FOLDER_ID" ] && [ "$FOLDER_ID" != "null" ]; then
             echo "Выгрузка готового мастера в Google Drive..."
-            rclone copy ./output/ "gdrive:{$FOLDER_ID}" --include "*.mp4" -v
+            rclone copy ./output/ "gdrive:" \
+              --drive-root-folder-id "$FOLDER_ID" \
+              --include "*.mp4" \
+              -v
           else
             echo "ID целевой папки не задан, пропускаем выгрузку на диск."
           fi
