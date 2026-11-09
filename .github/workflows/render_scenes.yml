@@ -1,0 +1,101 @@
+name: AetherCombine 60+ Scenes Montage to Google Drive
+
+on:
+  workflow_dispatch:
+    inputs:
+      manifest_payload:
+        description: 'Base64 encoded narrative manifest'
+        required: true
+        type: string
+
+jobs:
+  render_scenes_pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Tools (FFmpeg, Python, Rclone, jq)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg python3-pip rclone jq
+
+      - name: Decode Narrative Manifest
+        run: |
+          echo "${{ inputs.manifest_payload }}" | base64 -d > narrative_manifest.json
+          echo "Декодированный манифест сценария:"
+          cat narrative_manifest.json
+
+      - name: Setup Service Account Rclone
+        env:
+          SA_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          mkdir -p ~/.config/rclone
+          cat << 'EOF' > /home/runner/service_account.json
+          ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+          EOF
+
+          cat << 'EOF' > ~/.config/rclone/rclone.conf
+          [gdrive]
+          type = drive
+          scope = drive
+          service_account_file = /home/runner/service_account.json
+          EOF
+
+      - name: Download Scenes & Audio from Google Drive
+        run: |
+          mkdir -p input_scenes
+          FOLDER_ID=$(jq -r '.cloud_export.target_folder_id // empty' narrative_manifest.json)
+          echo "Целевая папка Google Drive: $FOLDER_ID"
+
+          if [ -z "$FOLDER_ID" ] || [ "$FOLDER_ID" = "null" ]; then
+            echo "::error::ID целевой папки Google Drive не найден в манифесте!"
+            exit 1
+          fi
+
+          echo "Скачивание исходных сцен и аудио..."
+          rclone copy "gdrive:" ./input_scenes/ \
+            --drive-root-folder-id "$FOLDER_ID" \
+            --include "*.mp4" \
+            --include "*.mp3" \
+            --include "*.wav" \
+            -v
+
+          echo "Список скачанных исходников:"
+          ls -la ./input_scenes/
+
+      - name: Run 60+ Scenes Assembly Pipeline
+        run: |
+          python3 assemble_scenes.py narrative_manifest.json
+
+      - name: Upload Output Video to Google Drive
+        run: |
+          FOLDER_ID=$(jq -r '.cloud_export.target_folder_id // empty' narrative_manifest.json)
+          echo "Выгрузка готового смонтированного видео в Google Drive..."
+          rclone copy ./output/ "gdrive:" \
+            --drive-root-folder-id "$FOLDER_ID" \
+            --include "*.mp4" \
+            -v
+
+      - name: Clean Source Files from Google Drive
+        if: success()
+        run: |
+          FOLDER_ID=$(jq -r '.cloud_export.target_folder_id // empty' narrative_manifest.json)
+          echo "Монтаж завершен. Удаление мелких исходных файлов с Google Диска..."
+          python3 -c "
+          import json, subprocess
+
+          with open('narrative_manifest.json', 'r', encoding='utf-8') as f:
+              data = json.load(f)
+
+          files = [s.get('file_name') for s in data.get('scenes', []) if s.get('file_name')]
+          audio = data.get('master_audio') or data.get('audio_track', {}).get('file_name')
+          if audio:
+              files.append(audio)
+
+          folder_id = '$FOLDER_ID'
+          for fname in set(files):
+              print(f'Удаление из Google Drive: {fname}')
+              subprocess.run(['rclone', 'deletefile', f'gdrive:{fname}', '--drive-root-folder-id', folder_id], check=False)
+          "
+          echo "Очистка завершена. На Диске сохранен только финальный фильм."
