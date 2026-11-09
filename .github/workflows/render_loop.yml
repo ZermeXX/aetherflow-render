@@ -31,18 +31,29 @@ jobs:
           echo "Декодированный манифест:"
           cat current_manifest.json
 
-      - name: Setup User Rclone Config
+      - name: Setup Service Account Rclone Config
         env:
-          RCLONE_CONFIG_DATA: ${{ secrets.RCLONE_CONFIG_DATA }}
+          SA_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
         run: |
           mkdir -p ~/.config/rclone
-          echo "$RCLONE_CONFIG_DATA" > ~/.config/rclone/rclone.conf
+          # Сохраняем ключ сервисного аккаунта в файл
+          echo "$SA_JSON" > /home/runner/service_account.json
+          
+          # Автоматически генерируем конфиг rclone под сервисный аккаунт
+          cat << 'EOF' > ~/.config/rclone/rclone.conf
+          [gdrive]
+          type = drive
+          scope = drive
+          service_account_file = /home/runner/service_account.json
+          EOF
+          
+          echo "Проверка подключения Rclone:"
+          rclone listremotes
 
       - name: Download Clips from Google Drive
         run: |
           mkdir -p input_clips
 
-          # Извлекаем ID папки Google Drive из декодированного манифеста
           FOLDER_ID=$(jq -r '.cloud_export.target_folder_id // empty' current_manifest.json)
           echo "Целевой ID папки Google Drive: '$FOLDER_ID'"
 
@@ -57,7 +68,7 @@ jobs:
             --include "*.mp4" \
             -v
 
-          echo "Файлы в папке input_clips после скачивания:"
+          echo "Файлы в input_clips:"
           ls -la ./input_clips/
 
       - name: Download Clips from Release Buffer (Fallback)
@@ -73,7 +84,7 @@ jobs:
           echo "Итоговый список файлов для сборки:"
           ls -la ./input_clips/
           if [ -z "$(ls -A ./input_clips/*.mp4 2>/dev/null)" ]; then
-            echo "::error::В папке input_clips нет файлов .mp4! Проверьте ID папки на Google Диске и загруженные файлы."
+            echo "::error::В папке input_clips нет файлов .mp4! Проверьте, расшарена ли папка Google Drive на email сервисного аккаунта."
             exit 1
           fi
 
@@ -90,6 +101,4 @@ jobs:
               --drive-root-folder-id "$FOLDER_ID" \
               --include "*.mp4" \
               -v
-          else
-            echo "ID целевой папки не задан, пропускаем выгрузку на диск."
           fi
