@@ -36,18 +36,20 @@ jobs:
           SA_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
         run: |
           mkdir -p ~/.config/rclone
-          # Сохраняем ключ сервисного аккаунта в файл
-          echo "$SA_JSON" > /home/runner/service_account.json
-          
-          # Автоматически генерируем конфиг rclone под сервисный аккаунт
+          # Записываем сервисный аккаунт из секрета репозитория
+          cat << 'EOF' > /home/runner/service_account.json
+          ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+          EOF
+
+          # Формируем секцию gdrive
           cat << 'EOF' > ~/.config/rclone/rclone.conf
           [gdrive]
           type = drive
           scope = drive
           service_account_file = /home/runner/service_account.json
           EOF
-          
-          echo "Проверка подключения Rclone:"
+
+          echo "Доступные подключения Rclone:"
           rclone listremotes
 
       - name: Download Clips from Google Drive
@@ -68,7 +70,7 @@ jobs:
             --include "*.mp4" \
             -v
 
-          echo "Файлы в input_clips:"
+          echo "Файлы в папке input_clips:"
           ls -la ./input_clips/
 
       - name: Download Clips from Release Buffer (Fallback)
@@ -84,7 +86,7 @@ jobs:
           echo "Итоговый список файлов для сборки:"
           ls -la ./input_clips/
           if [ -z "$(ls -A ./input_clips/*.mp4 2>/dev/null)" ]; then
-            echo "::error::В папке input_clips нет файлов .mp4! Проверьте, расшарена ли папка Google Drive на email сервисного аккаунта."
+            echo "::error::В папке input_clips нет файлов .mp4! Проверьте, расшарена ли папка Google Drive (1OuuxKa85KAR-zz9TFXv6Ccg99fZ6JpuK) на email сервисного аккаунта."
             exit 1
           fi
 
