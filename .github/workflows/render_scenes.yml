@@ -12,13 +12,21 @@ jobs:
   render_scenes_pipeline:
     runs-on: ubuntu-latest
     steps:
+      - name: Free Disk Space on Runner
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          df -h
+
       - name: Checkout Repository
         uses: actions/checkout@v4
 
       - name: Install FFmpeg, Python & Rclone
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg python3-pip rclone jq
+          sudo apt-get install -y ffmpeg python3-pip rclone jq curl
 
       - name: Decode Narrative Manifest
         run: |
@@ -66,7 +74,7 @@ jobs:
             -v
 
           echo "Скачанные исходники:"
-          ls -la ./input_scenes/
+          ls -lh ./input_scenes/
 
       - name: Run Narrative Assembly Pipeline
         run: |
@@ -88,7 +96,7 @@ jobs:
         if: success()
         run: |
           FOLDER_ID=$(jq -r '.cloud_export.target_folder_id // empty' narrative_manifest.json)
-          echo "Монтаж завершен. Удаление исходных сцен и аудиофайла с Google Диска..."
+          echo "Удаление исходных сцен с Google Диска..."
           python3 -c "
           import json, subprocess
 
@@ -108,10 +116,17 @@ jobs:
           folder_id = '$FOLDER_ID'
           for fname in set(files_to_delete):
               print(f'Удаление исходника: {fname}')
-              subprocess.run([
-                  'rclone', 'deletefile',
-                  f'gdrive:{fname}',
-                  '--drive-root-folder-id', folder_id
-              ], check=False)
+              subprocess.run(['rclone', 'deletefile', f'gdrive:{fname}', '--drive-root-folder-id', folder_id], check=False)
           "
-          echo "Очистка завершена. Итоговый смонтированный 4K фильм сохранен на Диске."
+
+      - name: Send Telegram Notification
+        if: always()
+        run: |
+          STATUS="${{ job.status }}"
+          if [ "$STATUS" = "success" ]; then
+            MSG="🎬 *Повествовательный фильм 4K готов!*%0AСборка успешно завершена и залита на Google Диск."
+          else
+            MSG="❌ *Сбой сборки повествовательного видео!*%0AПроверьте логи шагов в GitHub Actions."
+          fi
+          curl -s -X POST "https://api.telegram.org/bot8913425031:AAHQwn0IYlobij4HElc0AsrXTRVjg8sf6Hc/sendMessage" \
+            -d "chat_id=360790056&text=${MSG}&parse_mode=Markdown" || true
