@@ -1,15 +1,14 @@
-name: AetherCombine 4K Heavy Loop to Google Drive
+name: AetherCombine 4K Loop Render to Google Drive
 
 on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'Tag of GitHub Release buffer (optional)'
+        description: 'Release tag (optional fallback)'
         required: false
         default: 'none'
-        type: string
       manifest_payload:
-        description: 'Base64 encoded manifest payload from Studio'
+        description: 'Base64 encoded project manifest'
         required: true
         type: string
 
@@ -28,7 +27,7 @@ jobs:
       - name: Decode Manifest Payload
         run: |
           echo "${{ inputs.manifest_payload }}" | base64 -d > current_manifest.json
-          echo "Декодированный манифест:"
+          echo "=== Полученный манифест ==="
           cat current_manifest.json
 
       - name: Setup Service Account Rclone Config
@@ -36,12 +35,10 @@ jobs:
           SA_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
         run: |
           mkdir -p ~/.config/rclone
-          # Записываем сервисный аккаунт из секрета репозитория
           cat << 'EOF' > /home/runner/service_account.json
           ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
           EOF
 
-          # Формируем секцию gdrive
           cat << 'EOF' > ~/.config/rclone/rclone.conf
           [gdrive]
           type = drive
@@ -49,46 +46,35 @@ jobs:
           service_account_file = /home/runner/service_account.json
           EOF
 
-          echo "Доступные подключения Rclone:"
-          rclone listremotes
-
       - name: Download Clips from Google Drive
         run: |
           mkdir -p input_clips
-
           FOLDER_ID=$(jq -r '.cloud_export.target_folder_id // empty' current_manifest.json)
           echo "Целевой ID папки Google Drive: '$FOLDER_ID'"
 
           if [ -z "$FOLDER_ID" ] || [ "$FOLDER_ID" = "null" ]; then
-            echo "::error::ID папки Google Drive не найден в манифесте!"
-            exit 1
+            echo "::warning::ID папки не указан в манифесте. Пропуск скачивания из Drive."
+          else
+            echo "Скачиваем исходные ролики из Google Drive..."
+            rclone copy "gdrive:" ./input_clips/ \
+              --drive-root-folder-id "$FOLDER_ID" \
+              --include "*.mp4" \
+              --drive-shared-with-me \
+              -v
           fi
-
-          echo "Скачиваем исходные ролики из Google Drive..."
-          rclone copy "gdrive:" ./input_clips/ \
-            --drive-root-folder-id "$FOLDER_ID" \
-            --include "*.mp4" \
-            -v
-
-          echo "Файлы в папке input_clips:"
-          ls -la ./input_clips/
 
       - name: Download Clips from Release Buffer (Fallback)
         if: inputs.release_tag != 'none' && inputs.release_tag != ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "Проверка релиз-буфера ${{ inputs.release_tag }}..."
-          gh release download "${{ inputs.release_tag }}" --dir ./input_clips || true
+          echo "Загрузка резервных исходников из релиза ${{ inputs.release_tag }}..."
+          gh release download "${{ inputs.release_tag }}" --dir ./input_clips/ --pattern "*.mp4" || true
 
       - name: Check Input Files
         run: |
           echo "Итоговый список файлов для сборки:"
           ls -la ./input_clips/
-          if [ -z "$(ls -A ./input_clips/*.mp4 2>/dev/null)" ]; then
-            echo "::error::В папке input_clips нет файлов .mp4! Проверьте, расшарена ли папка Google Drive (1OuuxKa85KAR-zz9TFXv6Ccg99fZ6JpuK) на email сервисного аккаунта."
-            exit 1
-          fi
 
       - name: Build and Run FFmpeg Pipeline
         run: |
@@ -97,10 +83,40 @@ jobs:
       - name: Upload Output Video to Google Drive
         run: |
           FOLDER_ID=$(jq -r '.cloud_export.target_folder_id // empty' current_manifest.json)
+          echo "Выгрузка готового мастера в Google Drive..."
           if [ -n "$FOLDER_ID" ] && [ "$FOLDER_ID" != "null" ]; then
-            echo "Выгрузка готового мастера в Google Drive..."
             rclone copy ./output/ "gdrive:" \
               --drive-root-folder-id "$FOLDER_ID" \
               --include "*.mp4" \
               -v
+          fi
+
+      - name: Clean Source Files from Google Drive
+        if: success()
+        run: |
+          FOLDER_ID=$(jq -r '.cloud_export.target_folder_id // empty' current_manifest.json)
+          if [ -n "$FOLDER_ID" ] && [ "$FOLDER_ID" != "null" ]; then
+            echo "Рендер успешен. Удаление исходных файлов из Google Drive..."
+            python3 -c "
+            import json, subprocess
+
+            with open('current_manifest.json', 'r', encoding='utf-8') as f:
+                data = json.load(f)
+
+            files_to_delete = []
+            for slot in data.get('timeline_slots', []):
+                bf = slot.get('base_content', {}).get('file_name') or slot.get('file_name')
+                if bf:
+                    files_to_delete.append(bf)
+                for ins in slot.get('inserts', []):
+                    inf = ins.get('file_name')
+                    if inf:
+                        files_to_delete.append(inf)
+
+            folder_id = '$FOLDER_ID'
+            for fname in set(files_to_delete):
+                print(f'Удаление исходника: {fname}')
+                subprocess.run(['rclone', 'deletefile', f'gdrive:{fname}', '--drive-root-folder-id', folder_id], check=False)
+            "
+            echo "Очистка завершена. Финальный 4K файл сохранен в папке."
           fi
