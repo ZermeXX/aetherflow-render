@@ -3,10 +3,6 @@ name: AetherCombine 4K Loop Render to Google Drive
 on:
   workflow_dispatch:
     inputs:
-      release_tag:
-        description: 'Release tag (optional fallback)'
-        required: false
-        default: 'none'
       manifest_payload:
         description: 'Base64 encoded project manifest'
         required: true
@@ -16,13 +12,21 @@ jobs:
   render_and_upload:
     runs-on: ubuntu-latest
     steps:
+      - name: Free Disk Space on Runner
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          df -h
+
       - name: Checkout Repository
         uses: actions/checkout@v4
 
       - name: Install FFmpeg, Python & Rclone
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg python3-pip rclone jq
+          sudo apt-get install -y ffmpeg python3-pip rclone jq curl
 
       - name: Decode Manifest Payload
         run: |
@@ -52,32 +56,25 @@ jobs:
           FOLDER_ID=$(jq -r '.cloud_export.target_folder_id // empty' current_manifest.json)
           echo "Целевой ID папки Google Drive: '$FOLDER_ID'"
 
-          if [ -z "$FOLDER_ID" ] || [ "$FOLDER_ID" = "null" ]; then
-            echo "::warning::ID папки не указан в манифесте. Пропуск скачивания из Drive."
-          else
-            echo "Скачиваем исходные ролики из Google Drive..."
-            rclone copy "gdrive:" ./input_clips/ \
-              --drive-root-folder-id "$FOLDER_ID" \
-              --include "*.mp4" \
-              --timeout 30s \
-              --contimeout 15s \
-              --retries 3 \
-              --low-level-retries 5 \
-              -v
+          if [ -z "$FOLDER_ID" ] \vert{}\vert{} [ "$FOLDER_ID" = "null" ]; then
+            echo "::error::ID папки не указан в манифесте!"
+            exit 1
           fi
 
-      - name: Download Clips from Release Buffer (Fallback)
-        if: inputs.release_tag != 'none' && inputs.release_tag != ''
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          echo "Загрузка резервных исходников из релиза ${{ inputs.release_tag }}..."
-          gh release download "${{ inputs.release_tag }}" --dir ./input_clips/ --pattern "*.mp4" || true
+          echo "Скачиваем исходные ролики..."
+          rclone copy "gdrive:" ./input_clips/ \
+            --drive-root-folder-id "$FOLDER_ID" \
+            --include "*.mp4" \
+            --include "*.mp3" \
+            --include "*.wav" \
+            --timeout 30s \
+            --contimeout 15s \
+            --retries 3 \
+            --low-level-retries 5 \
+            -v
 
-      - name: Check Input Files
-        run: |
-          echo "Итоговый список файлов для сборки:"
-          ls -la ./input_clips/
+          echo "Итоговый список файлов:"
+          ls -lh ./input_clips/
 
       - name: Build and Run FFmpeg Pipeline
         run: |
@@ -87,46 +84,49 @@ jobs:
         run: |
           FOLDER_ID=$(jq -r '.cloud_export.target_folder_id // empty' current_manifest.json)
           echo "Выгрузка готового мастера в Google Drive..."
-          if [ -n "$FOLDER_ID" ] && [ "$FOLDER_ID" != "null" ]; then
-            rclone copy ./output/ "gdrive:" \
-              --drive-root-folder-id "$FOLDER_ID" \
-              --include "*.mp4" \
-              --timeout 60s \
-              --contimeout 15s \
-              --retries 3 \
-              -v
-          fi
+          rclone copy ./output/ "gdrive:" \
+            --drive-root-folder-id "$FOLDER_ID" \
+            --include "*.mp4" \
+            --timeout 60s \
+            --contimeout 15s \
+            --retries 3 \
+            -v
 
       - name: Clean Source Files from Google Drive
         if: success()
         run: |
           FOLDER_ID=$(jq -r '.cloud_export.target_folder_id // empty' current_manifest.json)
-          if [ -n "$FOLDER_ID" ] && [ "$FOLDER_ID" != "null" ]; then
-            echo "Рендер успешен. Удаление исходных файлов из Google Drive..."
-            python3 -c "
-            import json, subprocess
+          echo "Удаление отработанных исходников..."
+          python3 -c "
+          import json, subprocess
 
-            with open('current_manifest.json', 'r', encoding='utf-8') as f:
-                data = json.load(f)
+          with open('current_manifest.json', 'r', encoding='utf-8') as f:
+              data = json.load(f)
 
-            files_to_delete = []
-            for slot in data.get('timeline_slots', []):
-                bf = slot.get('base_content', {}).get('file_name') or slot.get('file_name')
-                if bf:
-                    files_to_delete.append(bf)
-                for ins in slot.get('inserts', []):
-                    inf = ins.get('file_name')
-                    if inf:
-                        files_to_delete.append(inf)
+          files_to_delete = []
+          for slot in data.get('timeline_slots', []):
+              bf = slot.get('base_content', {}).get('file_name') or slot.get('file_name')
+              if bf:
+                  files_to_delete.append(bf)
+              for ins in slot.get('inserts', []):
+                  inf = ins.get('file_name')
+                  if inf:
+                      files_to_delete.append(inf)
 
-            folder_id = '$FOLDER_ID'
-            for fname in set(files_to_delete):
-                print(f'Удаление исходника: {fname}')
-                subprocess.run([
-                    'rclone', 'deletefile',
-                    f'gdrive:{fname}',
-                    '--drive-root-folder-id', folder_id
-                ], check=False)
-            "
-            echo "Очистка завершена. Финальный 4K файл сохранен в папке."
+          folder_id = '$FOLDER_ID'
+          for fname in set(files_to_delete):
+              print(f'Удаление исходника: {fname}')
+              subprocess.run(['rclone', 'deletefile', f'gdrive:{fname}', '--drive-root-folder-id', folder_id], check=False)
+          "
+
+      - name: Send Telegram Notification
+        if: always()
+        run: |
+          STATUS="${{ job.status }}"
+          if [ "$STATUS" = "success" ]; then
+            MSG="✅ *4K Ambient Loop собран и загружен!*%0AФайл сохранен на Google Диске, исходники очищены."
+          else
+            MSG="❌ *Ошибка рендеринга 4K Loop!*%0AПроверьте выполнение сборки в GitHub Actions."
           fi
+          curl -s -X POST "https://api.telegram.org/bot8913425031:AAHQwn0IYlobij4HElc0AsrXTRVjg8sf6Hc/sendMessage" \
+            -d "chat_id=360790056&text=${MSG}&parse_mode=Markdown" || true
