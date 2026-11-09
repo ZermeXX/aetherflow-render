@@ -59,7 +59,10 @@ jobs:
             rclone copy "gdrive:" ./input_clips/ \
               --drive-root-folder-id "$FOLDER_ID" \
               --include "*.mp4" \
-              --drive-shared-with-me \
+              --timeout 30s \
+              --contimeout 15s \
+              --retries 3 \
+              --low-level-retries 5 \
               -v
           fi
 
@@ -88,6 +91,9 @@ jobs:
             rclone copy ./output/ "gdrive:" \
               --drive-root-folder-id "$FOLDER_ID" \
               --include "*.mp4" \
+              --timeout 60s \
+              --contimeout 15s \
+              --retries 3 \
               -v
           fi
 
@@ -116,7 +122,11 @@ jobs:
             folder_id = '$FOLDER_ID'
             for fname in set(files_to_delete):
                 print(f'Удаление исходника: {fname}')
-                subprocess.run(['rclone', 'deletefile', f'gdrive:{fname}', '--drive-root-folder-id', folder_id], check=False)
+                subprocess.run([
+                    'rclone', 'deletefile',
+                    f'gdrive:{fname}',
+                    '--drive-root-folder-id', folder_id
+                ], check=False)
             "
             echo "Очистка завершена. Финальный 4K файл сохранен в папке."
           fi
