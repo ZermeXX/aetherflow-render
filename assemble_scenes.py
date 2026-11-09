@@ -17,7 +17,7 @@ def resolve_file(input_dir, filename):
     for f in os.listdir(input_dir):
         if f.lower() == filename.lower():
             return os.path.join(input_dir, f)
-    raise FileNotFoundError(f"Файл '{filename}' не найден в {input_dir}. В папке: {len(os.listdir(input_dir))} файлов.")
+    raise FileNotFoundError(f"Файл '{filename}' не найден в {input_dir}. Найдено файлов: {len(os.listdir(input_dir))}")
 
 def main():
     manifest_path = sys.argv[1] if len(sys.argv) > 1 else 'narrative_manifest.json'
@@ -40,18 +40,20 @@ def main():
     out_filename = export_settings.get('output_filename', 'FINAL_NARRATIVE_4K.mp4')
     final_output = os.path.join(output_dir, out_filename)
 
-    v_codec = export_settings.get('video_codec', 'libx265')
-    crf = str(export_settings.get('crf', 22))
+    # По умолчанию libx264 veryfast для быстрой обработки
+    v_codec = export_settings.get('video_codec', 'libx264')
+    preset = "veryfast" if v_codec == "libx264" else "ultrafast"
+    crf = str(export_settings.get('crf', 20 if v_codec == 'libx264' else 22))
 
-    print(f"=== Старт сквозного 4K-монтажа: {manifest.get('project_name', 'Narrative Movie')} ===", flush=True)
-    print(f"Всего сцен в таймлайне: {total_scenes}", flush=True)
+    print(f"=== Старт сквозного 4K-монтажа ({v_codec}): {manifest.get('project_name', 'Narrative Movie')} ===", flush=True)
+    print(f"Всего сцен: {total_scenes}", flush=True)
 
     if total_scenes == 0:
-        raise ValueError("Манифест не содержит ни одной сцены в массиве 'scenes'!")
+        raise ValueError("Манифест не содержит ни одной сцены!")
 
     rendered_scenes = []
 
-    # 1. Нормализация и апскейл каждого фрагмента в 4K 24fps
+    # 1. Быстрый апскейл каждой сцены в 4K 24fps
     for idx, sc in enumerate(scenes):
         scene_id = sc.get('scene_id', f'scene_{idx+1:03d}')
         fname = sc.get('file_name')
@@ -59,17 +61,16 @@ def main():
         scene_out = os.path.join(temp_dir, f"{scene_id}.mp4")
 
         in_file = resolve_file(input_dir, fname)
-        print(f"[{idx+1}/{total_scenes}] 4K-подготовка: {scene_id} -> {fname}", flush=True)
+        print(f"[{idx+1}/{total_scenes}] Подготовка: {scene_id} -> {fname}", flush=True)
 
         cmd = ["ffmpeg", "-y", "-i", in_file]
         if dur:
             cmd.extend(["-t", str(dur)])
 
-        # Приводим любой входящий ролик (720p/1080p/вертикальный) к строгому стандарту 4K 24fps без звука
         cmd.extend([
             "-vf", "scale=3840:2160:force_original_aspect_ratio=decrease,pad=3840:2160:(ow-iw)/2:(oh-ih)/2,fps=24",
             "-c:v", v_codec,
-            "-preset", "ultrafast",
+            "-preset", preset,
             "-crf", crf,
             "-an",
             scene_out
@@ -77,7 +78,7 @@ def main():
         run_cmd(cmd)
         rendered_scenes.append(scene_out)
 
-    # 2. Создание Concat-списка для мгновенной сборки полотна
+    # 2. Concat
     concat_list = os.path.join(temp_dir, "scenes_concat.txt")
     with open(concat_list, "w", encoding="utf-8") as f:
         for s in rendered_scenes:
@@ -85,7 +86,7 @@ def main():
             f.write(f"file '{abs_p}'\n")
 
     video_only = os.path.join(temp_dir, "all_scenes_4k_no_audio.mp4")
-    print(f"\n=== Склейка {total_scenes} сцен в единый видеоряд ===", flush=True)
+    print(f"\n=== Бесшовное объединение {total_scenes} сцен ===", flush=True)
     run_cmd([
         "ffmpeg", "-y",
         "-f", "concat",
@@ -95,7 +96,7 @@ def main():
         video_only
     ])
 
-    # 3. Наложение общей мастер-фонограммы (озвучка + саундтрек)
+    # 3. Наложение звука
     if audio_track:
         audio_file = resolve_file(input_dir, audio_track)
         print(f"\n=== Сведение с мастер-аудио: {audio_track} ===", flush=True)
@@ -115,7 +116,7 @@ def main():
             os.remove(final_output)
         os.rename(video_only, final_output)
 
-    # 4. Очистка временных промежуточных сцен для освобождения диска раннера
+    # Очистка временных файлов
     for s in rendered_scenes:
         try:
             os.remove(s)
@@ -127,8 +128,8 @@ def main():
         except OSError:
             pass
 
-    file_size_mb = os.path.getsize(final_output) / (1024 * 1024)
-    print(f"\n[ГОТОВО]: Финальный фильм ({total_scenes} сцен) успешно собран: {final_output} ({file_size_mb:.2f} МБ)", flush=True)
+    size_mb = os.path.getsize(final_output) / (1024 * 1024)
+    print(f"\n[ГОТОВО]: Фильм 4K успешно собран: {final_output} ({size_mb:.2f} МБ)", flush=True)
 
 if __name__ == '__main__':
     main()
