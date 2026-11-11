@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       target_hours:
-        description: 'Итоговая длительность видео (в часах)'
+        description: 'Target hours'
         required: false
         default: '3'
 
@@ -24,13 +24,11 @@ jobs:
           curl https://rclone.org/install.sh | sudo bash
 
       - name: Build and Run FFmpeg Pipeline
-        env:
-          INPUT_HOURS: ${{ github.event.inputs.target_hours }}
         run: |
           set -e
           mkdir -p temp_render
 
-          echo "=== 1. Рендеринг базового мастер-слота ==="
+          echo "=== 1. Render Base Slot ==="
           if [ -f "render_slot.sh" ]; then
             bash render_slot.sh
           elif [ -f "input_loop.mp4" ]; then
@@ -41,21 +39,21 @@ jobs:
             ffmpeg -y -f lavfi -i testsrc=size=3840x2160:rate=24 -f lavfi -i anullsrc=r=48000:cl=stereo -t 900 -c:v libx264 -preset fast -crf 20 -c:a aac temp_render/slot_master.mp4
           fi
 
-          echo "=== 2. Сборка бесшовного лупа (-c copy) ==="
+          echo "=== 2. Build Seamless Loop ==="
           SLOT_DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 temp_render/slot_master.mp4)
           SLOT_SECS=${SLOT_DURATION%.*}
           if [ -z "$SLOT_SECS" ] || [ "$SLOT_SECS" -le 0 ]; then
             SLOT_SECS=900
           fi
 
-          HOURS="${INPUT_HOURS}"
+          HOURS="${{ github.event.inputs.target_hours }}"
           if [ -z "$HOURS" ]; then
             HOURS=3
           fi
           TARGET_SECS=$(( HOURS * 3600 ))
 
           REPEATS=$(( (TARGET_SECS + SLOT_SECS - 1) / SLOT_SECS ))
-          echo "Длительность слота: ${SLOT_SECS} сек. Повторов для ${TARGET_SECS} сек: ${REPEATS}"
+          echo "Slot: ${SLOT_SECS}s. Repeats: ${REPEATS}"
 
           > temp_render/loop_list.txt
           for i in $(seq 1 $REPEATS); do
@@ -74,7 +72,7 @@ jobs:
 
       - name: Upload Output Video to Google Drive
         run: |
-          echo "=== Выгрузка на Google Диск ==="
+          echo "=== Uploading to Google Drive ==="
           rclone copy ./output.mp4 gdrive:AetherFlow_Output/ \
             --drive-chunk-size 64M \
             --transfers 2 \
@@ -86,19 +84,12 @@ jobs:
 
       - name: Send Telegram Notification
         if: always()
-        env:
-          JOB_STATUS: ${{ job.status }}
-          HOURS: ${{ github.event.inputs.target_hours }}
         run: |
-          H_VAL="$HOURS"
-          if [ -z "$H_VAL" ]; then
-            H_VAL="3"
-          fi
-
-          if [ "$JOB_STATUS" = "success" ]; then
-            MSG="✅ *3-часовой Loop успешно готов и выгружен!*%0A%0A📁 *Файл:* output.mp4%0A☁️ *Google Drive:* AetherFlow_Output%0A⏱️ *Длительность:* ${H_VAL} ч."
+          STATUS="${{ job.status }}"
+          if [ "$STATUS" = "success" ]; then
+            MSG="✅ *3-hour Loop successfully created and uploaded!*%0A%0A📁 File: output.mp4%0A☁️ Target: Google Drive / AetherFlow_Output"
           else
-            MSG="❌ *Ошибка рендера или выгрузки Loop!*%0A%0A⚠️ *Статус:* $JOB_STATUS%0A🔍 Проверьте вкладку Actions в GitHub."
+            MSG="❌ *Pipeline Failed!*%0A%0A⚠️ Status: $STATUS"
           fi
 
           curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
