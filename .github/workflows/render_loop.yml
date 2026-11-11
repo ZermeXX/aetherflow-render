@@ -1,132 +1,94 @@
-name: AetherCombine 4K Loop Render to Google Drive
+name: Render Loop Pipeline
 
 on:
   workflow_dispatch:
     inputs:
-      manifest_payload:
-        description: 'Base64 encoded project manifest'
-        required: true
-        type: string
+      target_hours:
+        description: 'Итоговая длительность видео (в часах)'
+        required: false
+        default: '3'
 
 jobs:
   render_and_upload:
     runs-on: ubuntu-latest
-    steps:
-      - name: Free Disk Space on Runner
-        run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          df -h
+    timeout-minutes: 360
 
+    steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Install FFmpeg, Python & Rclone
+      - name: Install Dependencies (FFmpeg & Rclone)
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg python3-pip rclone jq curl
-
-      - name: Decode Manifest Payload
-        run: |
-          echo "${{ inputs.manifest_payload }}" | base64 -d > current_manifest.json
-          echo "=== Полученный манифест ==="
-          cat current_manifest.json
-
-      - name: Setup Service Account Rclone Config
-        env:
-          SA_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
-        run: |
-          mkdir -p ~/.config/rclone
-          cat << 'EOF' > /home/runner/service_account.json
-          ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
-          EOF
-
-          cat << 'EOF' > ~/.config/rclone/rclone.conf
-          [gdrive]
-          type = drive
-          scope = drive
-          service_account_file = /home/runner/service_account.json
-          EOF
-
-      - name: Download Clips from Google Drive
-        run: |
-          mkdir -p input_clips
-          FOLDER_ID=$(jq -r '.cloud_export.target_folder_id // empty' current_manifest.json)
-          echo "Целевой ID папки Google Drive: '$FOLDER_ID'"
-
-          if [ -z "$FOLDER_ID" ] \vert{}\vert{} [ "$FOLDER_ID" = "null" ]; then
-            echo "::error::ID папки не указан в манифесте!"
-            exit 1
-          fi
-
-          echo "Скачиваем исходные ролики..."
-          rclone copy "gdrive:" ./input_clips/ \
-            --drive-root-folder-id "$FOLDER_ID" \
-            --include "*.mp4" \
-            --include "*.mp3" \
-            --include "*.wav" \
-            --timeout 30s \
-            --contimeout 15s \
-            --retries 3 \
-            --low-level-retries 5 \
-            -v
-
-          echo "Итоговый список файлов:"
-          ls -lh ./input_clips/
+          sudo apt-get install -y ffmpeg curl bc
+          curl https://rclone.org/install.sh | sudo bash
 
       - name: Build and Run FFmpeg Pipeline
         run: |
-          python3 assemble_pipeline.py current_manifest.json
+          set -e
+          mkdir -p temp_render output_dir
+
+          echo "=== ЭТАП 1: Рендеринг базового мастер-слота ==="
+          if [ -f "render_slot.sh" ]; then
+            bash render_slot.sh
+          elif [ -f "input_loop.mp4" ]; then
+            ffmpeg -y -i input_loop.mp4 -c:v libx264 -preset fast -crf 20 -c:a aac -b:a 320k temp_render/slot_master.mp4
+          elif [ -f "manifest.json" ] && [ -f "render_from_manifest.sh" ]; then
+            bash render_from_manifest.sh
+          else
+            # Тестовый слот на 15 минут (900 сек) в случае отсутствия внешних скриптов
+            ffmpeg -y -f lavfi -i testsrc=size=3840x2160:rate=24 -f lavfi -i anullsrc=r=48000:cl=stereo -t 900 -c:v libx264 -preset fast -crf 20 -c:a aac temp_render/slot_master.mp4
+          fi
+
+          echo "=== ЭТАП 2: Сборка бесшовного лупа (-c copy) ==="
+          SLOT_DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 temp_render/slot_master.mp4)
+          SLOT_SECS=${SLOT_DURATION%.*}
+          [ -z "$SLOT_SECS" ] || [ "$SLOT_SECS" -le 0 ] && SLOT_SECS=900
+
+          TARGET_SECS=$((${inputs.target_hours:-3} * 3600))
+          REPEATS=$(( (TARGET_SECS + SLOT_SECS - 1) / SLOT_SECS ))
+          echo "Сегмент: ${SLOT_SECS} сек. Повторов для ${TARGET_SECS} сек: ${REPEATS}"
+
+          > temp_render/loop_list.txt
+          for i in $(seq 1 $REPEATS); do
+            echo "file '$(pwd)/temp_render/slot_master.mp4'" >> temp_render/loop_list.txt
+          done
+
+          # Мгновенная склейка лупа без повторного сжатия видеоряда
+          ffmpeg -y -f concat -safe 0 -i temp_render/loop_list.txt -t $TARGET_SECS -c copy output.mp4
+
+          echo "Проверка итогового файла:"
+          ls -lh output.mp4
+
+      - name: Setup Personal Rclone Config
+        run: |
+          mkdir -p ~/.config/rclone
+          echo "${{ secrets.RCLONE_CONFIG }}" > ~/.config/rclone/rclone.conf
+          chmod 600 ~/.config/rclone/rclone.conf
+          rclone listremotes
 
       - name: Upload Output Video to Google Drive
         run: |
-          FOLDER_ID=$(jq -r '.cloud_export.target_folder_id // empty' current_manifest.json)
-          echo "Выгрузка готового мастера в Google Drive..."
-          rclone copy ./output/ "gdrive:" \
-            --drive-root-folder-id "$FOLDER_ID" \
-            --include "*.mp4" \
-            --timeout 60s \
-            --contimeout 15s \
-            --retries 3 \
+          echo "=== Выгрузка 3-часового видео на Google Диск ==="
+          rclone copy ./output.mp4 gdrive:AetherFlow_Output/ \
+            --drive-chunk-size 64M \
+            --transfers 2 \
+            --checkers 4 \
+            --retries 5 \
+            --low-level-retries 10 \
+            --stats 30s \
             -v
-
-      - name: Clean Source Files from Google Drive
-        if: success()
-        run: |
-          FOLDER_ID=$(jq -r '.cloud_export.target_folder_id // empty' current_manifest.json)
-          echo "Удаление отработанных исходников..."
-          python3 -c "
-          import json, subprocess
-
-          with open('current_manifest.json', 'r', encoding='utf-8') as f:
-              data = json.load(f)
-
-          files_to_delete = []
-          for slot in data.get('timeline_slots', []):
-              bf = slot.get('base_content', {}).get('file_name') or slot.get('file_name')
-              if bf:
-                  files_to_delete.append(bf)
-              for ins in slot.get('inserts', []):
-                  inf = ins.get('file_name')
-                  if inf:
-                      files_to_delete.append(inf)
-
-          folder_id = '$FOLDER_ID'
-          for fname in set(files_to_delete):
-              print(f'Удаление исходника: {fname}')
-              subprocess.run(['rclone', 'deletefile', f'gdrive:{fname}', '--drive-root-folder-id', folder_id], check=False)
-          "
 
       - name: Send Telegram Notification
         if: always()
         run: |
-          STATUS="${{ job.status }}"
-          if [ "$STATUS" = "success" ]; then
-            MSG="✅ *4K Ambient Loop собран и загружен!*%0AФайл сохранен на Google Диске, исходники очищены."
+          if [ "${{ job.status }}" == "success" ]; then
+            MSG="✅ *3-часовой Loop успешно отрендерен и выгружен!*%0A%0A📁 *Файл:* output.mp4%0A☁️ *Папка:* Google Drive / AetherFlow_Output%0A⏱️ *Хронометраж:* ${{ inputs.target_hours:-3 }} ч."
           else
-            MSG="❌ *Ошибка рендеринга 4K Loop!*%0AПроверьте выполнение сборки в GitHub Actions."
+            MSG="❌ *Ошибка рендера или выгрузки Loop!*%0A%0A⚠️ *Статус:* ${{ job.status }}%0A🔍 Проверьте вкладку Actions в GitHub."
           fi
-          curl -s -X POST "https://api.telegram.org/bot8913425031:AAHQwn0IYlobij4HElc0AsrXTRVjg8sf6Hc/sendMessage" \
-            -d "chat_id=360790056&text=${MSG}&parse_mode=Markdown" || true
+
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -d "parse_mode=Markdown" \
+            -d "text=$MSG"
