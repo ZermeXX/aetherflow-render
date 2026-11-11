@@ -17,18 +17,18 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Install Dependencies (FFmpeg & Rclone)
+      - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg curl bc
+          sudo apt-get install -y ffmpeg curl
           curl https://rclone.org/install.sh | sudo bash
 
       - name: Build and Run FFmpeg Pipeline
         run: |
           set -e
-          mkdir -p temp_render output_dir
+          mkdir -p temp_render
 
-          echo "=== ЭТАП 1: Рендеринг базового мастер-слота ==="
+          echo "=== 1. Рендеринг базового мастер-слота ==="
           if [ -f "render_slot.sh" ]; then
             bash render_slot.sh
           elif [ -f "input_loop.mp4" ]; then
@@ -36,28 +36,27 @@ jobs:
           elif [ -f "manifest.json" ] && [ -f "render_from_manifest.sh" ]; then
             bash render_from_manifest.sh
           else
-            # Тестовый слот на 15 минут (900 сек) в случае отсутствия внешних скриптов
             ffmpeg -y -f lavfi -i testsrc=size=3840x2160:rate=24 -f lavfi -i anullsrc=r=48000:cl=stereo -t 900 -c:v libx264 -preset fast -crf 20 -c:a aac temp_render/slot_master.mp4
           fi
 
-          echo "=== ЭТАП 2: Сборка бесшовного лупа (-c copy) ==="
+          echo "=== 2. Сборка бесшовного лупа (-c copy) ==="
           SLOT_DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 temp_render/slot_master.mp4)
           SLOT_SECS=${SLOT_DURATION%.*}
           [ -z "$SLOT_SECS" ] || [ "$SLOT_SECS" -le 0 ] && SLOT_SECS=900
 
-          TARGET_SECS=$((${inputs.target_hours:-3} * 3600))
+          HOURS="${{ inputs.target_hours }}"
+          [ -z "$HOURS" ] && HOURS=3
+          TARGET_SECS=$(( HOURS * 3600 ))
+
           REPEATS=$(( (TARGET_SECS + SLOT_SECS - 1) / SLOT_SECS ))
-          echo "Сегмент: ${SLOT_SECS} сек. Повторов для ${TARGET_SECS} сек: ${REPEATS}"
+          echo "Сегмент: ${SLOT_SECS} сек. Повторов: ${REPEATS}"
 
           > temp_render/loop_list.txt
           for i in $(seq 1 $REPEATS); do
             echo "file '$(pwd)/temp_render/slot_master.mp4'" >> temp_render/loop_list.txt
           done
 
-          # Мгновенная склейка лупа без повторного сжатия видеоряда
           ffmpeg -y -f concat -safe 0 -i temp_render/loop_list.txt -t $TARGET_SECS -c copy output.mp4
-
-          echo "Проверка итогового файла:"
           ls -lh output.mp4
 
       - name: Setup Personal Rclone Config
@@ -69,7 +68,7 @@ jobs:
 
       - name: Upload Output Video to Google Drive
         run: |
-          echo "=== Выгрузка 3-часового видео на Google Диск ==="
+          echo "=== Выгрузка на Google Диск ==="
           rclone copy ./output.mp4 gdrive:AetherFlow_Output/ \
             --drive-chunk-size 64M \
             --transfers 2 \
@@ -81,11 +80,14 @@ jobs:
 
       - name: Send Telegram Notification
         if: always()
+        env:
+          STATUS: ${{ job.status }}
+          HOURS: ${{ inputs.target_hours || '3' }}
         run: |
-          if [ "${{ job.status }}" == "success" ]; then
-            MSG="✅ *3-часовой Loop успешно отрендерен и выгружен!*%0A%0A📁 *Файл:* output.mp4%0A☁️ *Папка:* Google Drive / AetherFlow_Output%0A⏱️ *Хронометраж:* ${{ inputs.target_hours:-3 }} ч."
+          if [ "$STATUS" = "success" ]; then
+            MSG="✅ *3-часовой Loop успешно готов и выгружен!*%0A%0A📁 *Файл:* output.mp4%0A☁️ *Google Drive:* AetherFlow_Output%0A⏱️ *Длительность:* ${HOURS} ч."
           else
-            MSG="❌ *Ошибка рендера или выгрузки Loop!*%0A%0A⚠️ *Статус:* ${{ job.status }}%0A🔍 Проверьте вкладку Actions в GitHub."
+            MSG="❌ *Ошибка рендера или выгрузки Loop!*%0A%0A⚠️ *Статус:* $STATUS%0A🔍 Проверьте вкладку Actions в GitHub."
           fi
 
           curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
