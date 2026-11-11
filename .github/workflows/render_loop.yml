@@ -24,6 +24,8 @@ jobs:
           curl https://rclone.org/install.sh | sudo bash
 
       - name: Build and Run FFmpeg Pipeline
+        env:
+          INPUT_HOURS: ${{ github.event.inputs.target_hours }}
         run: |
           set -e
           mkdir -p temp_render
@@ -42,14 +44,18 @@ jobs:
           echo "=== 2. Сборка бесшовного лупа (-c copy) ==="
           SLOT_DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 temp_render/slot_master.mp4)
           SLOT_SECS=${SLOT_DURATION%.*}
-          [ -z "$SLOT_SECS" ] || [ "$SLOT_SECS" -le 0 ] && SLOT_SECS=900
+          if [ -z "$SLOT_SECS" ] || [ "$SLOT_SECS" -le 0 ]; then
+            SLOT_SECS=900
+          fi
 
-          HOURS="${{ inputs.target_hours }}"
-          [ -z "$HOURS" ] && HOURS=3
+          HOURS="${INPUT_HOURS}"
+          if [ -z "$HOURS" ]; then
+            HOURS=3
+          fi
           TARGET_SECS=$(( HOURS * 3600 ))
 
           REPEATS=$(( (TARGET_SECS + SLOT_SECS - 1) / SLOT_SECS ))
-          echo "Сегмент: ${SLOT_SECS} сек. Повторов: ${REPEATS}"
+          echo "Длительность слота: ${SLOT_SECS} сек. Повторов для ${TARGET_SECS} сек: ${REPEATS}"
 
           > temp_render/loop_list.txt
           for i in $(seq 1 $REPEATS); do
@@ -81,13 +87,18 @@ jobs:
       - name: Send Telegram Notification
         if: always()
         env:
-          STATUS: ${{ job.status }}
-          HOURS: ${{ inputs.target_hours || '3' }}
+          JOB_STATUS: ${{ job.status }}
+          HOURS: ${{ github.event.inputs.target_hours }}
         run: |
-          if [ "$STATUS" = "success" ]; then
-            MSG="✅ *3-часовой Loop успешно готов и выгружен!*%0A%0A📁 *Файл:* output.mp4%0A☁️ *Google Drive:* AetherFlow_Output%0A⏱️ *Длительность:* ${HOURS} ч."
+          H_VAL="$HOURS"
+          if [ -z "$H_VAL" ]; then
+            H_VAL="3"
+          fi
+
+          if [ "$JOB_STATUS" = "success" ]; then
+            MSG="✅ *3-часовой Loop успешно готов и выгружен!*%0A%0A📁 *Файл:* output.mp4%0A☁️ *Google Drive:* AetherFlow_Output%0A⏱️ *Длительность:* ${H_VAL} ч."
           else
-            MSG="❌ *Ошибка рендера или выгрузки Loop!*%0A%0A⚠️ *Статус:* $STATUS%0A🔍 Проверьте вкладку Actions в GitHub."
+            MSG="❌ *Ошибка рендера или выгрузки Loop!*%0A%0A⚠️ *Статус:* $JOB_STATUS%0A🔍 Проверьте вкладку Actions в GitHub."
           fi
 
           curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
