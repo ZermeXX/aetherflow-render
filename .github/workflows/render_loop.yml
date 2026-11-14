@@ -65,7 +65,6 @@ jobs:
                   with open("manifest.json", "w", encoding="utf-8") as f:
                       json.dump(data, f, ensure_ascii=False, indent=2)
                   manifest_saved = True
-                  print("Получен прямой JSON из веб-приложения.")
               except Exception:
                   pass
 
@@ -76,7 +75,6 @@ jobs:
                       with open("manifest.json", "w", encoding="utf-8") as f:
                           json.dump(data, f, ensure_ascii=False, indent=2)
                       manifest_saved = True
-                      print("Получен Base64-манифест из веб-приложения.")
                   except Exception:
                       pass
 
@@ -84,9 +82,7 @@ jobs:
               if os.path.exists("assembly_manifest_metel_3h.json"):
                   shutil.copy("assembly_manifest_metel_3h.json", "manifest.json")
                   manifest_saved = True
-                  print("Использован локальный assembly_manifest_metel_3h.json из репозитория.")
               else:
-                  print("Payload пуст — скачиваем актуальный *manifest*.json из Google Drive...")
                   subprocess.run([
                       "rclone", "copy", "gdrive:", ".",
                       "--drive-root-folder-id", "1OuuxKa85KAR-zz9TFXv6Ccg99fZ6JpuK",
@@ -96,13 +92,11 @@ jobs:
                       if "manifest" in fname and fname.endswith(".json") and fname != "manifest.json":
                           os.rename(fname, "manifest.json")
                           manifest_saved = True
-                          print(f"Скачан и подключен манифест: {fname}")
                           break
 
           if not os.path.exists("manifest.json") or os.path.getsize("manifest.json") == 0:
-              raise RuntimeError("Не удалось получить непустой manifest.json ни из студии, ни из Google Drive!")
+              raise RuntimeError("Не удалось получить непустой manifest.json!")
           EOF
-          ls -lh manifest.json
 
       - name: Preflight Asset Check
         run: |
@@ -125,10 +119,9 @@ jobs:
           existing = set(x.strip() for x in out)
 
           missing = sorted(needed - existing)
-          print(f"Всего уникальных ассетов в манифесте: {len(needed)}")
           if missing:
               raise FileNotFoundError(f"На Google Диске отсутствуют файлы: {', '.join(missing)}")
-          print("✅ Все исходные клипы и врезки подтверждены на Google Диске!")
+          print(f"✅ Все {len(needed)} исходных клипов и врезок подтверждены на Google Диске!")
           EOF
 
       - name: Build and Run FFmpeg Pipeline
@@ -144,7 +137,6 @@ jobs:
           CHAPTERS_FILE=$(cat final_chapters_name.txt 2>/dev/null || echo "")
           FOLDER_ID=$(jq -r '.cloud_export.target_folder_id // .gdriveFolderId // empty' manifest.json 2>/dev/null || true)
 
-          echo "=== Выгрузка $OUT_FILE и таймкодов на Google Диск ==="
           if [ -n "$FOLDER_ID" ]; then
             rclone copy "./$OUT_FILE" gdrive: --drive-root-folder-id "$FOLDER_ID" \
               --drive-chunk-size 64M --transfers 2 --checkers 4 --retries 5 --low-level-retries 10 --stats 30s -v
@@ -158,8 +150,10 @@ jobs:
           fi
 
           FILE_SIZE=$(du -h "./$OUT_FILE" | cut -f1)
+          QC_SUMMARY=$(jq -r '"\(.duration_formatted) • \(.integrated_lufs) LUFS"' qc_report.json 2>/dev/null || echo "OK")
           echo "DRIVE_LINK=$DRIVE_LINK" >> $GITHUB_ENV
           echo "FILE_SIZE=$FILE_SIZE" >> $GITHUB_ENV
+          echo "QC_SUMMARY=$QC_SUMMARY" >> $GITHUB_ENV
 
       - name: Send Telegram Notification
         if: always()
@@ -173,10 +167,8 @@ jobs:
           if [ "${{ github.event.inputs.preflight_only }}" = "true" ] && [ "$STATUS" = "success" ]; then
             MSG="🔍 *Preflight-проверка пройдена!*%0A%0A✅ Все исходные клипы и врезки найдены на Google Диске."
           elif [ "$STATUS" = "success" ]; then
-            MSG="✅ *3-часовой мастер-ролик готов!*%0A%0A📁 *Файл:* \`${OUT_FILE}\` (${FILE_SIZE})%0A⏱ *Время сборки:* ${MINS} мин%0A📝 *Таймкоды YouTube:* выгружены в папку"
-            if [ -n "$DRIVE_LINK" ]; then
-              MSG="${MSG}%0A🔗 [Открыть видео на Google Диске](${DRIVE_LINK})"
-            fi
+            MSG="✅ *Мастер-ролик готов и прошёл Auto-QC!*%0A%0A📁 *Файл:* \`${OUT_FILE}\` (${FILE_SIZE})%0A🎛 *QC:* ${QC_SUMMARY}%0A⏱ *Время сборки:* ${MINS} мин%0A📝 *Таймкоды YouTube:* выгружены в папку"
+            [ -n "$DRIVE_LINK" ] && MSG="${MSG}%0A🔗 [Открыть на Google Диске](${DRIVE_LINK})"
           else
             MSG="❌ *Ошибка при сборке проекта!*%0A%0A⚠️ *Статус:* $STATUS%0A⏱ *Прошло:* ${MINS} мин"
           fi
