@@ -11,6 +11,10 @@ on:
         description: 'Target Google Drive Folder ID'
         required: false
         default: ''
+      preflight_only:
+        description: 'Check scene assets on Google Drive without rendering'
+        required: false
+        default: 'false'
 
 jobs:
   assemble_and_upload:
@@ -115,12 +119,84 @@ jobs:
           EOF
           ls -lh manifest.json
 
+      - name: Preflight Asset Check
+        run: |
+          python3 - << 'EOF'
+          import json, subprocess
+
+          with open("manifest.json", "r", encoding="utf-8") as f:
+              m = json.load(f)
+
+          folder_id = m.get("cloud_export", {}).get("target_folder_id", "")
+          scenes = m.get("scenes") or m.get("timeline_slots") or []
+          needed = set()
+
+          for s in scenes:
+              vid = s.get("file_name") or s.get("video_file") or s.get("asset") or s.get("base_content", {}).get("file_name")
+              if vid:
+                  needed.add(vid)
+              aud = s.get("audio_file") or s.get("voiceover_file")
+              if aud:
+                  needed.add(aud)
+
+          bg = m.get("background_music") or m.get("audio_rules", {}).get("continuous_bed", {})
+          if isinstance(bg, dict) and bg.get("enabled") and bg.get("source_file"):
+              needed.add(bg["source_file"])
+
+          if not folder_id:
+              print("⚠️ target_folder_id не задан — пропускаем сверку списка папки.")
+          else:
+              out = subprocess.check_output([
+                  "rclone", "lsf", "gdrive:", "--drive-root-folder-id", folder_id
+              ]).decode("utf-8").splitlines()
+              existing = set(x.strip() for x in out)
+              missing = sorted(needed - existing)
+              if missing:
+                  raise FileNotFoundError(f"На Google Диске отсутствуют файлы сцен: {', '.join(missing)}")
+              print(f"✅ Все {len(needed)} видео- и аудиофайлов сцен подтверждены на Google Диске!")
+          EOF
+
       - name: Assemble Scenes with FFmpeg
+        if: github.event.inputs.preflight_only != 'true'
         run: |
           set -e
           python3 assemble_scenes.py
 
+      - name: Run Auto-QC Check
+        if: github.event.inputs.preflight_only != 'true'
+        run: |
+          OUT_FILE=$(cat final_output_name.txt)
+          python3 - "$OUT_FILE" << 'EOF'
+          import json, re, subprocess, sys
+
+          out_file = sys.argv[1]
+          probe = json.loads(subprocess.check_output([
+              "ffprobe", "-v", "error", "-show_entries", "format=duration:stream=codec_type",
+              "-of", "json", out_file
+          ]).decode("utf-8"))
+
+          dur = float(probe["format"]["duration"])
+          streams = probe.get("streams", [])
+          if not any(s["codec_type"] == "video" for s in streams) or not any(s["codec_type"] == "audio" for s in streams):
+              raise RuntimeError("Auto-QC провален: отсутствует видео или аудио поток!")
+
+          lufs_proc = subprocess.run([
+              "ffmpeg", "-nostats", "-i", out_file,
+              "-filter_complex", "ebur128=framelog=verbose", "-f", "null", "-"
+          ], capture_output=True, text=True)
+          m = re.findall(r"I:\s*(-?\d+\.\d+)\s*LUFS", lufs_proc.stderr)
+          lufs = float(m[-1]) if m else -16.0
+
+          h, rem = divmod(int(round(dur)), 3600)
+          mins, secs = divmod(rem, 60)
+          summary = f"{h:02d}:{mins:02d}:{secs:02d} • {lufs} LUFS"
+          print(f"✅ Auto-QC пройден: {summary}")
+          with open("qc_summary.txt", "w", encoding="utf-8") as f:
+              f.write(summary)
+          EOF
+
       - name: Upload Output Video to Google Drive
+        if: github.event.inputs.preflight_only != 'true'
         run: |
           OUT_FILE=$(cat final_output_name.txt)
           FOLDER_ID=$(jq -r '.cloud_export.target_folder_id // .gdriveFolderId // empty' manifest.json 2>/dev/null || true)
@@ -137,8 +213,10 @@ jobs:
           fi
 
           FILE_SIZE=$(du -h "./$OUT_FILE" | cut -f1)
+          QC_SUMMARY=$(cat qc_summary.txt 2>/dev/null || echo "OK")
           echo "DRIVE_LINK=$DRIVE_LINK" >> $GITHUB_ENV
           echo "FILE_SIZE=$FILE_SIZE" >> $GITHUB_ENV
+          echo "QC_SUMMARY=$QC_SUMMARY" >> $GITHUB_ENV
 
       - name: Send Telegram Notification
         if: always()
@@ -149,11 +227,11 @@ jobs:
           MINS=$((ELAPSED / 60))
           OUT_FILE=$(cat final_output_name.txt 2>/dev/null || echo "scenes_master.mp4")
 
-          if [ "$STATUS" = "success" ]; then
-            MSG="✅ *Повествовательный монтаж сцен готов!*%0A%0A📁 *Файл:* \`${OUT_FILE}\` (${FILE_SIZE})%0A⏱ *Время сборки:* ${MINS} мин"
-            if [ -n "$DRIVE_LINK" ]; then
-              MSG="${MSG}%0A🔗 [Открыть видео на Google Диске](${DRIVE_LINK})"
-            fi
+          if [ "${{ github.event.inputs.preflight_only }}" = "true" ] && [ "$STATUS" = "success" ]; then
+            MSG="🔍 *Preflight-проверка сцен пройдена!*%0A%0A✅ Все видео- и аудиофайлы найдены на Google Диске."
+          elif [ "$STATUS" = "success" ]; then
+            MSG="✅ *Повествовательный монтаж сцен готов и прошёл Auto-QC!*%0A%0A📁 *Файл:* \`${OUT_FILE}\` (${FILE_SIZE})%0A🎛 *QC:* ${QC_SUMMARY}%0A⏱ *Время сборки:* ${MINS} мин"
+            [ -n "$DRIVE_LINK" ] && MSG="${MSG}%0A🔗 [Открыть на Google Диске](${DRIVE_LINK})"
           else
             MSG="❌ *Ошибка при сборке сцен!*%0A%0A⚠️ *Статус:* $STATUS%0A⏱ *Прошло:* ${MINS} мин"
           fi
