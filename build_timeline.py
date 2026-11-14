@@ -117,10 +117,6 @@ def build_seamless_loop(src_file, target_sec, cf_sec, out_file, width, height, f
 
 
 def apply_inserts_surgical(base_video, inserts, slot_start_sec, out_video, width, height, fps, folder_id, v_codec, preset, crf, a_bitrate):
-    """
-    Хирургическое наложение врезок: перекодирует ТОЛЬКО окно самой врезки (10-15 сек),
-    а остальной 30-40 минутный базовый слот копирует через -c:v copy за 2 секунды.
-    """
     if not inserts:
         os.replace(base_video, out_video)
         return
@@ -236,16 +232,18 @@ def build_smart_concat(built_slots, raw_concat_out, fps, v_codec, preset, crf, a
         os.replace(built_slots[0][0], raw_concat_out)
         return
 
-    segments_meta = []
-    for i, (path, _, cf_out) in enumerate(built_slots):
-        actual_dur = get_duration(path)
-        cf_before = built_slots[i - 1][2] if i > 0 else 0.0
-        cf_after = cf_out if i < n - 1 else 0.0
-        segments_meta.append((path, actual_dur, cf_before, actual_dur - cf_after, cf_after))
-
+    durations = [get_duration(p) for p, _, _ in built_slots]
     concat_parts = []
 
-    for i, (path, actual_dur, body_start, body_end, cf_after) in enumerate(segments_meta):
+    for i in range(n):
+        path, _, cf_out = built_slots[i]
+        actual_dur = durations[i]
+        cf_before = built_slots[i - 1][2] if i > 0 else 0.0
+        cf_after = cf_out if i < n - 1 else 0.0
+
+        body_start = cf_before
+        body_end = actual_dur - cf_after
+
         if body_end - body_start > 2.0:
             body_file = os.path.join(WORK_DIR, f"body_{i}.mp4")
             run([
@@ -259,7 +257,7 @@ def build_smart_concat(built_slots, raw_concat_out, fps, v_codec, preset, crf, a
             concat_parts.append(body_file)
 
         if cf_after > 0 and i < n - 1:
-            next_path = segments_meta[i + 1][0]
+            next_path = built_slots[i + 1][0]
             tail_file = os.path.join(WORK_DIR, f"tail_{i}.mp4")
             head_file = os.path.join(WORK_DIR, f"head_{i+1}.mp4")
             bridge_file = os.path.join(WORK_DIR, f"bridge_{i}.mp4")
@@ -295,6 +293,9 @@ def build_smart_concat(built_slots, raw_concat_out, fps, v_codec, preset, crf, a
             safe_remove(tail_file)
             safe_remove(head_file)
             concat_parts.append(bridge_file)
+
+        # Поэтапно удаляем каждый отработанный слот, освобождая место на диске раннера
+        safe_remove(path)
 
     master_list = os.path.join(WORK_DIR, "master_concat.txt")
     with open(master_list, "w", encoding="utf-8") as f:
