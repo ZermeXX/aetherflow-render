@@ -24,6 +24,14 @@ def safe_remove(path):
             pass
 
 
+def get_duration(file_path):
+    res = subprocess.check_output([
+        "ffprobe", "-v", "error", "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1", file_path
+    ]).decode().strip()
+    return float(res)
+
+
 def ensure_asset(filename, folder_id):
     local_path = os.path.join(ASSETS_DIR, filename)
     if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
@@ -60,11 +68,7 @@ def build_seamless_loop(src_file, target_sec, cf_sec, out_file, width, height, f
         norm_clip
     ])
 
-    res = subprocess.check_output([
-        "ffprobe", "-v", "error", "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1", norm_clip
-    ]).decode().strip()
-    dur = float(res)
+    dur = get_duration(norm_clip)
 
     if cf_sec <= 0 or dur <= cf_sec * 2:
         effective_dur = dur
@@ -112,11 +116,18 @@ def apply_inserts(base_video, inserts, slot_start_sec, out_video, width, height,
     current_vid = base_video
     for idx, ins in enumerate(inserts):
         ins_file = ensure_asset(ins["file_name"], folder_id)
-        rel_start = float(ins["trigger_at_sec"]) - slot_start_sec
-        ins_dur = float(ins["source_clip_duration_sec"])
+        rel_start = max(0.0, float(ins.get("trigger_at_sec", slot_start_sec)) - slot_start_sec)
+        
+        # Определяем длительность врезки напрямую через ffprobe, если ключа нет в JSON
+        raw_dur = ins.get("source_clip_duration_sec") or ins.get("duration_sec") or ins.get("duration")
+        ins_dur = float(raw_dur) if raw_dur is not None else get_duration(ins_file)
+
         fade_in = float(ins.get("transition_duration_sec", 1.0))
-        t_out = ins.get("transition_out", {})
-        fade_out = float(t_out.get("duration_sec", 0)) if t_out.get("type") != "none" else 0.0
+        t_out = ins.get("transition_out") or {}
+        if isinstance(t_out, dict):
+            fade_out = float(t_out.get("duration_sec", 0)) if t_out.get("type") != "none" else 0.0
+        else:
+            fade_out = float(ins.get("transition_out_duration_sec", 1.0))
 
         step_out = os.path.join(WORK_DIR, f"ins_{idx}_{os.path.basename(out_video)}")
 
@@ -127,15 +138,15 @@ def apply_inserts(base_video, inserts, slot_start_sec, out_video, width, height,
         if fade_in > 0:
             v_chain += f",fade=t=in:st=0:d={fade_in}:alpha=1"
         if fade_out > 0:
-            v_chain += f",fade=t=out:st={max(0, ins_dur - fade_out)}:d={fade_out}:alpha=1"
+            v_chain += f",fade=t=out:st={max(0.0, ins_dur - fade_out)}:d={fade_out}:alpha=1"
         v_chain += f",setpts=PTS-STARTPTS+{rel_start}/TB[ov_v];"
 
         delay_ms = int(rel_start * 1000)
-        a_chain = f"[1:a]aresample=48000"
+        a_chain = "[1:a]aresample=48000"
         if fade_in > 0:
             a_chain += f",afade=t=in:st=0:d={fade_in}"
         if fade_out > 0:
-            a_chain += f",afade=t=out:st={max(0, ins_dur - fade_out)}:d={fade_out}"
+            a_chain += f",afade=t=out:st={max(0.0, ins_dur - fade_out)}:d={fade_out}"
         a_chain += f",adelay={delay_ms}|{delay_ms}[ov_a];"
 
         filter_complex = (
@@ -162,7 +173,7 @@ def main():
     with open(MANIFEST_FILE, "r", encoding="utf-8") as f:
         manifest = json.load(f)
 
-    exp = manifest["export_settings"]
+    exp = manifest.get("export_settings", {})
     width = exp.get("width", 3840)
     height = exp.get("height", 2160)
     fps = exp.get("fps", 24)
@@ -181,9 +192,10 @@ def main():
         base = slot["base_content"]
         src_path = ensure_asset(base["file_name"], folder_id)
 
-        trans_out = slot.get("slot_transition_out", {})
+        trans_out = slot.get("slot_transition_out") or {}
         cf_out = float(trans_out.get("duration_sec", 0)) if trans_out.get("type") == "crossfade" else 0.0
-        raw_dur = float(slot["slot_duration_sec"]) + cf_out
+        slot_dur = float(slot["slot_duration_sec"])
+        raw_dur = slot_dur + cf_out
 
         raw_slot_path = os.path.join(WORK_DIR, f"{slot_id}_raw.mp4")
         final_slot_path = os.path.join(WORK_DIR, f"{slot_id}_final.mp4")
@@ -193,12 +205,11 @@ def main():
             raw_slot_path, width, height, fps
         )
         apply_inserts(
-            raw_slot_path, slot.get("inserts", []), float(slot["start_sec"]),
+            raw_slot_path, slot.get("inserts", []), float(slot.get("start_sec", 0)),
             final_slot_path, width, height, fps, folder_id
         )
-        built_slots.append((final_slot_path, float(slot["slot_duration_sec"]), cf_out))
+        built_slots.append((final_slot_path, slot_dur, cf_out))
 
-    # Единый проход: склеиваем все 6 слотов с кроссфейдами + нормализация + кодирование сразу в финал (без промежуточных merged-файлов!)
     print(f"=== Финальный рендер в один проход: {out_filename} ({v_codec}, preset {preset}, CRF {crf}) ===")
     inputs_cmd = []
     for path, _, _ in built_slots:
