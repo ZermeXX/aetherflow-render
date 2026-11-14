@@ -26,12 +26,13 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Record Start Time
-        run: echo "START_TS=$(date +\%s)" >> $GITHUB_ENV
+        run: echo "START_TS=$(date +%s)" >> $GITHUB_ENV
 
       - name: Free Disk Space on Runner
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache /usr/local/share/boost
           sudo docker image prune --all --force || true
+          sudo apt-get clean
           df -h
 
       - name: Install Dependencies
@@ -195,7 +196,6 @@ jobs:
           with open("qc_summary.txt", "w", encoding="utf-8") as f:
               f.write(summary)
 
-          # Генерация таймкодов сцен и карточки релиза
           with open("manifest.json", "r", encoding="utf-8") as f:
               manifest = json.load(f)
 
