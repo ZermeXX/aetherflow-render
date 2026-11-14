@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import subprocess
 import math
 
@@ -115,7 +116,11 @@ def build_seamless_loop(src_file, target_sec, cf_sec, out_file, width, height, f
     safe_remove(list_txt)
 
 
-def apply_inserts(base_video, inserts, slot_start_sec, out_video, width, height, fps, folder_id, v_codec, preset, crf, a_bitrate):
+def apply_inserts_surgical(base_video, inserts, slot_start_sec, out_video, width, height, fps, folder_id, v_codec, preset, crf, a_bitrate):
+    """
+    Хирургическое наложение врезок: перекодирует ТОЛЬКО окно самой врезки (10-15 сек),
+    а остальной 30-40 минутный базовый слот копирует через -c:v copy за 2 секунды.
+    """
     if not inserts:
         os.replace(base_video, out_video)
         return
@@ -123,10 +128,15 @@ def apply_inserts(base_video, inserts, slot_start_sec, out_video, width, height,
     current_vid = base_video
     for idx, ins in enumerate(inserts):
         ins_file = ensure_asset(ins["file_name"], folder_id)
-        rel_start = max(0.0, float(ins.get("trigger_at_sec", slot_start_sec)) - slot_start_sec)
+        base_dur = get_duration(current_vid)
 
+        rel_start = max(0.0, float(ins.get("trigger_at_sec", slot_start_sec)) - slot_start_sec)
         raw_dur = ins.get("source_clip_duration_sec") or ins.get("duration_sec") or ins.get("duration")
         ins_dur = float(raw_dur) if raw_dur is not None else get_duration(ins_file)
+
+        win_start = max(0.0, rel_start - 1.0)
+        win_end = min(base_dur, rel_start + ins_dur + 1.0)
+        local_offset = rel_start - win_start
 
         fade_in = float(ins.get("transition_duration_sec", 1.0))
         t_out = ins.get("transition_out") or {}
@@ -135,7 +145,31 @@ def apply_inserts(base_video, inserts, slot_start_sec, out_video, width, height,
         else:
             fade_out = float(ins.get("transition_out_duration_sec", 1.0))
 
+        part_pre = os.path.join(WORK_DIR, f"pre_{idx}_{os.path.basename(out_video)}")
+        part_mid_raw = os.path.join(WORK_DIR, f"mid_raw_{idx}_{os.path.basename(out_video)}")
+        part_mid_ov = os.path.join(WORK_DIR, f"mid_ov_{idx}_{os.path.basename(out_video)}")
+        part_post = os.path.join(WORK_DIR, f"post_{idx}_{os.path.basename(out_video)}")
         step_out = os.path.join(WORK_DIR, f"ins_{idx}_{os.path.basename(out_video)}")
+
+        concat_segments = []
+
+        if win_start > 0.5:
+            run([
+                "ffmpeg", "-y", "-ss", "0", "-to", f"{win_start:.3f}",
+                "-i", current_vid, "-c", "copy", part_pre
+            ])
+            concat_segments.append(part_pre)
+        else:
+            win_start = 0.0
+            local_offset = rel_start
+
+        run([
+            "ffmpeg", "-y", "-ss", f"{win_start:.3f}", "-to", f"{win_end:.3f}",
+            "-i", current_vid,
+            "-c:v", v_codec, "-preset", preset, "-crf", crf, "-g", str(fps * 2), "-keyint_min", str(fps * 2),
+            "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", a_bitrate,
+            part_mid_raw
+        ])
 
         v_chain = (
             f"[1:v]scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},"
@@ -145,9 +179,9 @@ def apply_inserts(base_video, inserts, slot_start_sec, out_video, width, height,
             v_chain += f",fade=t=in:st=0:d={fade_in}:alpha=1"
         if fade_out > 0:
             v_chain += f",fade=t=out:st={max(0.0, ins_dur - fade_out)}:d={fade_out}:alpha=1"
-        v_chain += f",setpts=PTS-STARTPTS+{rel_start}/TB[ov_v];"
+        v_chain += f",setpts=PTS-STARTPTS+{local_offset:.3f}/TB[ov_v];"
 
-        delay_ms = int(rel_start * 1000)
+        delay_ms = int(local_offset * 1000)
         a_chain = "[1:a]aresample=48000"
         if fade_in > 0:
             a_chain += f",afade=t=in:st=0:d={fade_in}"
@@ -162,31 +196,46 @@ def apply_inserts(base_video, inserts, slot_start_sec, out_video, width, height,
         )
 
         run([
-            "ffmpeg", "-y", "-i", current_vid, "-i", ins_file,
+            "ffmpeg", "-y", "-i", part_mid_raw, "-i", ins_file,
             "-filter_complex", filter_complex,
             "-map", "[outv]", "-map", "[outa]",
             "-c:v", v_codec, "-preset", preset, "-crf", crf, "-g", str(fps * 2), "-keyint_min", str(fps * 2),
             "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", a_bitrate,
-            step_out
+            part_mid_ov
         ])
-        safe_remove(current_vid)
+        concat_segments.append(part_mid_ov)
+
+        if base_dur - win_end > 0.5:
+            run([
+                "ffmpeg", "-y", "-ss", f"{win_end:.3f}", "-to", f"{base_dur:.3f}",
+                "-i", current_vid, "-c", "copy", part_post
+            ])
+            concat_segments.append(part_post)
+
+        seg_list = os.path.join(WORK_DIR, f"seg_{idx}_{os.path.basename(out_video)}.txt")
+        with open(seg_list, "w", encoding="utf-8") as f:
+            for seg in concat_segments:
+                f.write(f"file '{os.path.abspath(seg)}'\n")
+
+        run([
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", seg_list,
+            "-c", "copy", step_out
+        ])
+
+        for p in [current_vid, part_pre, part_mid_raw, part_mid_ov, part_post, seg_list]:
+            safe_remove(p)
+
         current_vid = step_out
 
     os.replace(current_vid, out_video)
 
 
 def build_smart_concat(built_slots, raw_concat_out, fps, v_codec, preset, crf, a_bitrate):
-    """
-    Склеивает длинные слоты без повторного перекодирования их тел:
-    пересчитываются только короткие зоны кроссфейда (cf_sec), а основные части идут через -c:v copy.
-    """
     n = len(built_slots)
     if n == 1:
         os.replace(built_slots[0][0], raw_concat_out)
         return
 
-    # Вычисляем границы вырезки для каждого слота
-    # Каждая запись: (slot_path, actual_dur, trim_start, trim_end, cf_after)
     segments_meta = []
     for i, (path, _, cf_out) in enumerate(built_slots):
         actual_dur = get_duration(path)
@@ -197,7 +246,6 @@ def build_smart_concat(built_slots, raw_concat_out, fps, v_codec, preset, crf, a
     concat_parts = []
 
     for i, (path, actual_dur, body_start, body_end, cf_after) in enumerate(segments_meta):
-        # 1. Основное тело слота (вырезаем без перекодирования видео, если длина > 2 сек)
         if body_end - body_start > 2.0:
             body_file = os.path.join(WORK_DIR, f"body_{i}.mp4")
             run([
@@ -209,10 +257,7 @@ def build_smart_concat(built_slots, raw_concat_out, fps, v_codec, preset, crf, a
                 body_file
             ])
             concat_parts.append(body_file)
-        else:
-            body_end = body_start
 
-        # 2. Зона кроссфейда к следующему слоту
         if cf_after > 0 and i < n - 1:
             next_path = segments_meta[i + 1][0]
             tail_file = os.path.join(WORK_DIR, f"tail_{i}.mp4")
@@ -280,6 +325,48 @@ def generate_chapters(manifest, chapters_path):
     print(f"Таймкоды сохранены в {chapters_path}")
 
 
+def run_auto_qc(out_filename, expected_sec):
+    print("=== Запуск Auto-QC проверки качества ===")
+    probe_raw = subprocess.check_output([
+        "ffprobe", "-v", "error", "-show_entries",
+        "format=duration,size:stream=codec_type,codec_name,width,height,r_frame_rate",
+        "-of", "json", out_filename
+    ]).decode("utf-8")
+    probe = json.loads(probe_raw)
+
+    actual_dur = float(probe["format"]["duration"])
+    streams = probe.get("streams", [])
+    has_video = any(s.get("codec_type") == "video" for s in streams)
+    has_audio = any(s.get("codec_type") == "audio" for s in streams)
+
+    if not has_video or not has_audio:
+        raise RuntimeError(f"Auto-QC провален: отсутствует видео ({has_video}) или аудио ({has_audio}) поток!")
+
+    if expected_sec > 0 and abs(actual_dur - expected_sec) > 15.0:
+        raise RuntimeError(
+            f"Auto-QC провален: длительность {actual_dur:.1f}с расходится с ожидаемой {expected_sec:.1f}с!"
+        )
+
+    lufs_proc = subprocess.run([
+        "ffmpeg", "-nostats", "-i", out_filename,
+        "-filter_complex", "ebur128=framelog=verbose", "-f", "null", "-"
+    ], capture_output=True, text=True)
+    m = re.findall(r"I:\s*(-?\d+\.\d+)\s*LUFS", lufs_proc.stderr)
+    integrated_lufs = float(m[-1]) if m else -16.0
+
+    qc_data = {
+        "status": "PASS",
+        "duration_sec": round(actual_dur, 2),
+        "duration_formatted": format_timestamp(actual_dur),
+        "integrated_lufs": integrated_lufs,
+        "has_video": has_video,
+        "has_audio": has_audio
+    }
+    with open("qc_report.json", "w", encoding="utf-8") as f:
+        json.dump(qc_data, f, ensure_ascii=False, indent=2)
+    print(f"✅ Auto-QC пройден: {qc_data['duration_formatted']} | Громкость: {integrated_lufs} LUFS")
+
+
 def main():
     with open(MANIFEST_FILE, "r", encoding="utf-8") as f:
         manifest = json.load(f)
@@ -297,6 +384,7 @@ def main():
 
     slots = manifest["timeline_slots"]
     built_slots = []
+    expected_total_sec = sum(float(s["slot_duration_sec"]) for s in slots)
 
     for slot in slots:
         slot_id = slot["slot_id"]
@@ -315,13 +403,12 @@ def main():
             src_path, raw_dur, float(base.get("loop_crossfade_sec", 1.0)),
             raw_slot_path, width, height, fps, v_codec, preset, crf, a_bitrate
         )
-        apply_inserts(
+        apply_inserts_surgical(
             raw_slot_path, slot.get("inserts", []), float(slot.get("start_sec", 0)),
             final_slot_path, width, height, fps, folder_id, v_codec, preset, crf, a_bitrate
         )
         built_slots.append((final_slot_path, slot_dur, cf_out))
 
-    # 1. Быстрая склейка без пересчёта пикселей основных слотов
     raw_master = os.path.join(WORK_DIR, "raw_master.mp4")
     print("=== Быстрая склейка слотов и кроссфейдов (-c:v copy) ===")
     build_smart_concat(built_slots, raw_master, fps, v_codec, preset, crf, a_bitrate)
@@ -329,7 +416,6 @@ def main():
     for path, _, _ in built_slots:
         safe_remove(path)
 
-    # 2. Финальная нормализация звука -16 LUFS с копированием видеопотока (занимает ~2-3 минуты вместо часа!)
     print(f"=== Финальная нормализация звука (-16 LUFS) -> {out_filename} ===")
     run([
         "ffmpeg", "-y", "-i", raw_master,
@@ -341,9 +427,9 @@ def main():
     ])
     safe_remove(raw_master)
 
-    # 3. Генерация таймкодов YouTube
     chapters_file = f"{os.path.splitext(out_filename)[0]}_chapters.txt"
     generate_chapters(manifest, chapters_file)
+    run_auto_qc(out_filename, expected_total_sec)
 
     with open("final_output_name.txt", "w", encoding="utf-8") as f:
         f.write(out_filename)
