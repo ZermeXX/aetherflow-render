@@ -40,11 +40,59 @@ jobs:
         env:
           RAW_PAYLOAD: ${{ github.event.inputs.manifest_payload }}
         run: |
-          if [ -n "$RAW_PAYLOAD" ] && [ "$RAW_PAYLOAD" != "{}" ]; then
-            printf "%s\n" "$RAW_PAYLOAD" > manifest.json
-          elif [ -f "assembly_manifest_metel_3h.json" ]; then
-            cp assembly_manifest_metel_3h.json manifest.json
-          fi
+          python3 - << 'EOF'
+          import os, base64, json, shutil, subprocess
+
+          raw = os.environ.get("RAW_PAYLOAD", "").strip()
+          manifest_saved = False
+
+          if raw and raw != "{}":
+              # 1. Пробуем распарсить как прямой JSON
+              try:
+                  data = json.loads(raw)
+                  with open("manifest.json", "w", encoding="utf-8") as f:
+                      json.dump(data, f, ensure_ascii=False, indent=2)
+                  manifest_saved = True
+                  print("Получен прямой JSON из веб-приложения.")
+              except Exception:
+                  pass
+
+              # 2. Пробуем декодировать из Base64
+              if not manifest_saved:
+                  try:
+                      decoded = base64.b64decode(raw).decode("utf-8")
+                      data = json.loads(decoded)
+                      with open("manifest.json", "w", encoding="utf-8") as f:
+                          json.dump(data, f, ensure_ascii=False, indent=2)
+                      manifest_saved = True
+                      print("Получен Base64-манифест из веб-приложения.")
+                  except Exception:
+                      pass
+
+          # 3. Резерв: берем локальный файл из репозитория или скачиваем с Google Диска
+          if not manifest_saved:
+              if os.path.exists("assembly_manifest_metel_3h.json"):
+                  shutil.copy("assembly_manifest_metel_3h.json", "manifest.json")
+                  manifest_saved = True
+                  print("Использован локальный assembly_manifest_metel_3h.json из репозитория.")
+              else:
+                  print("Payload пуст — скачиваем актуальный *manifest*.json из Google Drive...")
+                  subprocess.run([
+                      "rclone", "copy", "gdrive:", ".",
+                      "--drive-root-folder-id", "1OuuxKa85KAR-zz9TFXv6Ccg99fZ6JpuK",
+                      "--include", "*manifest*.json", "-v"
+                  ], check=False)
+                  for fname in os.listdir("."):
+                      if "manifest" in fname and fname.endswith(".json") and fname != "manifest.json":
+                          os.rename(fname, "manifest.json")
+                          manifest_saved = True
+                          print(f"Скачан и подключен манифест: {fname}")
+                          break
+
+          if not os.path.exists("manifest.json") or os.path.getsize("manifest.json") == 0:
+              raise RuntimeError("Не удалось получить непустой manifest.json ни из студии, ни из Google Drive!")
+          EOF
+          ls -lh manifest.json
 
       - name: Build and Run FFmpeg Pipeline
         run: |
@@ -52,7 +100,7 @@ jobs:
           if [ -f "manifest.json" ] && [ -f "build_timeline.py" ]; then
             python3 build_timeline.py
           else
-            echo "Манифест не найден, запуск резервной сборки..."
+            echo "Манифест или build_timeline.py не найдены, запуск резервной сборки..."
             ffmpeg -y -f lavfi -i testsrc=size=1920x1080:rate=24 -f lavfi -i anullsrc=r=48000:cl=stereo -t 60 -c:v libx264 -preset fast -c:a aac output.mp4
             echo "output.mp4" > final_output_name.txt
           fi
