@@ -32,6 +32,14 @@ def get_duration(file_path):
     return float(res)
 
 
+def format_timestamp(seconds):
+    total = int(round(seconds))
+    h = total // 3600
+    m = (total % 3600) // 60
+    s = total % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
 def ensure_asset(filename, folder_id):
     local_path = os.path.join(ASSETS_DIR, filename)
     if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
@@ -40,31 +48,30 @@ def ensure_asset(filename, folder_id):
         return filename
 
     print(f"Скачиваем {filename} из Google Drive...")
-    cmd_folder = [
-        "rclone", "copy", f"gdrive:{filename}", ASSETS_DIR,
-        "--drive-root-folder-id", folder_id, "-v"
-    ]
-    subprocess.run(cmd_folder, check=False)
+    if folder_id:
+        subprocess.run([
+            "rclone", "copy", f"gdrive:{filename}", ASSETS_DIR,
+            "--drive-root-folder-id", folder_id, "-v"
+        ], check=False)
 
     if not os.path.exists(local_path):
-        cmd_global = [
+        run([
             "rclone", "copy", "gdrive:", ASSETS_DIR,
             "--include", filename, "-v"
-        ]
-        run(cmd_global)
+        ])
 
     if not os.path.exists(local_path):
         raise FileNotFoundError(f"Исходный файл {filename} не найден ни в репозитории, ни на Google Диске!")
     return local_path
 
 
-def build_seamless_loop(src_file, target_sec, cf_sec, out_file, width, height, fps):
+def build_seamless_loop(src_file, target_sec, cf_sec, out_file, width, height, fps, v_codec, preset, crf, a_bitrate):
     norm_clip = os.path.join(WORK_DIR, f"norm_{os.path.basename(src_file)}")
     run([
         "ffmpeg", "-y", "-i", src_file,
         "-vf", f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},fps={fps},format=yuv420p",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
-        "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "320k",
+        "-c:v", v_codec, "-preset", preset, "-crf", crf, "-g", str(fps * 2), "-keyint_min", str(fps * 2),
+        "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", a_bitrate,
         norm_clip
     ])
 
@@ -88,15 +95,15 @@ def build_seamless_loop(src_file, target_sec, cf_sec, out_file, width, height, f
             "ffmpeg", "-y", "-i", norm_clip,
             "-filter_complex", filter_complex,
             "-map", "[v]", "-map", "[a]",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
-            "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "320k",
+            "-c:v", v_codec, "-preset", preset, "-crf", crf, "-g", str(fps * 2), "-keyint_min", str(fps * 2),
+            "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", a_bitrate,
             unit_clip
         ])
         safe_remove(norm_clip)
 
     repeats = math.ceil(target_sec / effective_dur) + 1
     list_txt = os.path.join(WORK_DIR, f"list_{os.path.basename(out_file)}.txt")
-    with open(list_txt, "w") as f:
+    with open(list_txt, "w", encoding="utf-8") as f:
         for _ in range(repeats):
             f.write(f"file '{os.path.abspath(unit_clip)}'\n")
 
@@ -108,7 +115,7 @@ def build_seamless_loop(src_file, target_sec, cf_sec, out_file, width, height, f
     safe_remove(list_txt)
 
 
-def apply_inserts(base_video, inserts, slot_start_sec, out_video, width, height, fps, folder_id):
+def apply_inserts(base_video, inserts, slot_start_sec, out_video, width, height, fps, folder_id, v_codec, preset, crf, a_bitrate):
     if not inserts:
         os.replace(base_video, out_video)
         return
@@ -117,8 +124,7 @@ def apply_inserts(base_video, inserts, slot_start_sec, out_video, width, height,
     for idx, ins in enumerate(inserts):
         ins_file = ensure_asset(ins["file_name"], folder_id)
         rel_start = max(0.0, float(ins.get("trigger_at_sec", slot_start_sec)) - slot_start_sec)
-        
-        # Определяем длительность врезки напрямую через ffprobe, если ключа нет в JSON
+
         raw_dur = ins.get("source_clip_duration_sec") or ins.get("duration_sec") or ins.get("duration")
         ins_dur = float(raw_dur) if raw_dur is not None else get_duration(ins_file)
 
@@ -159,14 +165,119 @@ def apply_inserts(base_video, inserts, slot_start_sec, out_video, width, height,
             "ffmpeg", "-y", "-i", current_vid, "-i", ins_file,
             "-filter_complex", filter_complex,
             "-map", "[outv]", "-map", "[outa]",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
-            "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "320k",
+            "-c:v", v_codec, "-preset", preset, "-crf", crf, "-g", str(fps * 2), "-keyint_min", str(fps * 2),
+            "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", a_bitrate,
             step_out
         ])
         safe_remove(current_vid)
         current_vid = step_out
 
     os.replace(current_vid, out_video)
+
+
+def build_smart_concat(built_slots, raw_concat_out, fps, v_codec, preset, crf, a_bitrate):
+    """
+    Склеивает длинные слоты без повторного перекодирования их тел:
+    пересчитываются только короткие зоны кроссфейда (cf_sec), а основные части идут через -c:v copy.
+    """
+    n = len(built_slots)
+    if n == 1:
+        os.replace(built_slots[0][0], raw_concat_out)
+        return
+
+    # Вычисляем границы вырезки для каждого слота
+    # Каждая запись: (slot_path, actual_dur, trim_start, trim_end, cf_after)
+    segments_meta = []
+    for i, (path, _, cf_out) in enumerate(built_slots):
+        actual_dur = get_duration(path)
+        cf_before = built_slots[i - 1][2] if i > 0 else 0.0
+        cf_after = cf_out if i < n - 1 else 0.0
+        segments_meta.append((path, actual_dur, cf_before, actual_dur - cf_after, cf_after))
+
+    concat_parts = []
+
+    for i, (path, actual_dur, body_start, body_end, cf_after) in enumerate(segments_meta):
+        # 1. Основное тело слота (вырезаем без перекодирования видео, если длина > 2 сек)
+        if body_end - body_start > 2.0:
+            body_file = os.path.join(WORK_DIR, f"body_{i}.mp4")
+            run([
+                "ffmpeg", "-y",
+                "-ss", f"{body_start:.3f}", "-to", f"{body_end:.3f}",
+                "-i", path,
+                "-c:v", "copy",
+                "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", a_bitrate,
+                body_file
+            ])
+            concat_parts.append(body_file)
+        else:
+            body_end = body_start
+
+        # 2. Зона кроссфейда к следующему слоту
+        if cf_after > 0 and i < n - 1:
+            next_path = segments_meta[i + 1][0]
+            tail_file = os.path.join(WORK_DIR, f"tail_{i}.mp4")
+            head_file = os.path.join(WORK_DIR, f"head_{i+1}.mp4")
+            bridge_file = os.path.join(WORK_DIR, f"bridge_{i}.mp4")
+
+            run([
+                "ffmpeg", "-y", "-ss", f"{max(0.0, actual_dur - cf_after):.3f}", "-i", path,
+                "-t", f"{cf_after:.3f}",
+                "-c:v", v_codec, "-preset", preset, "-crf", crf, "-g", str(fps * 2), "-keyint_min", str(fps * 2),
+                "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", a_bitrate,
+                tail_file
+            ])
+            run([
+                "ffmpeg", "-y", "-ss", "0", "-i", next_path,
+                "-t", f"{cf_after:.3f}",
+                "-c:v", v_codec, "-preset", preset, "-crf", crf, "-g", str(fps * 2), "-keyint_min", str(fps * 2),
+                "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", a_bitrate,
+                head_file
+            ])
+
+            half_cf = cf_after / 2.0
+            fc = (
+                f"[0:v][1:v]xfade=transition=fade:duration={half_cf:.3f}:offset={half_cf:.3f}[v];"
+                f"[0:a][1:a]acrossfade=d={half_cf:.3f}[a]"
+            )
+            run([
+                "ffmpeg", "-y", "-i", tail_file, "-i", head_file,
+                "-filter_complex", fc,
+                "-map", "[v]", "-map", "[a]",
+                "-c:v", v_codec, "-preset", preset, "-crf", crf, "-g", str(fps * 2), "-keyint_min", str(fps * 2),
+                "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", a_bitrate,
+                bridge_file
+            ])
+            safe_remove(tail_file)
+            safe_remove(head_file)
+            concat_parts.append(bridge_file)
+
+    master_list = os.path.join(WORK_DIR, "master_concat.txt")
+    with open(master_list, "w", encoding="utf-8") as f:
+        for p in concat_parts:
+            f.write(f"file '{os.path.abspath(p)}'\n")
+
+    run([
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", master_list,
+        "-c", "copy", raw_concat_out
+    ])
+
+    for p in concat_parts:
+        safe_remove(p)
+    safe_remove(master_list)
+
+
+def generate_chapters(manifest, chapters_path):
+    slots = manifest.get("timeline_slots", [])
+    lines = []
+    cur_sec = 0.0
+    for idx, slot in enumerate(slots):
+        title = slot.get("title") or slot.get("label") or slot.get("slot_id") or f"Act {idx + 1}"
+        start = float(slot.get("start_sec", cur_sec))
+        lines.append(f"{format_timestamp(start)} {title}")
+        cur_sec = start + float(slot.get("slot_duration_sec", 0))
+    with open(chapters_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"Таймкоды сохранены в {chapters_path}")
 
 
 def main():
@@ -187,7 +298,7 @@ def main():
     slots = manifest["timeline_slots"]
     built_slots = []
 
-    for i, slot in enumerate(slots):
+    for slot in slots:
         slot_id = slot["slot_id"]
         base = slot["base_content"]
         src_path = ensure_asset(base["file_name"], folder_id)
@@ -202,56 +313,42 @@ def main():
 
         build_seamless_loop(
             src_path, raw_dur, float(base.get("loop_crossfade_sec", 1.0)),
-            raw_slot_path, width, height, fps
+            raw_slot_path, width, height, fps, v_codec, preset, crf, a_bitrate
         )
         apply_inserts(
             raw_slot_path, slot.get("inserts", []), float(slot.get("start_sec", 0)),
-            final_slot_path, width, height, fps, folder_id
+            final_slot_path, width, height, fps, folder_id, v_codec, preset, crf, a_bitrate
         )
         built_slots.append((final_slot_path, slot_dur, cf_out))
 
-    print(f"=== Финальный рендер в один проход: {out_filename} ({v_codec}, preset {preset}, CRF {crf}) ===")
-    inputs_cmd = []
-    for path, _, _ in built_slots:
-        inputs_cmd.extend(["-i", path])
-
-    filter_parts = []
-    prev_v = "[0:v]"
-    prev_a = "[0:a]"
-    offset = built_slots[0][1]
-
-    for idx in range(1, len(built_slots)):
-        cf_dur = built_slots[idx - 1][2]
-        out_v = f"[v{idx}]"
-        out_a = f"[a{idx}]"
-        if cf_dur > 0:
-            filter_parts.append(f"{prev_v}[{idx}:v]xfade=transition=fade:duration={cf_dur}:offset={offset}{out_v}")
-            filter_parts.append(f"{prev_a}[{idx}:a]acrossfade=d={cf_dur}{out_a}")
-        else:
-            filter_parts.append(f"{prev_v}[{idx}:v]concat=n=2:v=1:a=0{out_v}")
-            filter_parts.append(f"{prev_a}[{idx}:a]concat=n=2:v=0:a=1{out_a}")
-        prev_v = out_v
-        prev_a = out_a
-        offset += built_slots[idx][1]
-
-    filter_parts.append(f"{prev_a}loudnorm=I=-16.0:TP=-3.0:LRA=11.0[afinal]")
-    full_fc = ";".join(filter_parts)
-
-    run([
-        "ffmpeg", "-y",
-        *inputs_cmd,
-        "-filter_complex", full_fc,
-        "-map", prev_v, "-map", "[afinal]",
-        "-c:v", v_codec, "-preset", preset, "-crf", crf, "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", a_bitrate, "-ar", "48000",
-        out_filename
-    ])
+    # 1. Быстрая склейка без пересчёта пикселей основных слотов
+    raw_master = os.path.join(WORK_DIR, "raw_master.mp4")
+    print("=== Быстрая склейка слотов и кроссфейдов (-c:v copy) ===")
+    build_smart_concat(built_slots, raw_master, fps, v_codec, preset, crf, a_bitrate)
 
     for path, _, _ in built_slots:
         safe_remove(path)
 
-    with open("final_output_name.txt", "w") as f:
+    # 2. Финальная нормализация звука -16 LUFS с копированием видеопотока (занимает ~2-3 минуты вместо часа!)
+    print(f"=== Финальная нормализация звука (-16 LUFS) -> {out_filename} ===")
+    run([
+        "ffmpeg", "-y", "-i", raw_master,
+        "-c:v", "copy",
+        "-af", "loudnorm=I=-16.0:TP=-3.0:LRA=11.0",
+        "-c:a", "aac", "-b:a", a_bitrate, "-ar", "48000",
+        "-movflags", "+faststart",
+        out_filename
+    ])
+    safe_remove(raw_master)
+
+    # 3. Генерация таймкодов YouTube
+    chapters_file = f"{os.path.splitext(out_filename)[0]}_chapters.txt"
+    generate_chapters(manifest, chapters_file)
+
+    with open("final_output_name.txt", "w", encoding="utf-8") as f:
         f.write(out_filename)
+    with open("final_chapters_name.txt", "w", encoding="utf-8") as f:
+        f.write(chapters_file)
 
 
 if __name__ == "__main__":
