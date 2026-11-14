@@ -26,7 +26,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Record Start Time
-        run: echo "START_TS=$(date +%s)" >> $GITHUB_ENV
+        run: echo "START_TS=$(date +\%s)" >> $GITHUB_ENV
 
       - name: Free Disk Space on Runner
         run: |
@@ -44,9 +44,15 @@ jobs:
       - name: Setup Personal Rclone Config
         env:
           RCLONE_CONF_DATA: ${{ secrets.RCLONE_CONFIG }}
+          CUSTOM_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
+          CUSTOM_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
         run: |
           mkdir -p ~/.config/rclone
           printf "%s\n" "$RCLONE_CONF_DATA" > ~/.config/rclone/rclone.conf
+          if [ -n "$CUSTOM_CLIENT_ID" ] && [ -n "$CUSTOM_CLIENT_SECRET" ]; then
+            echo "RCLONE_DRIVE_CLIENT_ID=$CUSTOM_CLIENT_ID" >> $GITHUB_ENV
+            echo "RCLONE_DRIVE_CLIENT_SECRET=$CUSTOM_CLIENT_SECRET" >> $GITHUB_ENV
+          fi
           chmod 600 ~/.config/rclone/rclone.conf
           rclone listremotes
 
@@ -68,7 +74,7 @@ jobs:
                   with open("manifest.json", "w", encoding="utf-8") as f:
                       json.dump(data, f, ensure_ascii=False, indent=2)
                   manifest_saved = True
-                  print("Получен прямой JSON сцен из веб-приложения.")
+                  print("Received direct scenes JSON from Web Studio.")
               except Exception:
                   pass
 
@@ -79,7 +85,7 @@ jobs:
                       with open("manifest.json", "w", encoding="utf-8") as f:
                           json.dump(data, f, ensure_ascii=False, indent=2)
                       manifest_saved = True
-                      print("Получен Base64-манифест сцен из веб-приложения.")
+                      print("Received Base64 scenes manifest from Web Studio.")
                   except Exception:
                       pass
 
@@ -89,11 +95,11 @@ jobs:
                       if local_candidate != "manifest.json":
                           shutil.copy(local_candidate, "manifest.json")
                       manifest_saved = True
-                      print(f"Использован локальный файл {local_candidate}.")
+                      print(f"Used local file {local_candidate}.")
                       break
 
           if not manifest_saved and folder_override:
-              print("Скачиваем *manifest*.json из целевой папки Google Drive...")
+              print("Downloading *manifest*.json from target Google Drive folder...")
               subprocess.run([
                   "rclone", "copy", "gdrive:", ".",
                   "--drive-root-folder-id", folder_override,
@@ -103,11 +109,11 @@ jobs:
                   if "manifest" in fname and fname.endswith(".json") and fname != "manifest.json":
                       os.rename(fname, "manifest.json")
                       manifest_saved = True
-                      print(f"Скачан манифест: {fname}")
+                      print(f"Downloaded manifest: {fname}")
                       break
 
           if not os.path.exists("manifest.json") or os.path.getsize("manifest.json") == 0:
-              raise RuntimeError("Не удалось получить непустой manifest.json для сборки сцен!")
+              raise RuntimeError("Failed to obtain non-empty manifest.json for scene assembly!")
 
           if folder_override:
               with open("manifest.json", "r", encoding="utf-8") as f:
@@ -145,7 +151,7 @@ jobs:
               needed.add(bg["source_file"])
 
           if not folder_id:
-              print("⚠️ target_folder_id не задан — пропускаем сверку списка папки.")
+              print("⚠️ target_folder_id not specified — skipping folder listing check.")
           else:
               out = subprocess.check_output([
                   "rclone", "lsf", "gdrive:", "--drive-root-folder-id", folder_id
@@ -153,8 +159,8 @@ jobs:
               existing = set(x.strip() for x in out)
               missing = sorted(needed - existing)
               if missing:
-                  raise FileNotFoundError(f"На Google Диске отсутствуют файлы сцен: {', '.join(missing)}")
-              print(f"✅ Все {len(needed)} видео- и аудиофайлов сцен подтверждены на Google Диске!")
+                  raise FileNotFoundError(f"Missing scene assets on Google Drive: {', '.join(missing)}")
+              print(f"✅ All {len(needed)} scene video/audio files verified on Google Drive!")
           EOF
 
       - name: Assemble Scenes with FFmpeg
@@ -170,6 +176,13 @@ jobs:
           python3 - "$OUT_FILE" << 'EOF'
           import json, os, re, subprocess, sys
 
+          def clean_en(text, fallback=""):
+              if not text:
+                  return fallback
+              res = re.sub(r"[А-Яа-яЁё]+", "", str(text)).strip(" -–—|:;,.")
+              res = re.sub(r"\s{2,}", " ", res).strip()
+              return res if res else fallback
+
           out_file = sys.argv[1]
           probe = json.loads(subprocess.check_output([
               "ffprobe", "-v", "error", "-show_entries", "format=duration:stream=codec_type",
@@ -179,11 +192,12 @@ jobs:
           dur = float(probe["format"]["duration"])
           streams = probe.get("streams", [])
           if not any(s["codec_type"] == "video" for s in streams) or not any(s["codec_type"] == "audio" for s in streams):
-              raise RuntimeError("Auto-QC провален: отсутствует видео или аудио поток!")
+              raise RuntimeError("Auto-QC failed: missing video or audio stream!")
 
+          # -vn skips 4K video decoding during EBU R128 loudness check (~10s instead of 15 min)
           lufs_proc = subprocess.run([
-              "ffmpeg", "-nostats", "-i", out_file,
-              "-filter_complex", "ebur128=framelog=verbose", "-f", "null", "-"
+              "ffmpeg", "-nostats", "-vn", "-i", out_file,
+              "-filter_complex", "ebur128", "-f", "null", "-"
           ], capture_output=True, text=True)
           m = re.findall(r"I:\s*(-?\d+\.\d+)\s*LUFS", lufs_proc.stderr)
           lufs = float(m[-1]) if m else -16.0
@@ -192,7 +206,7 @@ jobs:
           mins, secs = divmod(rem, 60)
           dur_fmt = f"{h:02d}:{mins:02d}:{secs:02d}"
           summary = f"{dur_fmt} • {lufs} LUFS"
-          print(f"✅ Auto-QC пройден: {summary}")
+          print(f"✅ Auto-QC passed: {summary}")
           with open("qc_summary.txt", "w", encoding="utf-8") as f:
               f.write(summary)
 
@@ -203,7 +217,8 @@ jobs:
           chapters_lines = []
           cur_sec = 0.0
           for idx, sc in enumerate(scenes):
-              title = sc.get("title") or sc.get("label") or f"Scene {idx + 1}"
+              raw_title = sc.get("title_en") or sc.get("title") or sc.get("label") or f"Scene {idx + 1}"
+              title = clean_en(raw_title, f"Scene {idx + 1}")
               sh, srem = divmod(int(round(cur_sec)), 3600)
               smin, ssec = divmod(srem, 60)
               chapters_lines.append(f"{sh:02d}:{smin:02d}:{ssec:02d} {title}")
@@ -214,23 +229,32 @@ jobs:
               cf.write("\n".join(chapters_lines) + "\n")
 
           seo = manifest.get("youtube_seo", {})
+          title_en = clean_en(seo.get("title_en") or seo.get("title"), out_file)
+          desc_en = clean_en(
+              seo.get("description_en") or seo.get("description"),
+              "4K Ultra HD Cinematic Narrative & Atmospheric Story."
+          )
+          tags_en = [clean_en(t) for t in seo.get("tags", []) if clean_en(t)]
+          if not tags_en:
+              tags_en = ["4K Documentary", "Cinematic Story", "4K Ultra HD", "History & Mystery"]
+
           card = [
-              f"# RELEASE CARD: {seo.get('title') or out_file}",
+              f"# RELEASE CARD: {title_en}",
               "",
-              f"- **Файл мастера:** `{out_file}`",
-              f"- **Хронометраж:** {dur_fmt}",
-              f"- **Громкость (EBU R128):** {lufs} LUFS",
+              f"- **Master File:** `{out_file}`",
+              f"- **Duration:** {dur_fmt}",
+              f"- **Integrated Loudness (EBU R128):** {lufs} LUFS",
               "",
-              "## Описание для YouTube",
-              seo.get("description", "(не задано в манифесте)"),
+              "## YouTube Description",
+              desc_en,
               "",
-              "## Таймкоды сцен",
+              "## Timestamps (Chapters)",
               "```text",
               "\n".join(chapters_lines),
               "```",
               "",
-              "## Теги",
-              ", ".join(seo.get("tags", []))
+              "## Tags",
+              ", ".join(tags_en)
           ]
           with open("RELEASE_CARD.md", "w", encoding="utf-8") as rcf:
               rcf.write("\n".join(card) + "\n")
@@ -244,23 +268,36 @@ jobs:
           CHAPTERS_FILE="${OUT_FILE%.*}_chapters.txt"
           FOLDER_ID=$(jq -r '.cloud_export.target_folder_id // .gdriveFolderId // empty' manifest.json 2>/dev/null || true)
 
+          RCLONE_FLAGS=(
+            --drive-chunk-size 128M
+            --drive-upload-cutoff 128M
+            --transfers 1
+            --checkers 2
+            --tpslimit 2
+            --tpslimit-burst 4
+            --timeout 15m
+            --contimeout 60s
+            --retries 3
+            --low-level-retries 5
+            --stats 30s
+            -v
+          )
+
           echo "=== Выгрузка $OUT_FILE и метаданных на Google Диск ==="
           if [ -n "$FOLDER_ID" ]; then
-            rclone copy "./$OUT_FILE" gdrive: --drive-root-folder-id "$FOLDER_ID" \
-              --drive-chunk-size 64M --transfers 2 --checkers 4 --retries 5 --low-level-retries 10 --stats 30s -v
-            [ -f "./$CHAPTERS_FILE" ] && rclone copy "./$CHAPTERS_FILE" gdrive: --drive-root-folder-id "$FOLDER_ID" -v
-            [ -f "RELEASE_CARD.md" ] && rclone copy "./RELEASE_CARD.md" gdrive: --drive-root-folder-id "$FOLDER_ID" -v
+            rclone copy "./$OUT_FILE" gdrive: --drive-root-folder-id "$FOLDER_ID" "${RCLONE_FLAGS[@]}"
+            [ -f "./$CHAPTERS_FILE" ] && rclone copy "./$CHAPTERS_FILE" gdrive: --drive-root-folder-id "$FOLDER_ID" --tpslimit 2 -v
+            [ -f "RELEASE_CARD.md" ] && rclone copy "./RELEASE_CARD.md" gdrive: --drive-root-folder-id "$FOLDER_ID" --tpslimit 2 -v
             if [ -d "shorts_out" ] && [ "$(ls -A shorts_out)" ]; then
-              rclone copy "./shorts_out/" "gdrive:Shorts/" --drive-root-folder-id "$FOLDER_ID" -v
+              rclone copy "./shorts_out/" "gdrive:Shorts/" --drive-root-folder-id "$FOLDER_ID" --transfers 1 --tpslimit 2 -v
             fi
             DRIVE_LINK=$(rclone link "gdrive:$OUT_FILE" --drive-root-folder-id "$FOLDER_ID" 2>/dev/null || echo "")
           else
-            rclone copy "./$OUT_FILE" gdrive:AetherFlow_Output/ \
-              --drive-chunk-size 64M --transfers 2 --checkers 4 --retries 5 --low-level-retries 10 --stats 30s -v
-            [ -f "./$CHAPTERS_FILE" ] && rclone copy "./$CHAPTERS_FILE" gdrive:AetherFlow_Output/ -v
-            [ -f "RELEASE_CARD.md" ] && rclone copy "./RELEASE_CARD.md" gdrive:AetherFlow_Output/ -v
+            rclone copy "./$OUT_FILE" gdrive:AetherFlow_Output/ "${RCLONE_FLAGS[@]}"
+            [ -f "./$CHAPTERS_FILE" ] && rclone copy "./$CHAPTERS_FILE" gdrive:AetherFlow_Output/ --tpslimit 2 -v
+            [ -f "RELEASE_CARD.md" ] && rclone copy "./RELEASE_CARD.md" gdrive:AetherFlow_Output/ --tpslimit 2 -v
             if [ -d "shorts_out" ] && [ "$(ls -A shorts_out)" ]; then
-              rclone copy "./shorts_out/" "gdrive:AetherFlow_Output/Shorts/" -v
+              rclone copy "./shorts_out/" "gdrive:AetherFlow_Output/Shorts/" --transfers 1 --tpslimit 2 -v
             fi
             DRIVE_LINK=$(rclone link "gdrive:AetherFlow_Output/$OUT_FILE" 2>/dev/null || echo "")
           fi
@@ -285,7 +322,7 @@ jobs:
           if [ "${{ github.event.inputs.preflight_only }}" = "true" ] && [ "$STATUS" = "success" ]; then
             MSG="🔍 *Preflight-проверка сцен пройдена!*%0A%0A✅ Все видео- и аудиофайлы найдены на Google Диске."
           elif [ "$STATUS" = "success" ]; then
-            MSG="✅ *Повествовательный монтаж сцен готов и прошёл Auto-QC!*%0A%0A📁 *Файл:* \`${OUT_FILE}\` (${FILE_SIZE})%0A🎛 *QC:* ${QC_SUMMARY}%0A⏱ *Время сборки:* ${MINS} мин%0A📝 *Метаданные:* таймкоды и \`RELEASE_CARD.md\` в папке"
+            MSG="✅ *Повествовательный монтаж сцен готов и прошёл Auto-QC!*%0A%0A📁 *Файл:* \`${OUT_FILE}\` (${FILE_SIZE})%0A🎛 *QC:* ${QC_SUMMARY}%0A⏱ *Время сборки:* ${MINS} мин%0A📝 *Метаданные:* английские таймкоды и \`RELEASE_CARD.md\` в папке"
             [ "${SHORTS_COUNT:-0}" -gt 0 ] && MSG="${MSG}%0A📱 *Shorts (9:16):* ${SHORTS_COUNT} шт. в подпапке \`Shorts/\`"
             [ -n "$DRIVE_LINK" ] && MSG="${MSG}%0A🔗 [Открыть на Google Диске](${DRIVE_LINK})"
           else
