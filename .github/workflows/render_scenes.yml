@@ -3,13 +3,17 @@ name: Render Scenes Pipeline
 on:
   workflow_dispatch:
     inputs:
-      resolution:
-        description: 'Разрешение рендера (4k / 1080p)'
+      manifest_payload:
+        description: 'JSON or Base64 payload from Web Studio'
         required: false
-        default: '4k'
+        default: '{}'
+      gdrive_folder_id:
+        description: 'Target Google Drive Folder ID'
+        required: false
+        default: ''
 
 jobs:
-  render_scenes:
+  assemble_and_upload:
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
@@ -17,60 +21,129 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Install Dependencies (FFmpeg & Rclone)
+      - name: Free Disk Space on Runner
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg curl jq
+          sudo apt-get install -y ffmpeg curl jq python3
           curl https://rclone.org/install.sh | sudo bash
 
-      - name: Build and Run FFmpeg Pipeline
-        run: |
-          set -e
-          mkdir -p temp_scenes output_dir
-
-          echo "=== Сборка сюжетных сцен из манифеста ==="
-          if [ -f "render_scenes.sh" ]; then
-            bash render_scenes.sh
-          elif [ -f "scenes_list.txt" ]; then
-            # Склейка готового списка сцен
-            ffmpeg -y -f concat -safe 0 -i scenes_list.txt -c:v libx264 -preset fast -crf 20 -c:a aac -b:a 320k output.mp4
-          elif [ -f "manifest.json" ]; then
-            echo "Обнаружен manifest.json, запуск универсального парсера сцен..."
-            python3 build_scenes.py || bash render_from_manifest.sh
-          else
-            echo "Входные сцены не обнаружены. Генерация тестового сюжетного ролика..."
-            ffmpeg -y -f lavfi -i color=c=navy:s=3840x2160:r=24 -f lavfi -i anullsrc=r=48000:cl=stereo -t 60 -c:v libx264 -preset fast -crf 20 -c:a aac output.mp4
-          fi
-
-          echo "Проверка скомпилированного видео:"
-          ls -lh output.mp4
-
       - name: Setup Personal Rclone Config
+        env:
+          RCLONE_CONF_DATA: ${{ secrets.RCLONE_CONFIG }}
         run: |
           mkdir -p ~/.config/rclone
-          echo "${{ secrets.RCLONE_CONFIG }}" > ~/.config/rclone/rclone.conf
+          printf "%s\n" "$RCLONE_CONF_DATA" > ~/.config/rclone/rclone.conf
           chmod 600 ~/.config/rclone/rclone.conf
           rclone listremotes
 
+      - name: Parse Studio Manifest Payload
+        env:
+          RAW_PAYLOAD: ${{ github.event.inputs.manifest_payload }}
+          INPUT_FOLDER_ID: ${{ github.event.inputs.gdrive_folder_id }}
+        run: |
+          python3 - << 'EOF'
+          import os, base64, json, shutil, subprocess
+
+          raw = os.environ.get("RAW_PAYLOAD", "").strip()
+          folder_override = os.environ.get("INPUT_FOLDER_ID", "").strip()
+          manifest_saved = False
+
+          if raw and raw != "{}":
+              # 1. Прямой JSON
+              try:
+                  data = json.loads(raw)
+                  with open("manifest.json", "w", encoding="utf-8") as f:
+                      json.dump(data, f, ensure_ascii=False, indent=2)
+                  manifest_saved = True
+                  print("Получен прямой JSON сцен из веб-приложения.")
+              except Exception:
+                  pass
+
+              # 2. Base64 payload
+              if not manifest_saved:
+                  try:
+                      decoded = base64.b64decode(raw).decode("utf-8")
+                      data = json.loads(decoded)
+                      with open("manifest.json", "w", encoding="utf-8") as f:
+                          json.dump(data, f, ensure_ascii=False, indent=2)
+                      manifest_saved = True
+                      print("Получен Base64-манифест сцен из веб-приложения.")
+                  except Exception:
+                      pass
+
+          # 3. Резерв: локальный scenes_manifest.json или поиск на Google Диске
+          if not manifest_saved:
+              for local_candidate in ["scenes_manifest.json", "manifest.json"]:
+                  if os.path.exists(local_candidate) and os.path.getsize(local_candidate) > 0:
+                      if local_candidate != "manifest.json":
+                          shutil.copy(local_candidate, "manifest.json")
+                      manifest_saved = True
+                      print(f"Использован локальный файл {local_candidate}.")
+                      break
+
+          if not manifest_saved and folder_override:
+              print("Скачиваем *manifest*.json из целевой папки Google Drive...")
+              subprocess.run([
+                  "rclone", "copy", "gdrive:", ".",
+                  "--drive-root-folder-id", folder_override,
+                  "--include", "*manifest*.json", "-v"
+              ], check=False)
+              for fname in os.listdir("."):
+                  if "manifest" in fname and fname.endswith(".json") and fname != "manifest.json":
+                      os.rename(fname, "manifest.json")
+                      manifest_saved = True
+                      print(f"Скачан манифест: {fname}")
+                      break
+
+          if not os.path.exists("manifest.json") or os.path.getsize("manifest.json") == 0:
+              raise RuntimeError("Не удалось получить непустой manifest.json для сборки сцен!")
+
+          # Если передан gdrive_folder_id через input, записываем его в манифест при отсутствии
+          if folder_override:
+              with open("manifest.json", "r", encoding="utf-8") as f:
+                  m = json.load(f)
+              m.setdefault("cloud_export", {})
+              if not m["cloud_export"].get("target_folder_id"):
+                  m["cloud_export"]["target_folder_id"] = folder_override
+              with open("manifest.json", "w", encoding="utf-8") as f:
+                  json.dump(m, f, ensure_ascii=False, indent=2)
+          EOF
+          ls -lh manifest.json
+
+      - name: Assemble Scenes with FFmpeg
+        run: |
+          set -e
+          python3 assemble_scenes.py
+
       - name: Upload Output Video to Google Drive
         run: |
-          echo "=== Выгрузка сюжетного ролика на Google Диск ==="
-          rclone copy ./output.mp4 gdrive:AetherFlow_Output/ \
-            --drive-chunk-size 64M \
-            --transfers 2 \
-            --checkers 4 \
-            --retries 5 \
-            --low-level-retries 10 \
-            --stats 30s \
-            -v
+          OUT_FILE=$(cat final_output_name.txt)
+          FOLDER_ID=$(jq -r '.cloud_export.target_folder_id // .gdriveFolderId // empty' manifest.json 2>/dev/null || true)
+
+          echo "=== Выгрузка $OUT_FILE на Google Диск ==="
+          if [ -n "$FOLDER_ID" ]; then
+            rclone copy "./$OUT_FILE" gdrive: --drive-root-folder-id "$FOLDER_ID" \
+              --drive-chunk-size 64M --transfers 2 --checkers 4 --retries 5 --low-level-retries 10 --stats 30s -v
+          else
+            rclone copy "./$OUT_FILE" gdrive:AetherFlow_Output/ \
+              --drive-chunk-size 64M --transfers 2 --checkers 4 --retries 5 --low-level-retries 10 --stats 30s -v
+          fi
 
       - name: Send Telegram Notification
         if: always()
         run: |
-          if [ "${{ job.status }}" == "success" ]; then
-            MSG="🎬 *Сюжетный ролик (Scenes) успешно готов!*%0A%0A📁 *Файл:* output.mp4%0A☁️ *Папка:* Google Drive / AetherFlow_Output%0A✨ *Статус:* Доступен для загрузки"
+          STATUS="${{ job.status }}"
+          OUT_FILE=$(cat final_output_name.txt 2>/dev/null || echo "scenes_master.mp4")
+          if [ "$STATUS" = "success" ]; then
+            MSG="✅ *Повествовательный монтаж сцен готов и выгружен!*%0A%0A📁 *Файл:* ${OUT_FILE}%0A☁️ *Google Drive:* папка проекта"
           else
-            MSG="❌ *Ошибка сборки сюжетных сцен!*%0A%0A⚠️ *Статус:* ${{ job.status }}%0A🔍 Проверьте лог шага FFmpeg Pipeline."
+            MSG="❌ *Ошибка при сборке сцен!*%0A%0A⚠️ *Статус:* $STATUS"
           fi
 
           curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
