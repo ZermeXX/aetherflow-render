@@ -27,19 +27,6 @@ jobs:
           sudo apt-get install -y ffmpeg curl jq python3
           curl https://rclone.org/install.sh | sudo bash
 
-      - name: Parse Studio Manifest Payload
-        env:
-          RAW_PAYLOAD: ${{ github.event.inputs.manifest_payload }}
-        run: |
-          mkdir -p temp_render
-          if [ -n "$RAW_PAYLOAD" ] && [ "$RAW_PAYLOAD" != "{}" ]; then
-            printf "%s\n" "$RAW_PAYLOAD" > manifest.json
-            echo "Манифест из приложения успешно получен:"
-            cat manifest.json
-          else
-            echo "Запуск без внешнего манифеста (используются локальные параметры)."
-          fi
-
       - name: Setup Personal Rclone Config
         env:
           RCLONE_CONF_DATA: ${{ secrets.RCLONE_CONFIG }}
@@ -49,69 +36,38 @@ jobs:
           chmod 600 ~/.config/rclone/rclone.conf
           rclone listremotes
 
-      - name: Build and Run FFmpeg Pipeline
+      - name: Parse Studio Manifest Payload
         env:
-          INPUT_HOURS: ${{ github.event.inputs.target_hours }}
+          RAW_PAYLOAD: ${{ github.event.inputs.manifest_payload }}
+        run: |
+          if [ -n "$RAW_PAYLOAD" ] && [ "$RAW_PAYLOAD" != "{}" ]; then
+            printf "%s\n" "$RAW_PAYLOAD" > manifest.json
+          elif [ -f "assembly_manifest_metel_3h.json" ]; then
+            cp assembly_manifest_metel_3h.json manifest.json
+          fi
+
+      - name: Build and Run FFmpeg Pipeline
         run: |
           set -e
-          mkdir -p temp_render
-
-          echo "=== 1. Render Base Slot ==="
-          if [ -f "render_slot.sh" ]; then
-            bash render_slot.sh
-          elif [ -f "manifest.json" ] && [ -f "render_from_manifest.sh" ]; then
-            bash render_from_manifest.sh
-          elif [ -f "input_loop.mp4" ]; then
-            ffmpeg -y -i input_loop.mp4 -c:v libx264 -preset fast -crf 20 -c:a aac -b:a 320k temp_render/slot_master.mp4
+          if [ -f "manifest.json" ] && [ -f "build_timeline.py" ]; then
+            python3 build_timeline.py
           else
-            ffmpeg -y -f lavfi -i testsrc=size=3840x2160:rate=24 -f lavfi -i anullsrc=r=48000:cl=stereo -t 900 -c:v libx264 -preset fast -crf 20 -c:a aac temp_render/slot_master.mp4
+            echo "Манифест не найден, запуск резервной сборки..."
+            ffmpeg -y -f lavfi -i testsrc=size=1920x1080:rate=24 -f lavfi -i anullsrc=r=48000:cl=stereo -t 60 -c:v libx264 -preset fast -c:a aac output.mp4
+            echo "output.mp4" > final_output_name.txt
           fi
-
-          echo "=== 2. Build Seamless Loop ==="
-          SLOT_DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 temp_render/slot_master.mp4)
-          SLOT_SECS=${SLOT_DURATION%.*}
-          if [ -z "$SLOT_SECS" ] || [ "$SLOT_SECS" -le 0 ]; then
-            SLOT_SECS=900
-          fi
-
-          # Берем длительность из манифеста (если передана) или из target_hours
-          HOURS="$INPUT_HOURS"
-          if [ -f "manifest.json" ]; then
-            MANIFEST_H=$(jq -r '.targetHours // .target_hours // empty' manifest.json 2>/dev/null || true)
-            if [ -n "$MANIFEST_H" ]; then
-              HOURS="$MANIFEST_H"
-            fi
-          fi
-          if [ -z "$HOURS" ]; then
-            HOURS=3
-          fi
-          TARGET_SECS=$(( HOURS * 3600 ))
-
-          REPEATS=$(( (TARGET_SECS + SLOT_SECS - 1) / SLOT_SECS ))
-          echo "Slot: ${SLOT_SECS}s. Repeats: ${REPEATS}"
-
-          > temp_render/loop_list.txt
-          for i in $(seq 1 $REPEATS); do
-            echo "file '$(pwd)/temp_render/slot_master.mp4'" >> temp_render/loop_list.txt
-          done
-
-          ffmpeg -y -f concat -safe 0 -i temp_render/loop_list.txt -t $TARGET_SECS -c copy output.mp4
-          ls -lh output.mp4
 
       - name: Upload Output Video to Google Drive
         run: |
-          echo "=== Uploading to Google Drive ==="
-          FOLDER_ID=""
-          if [ -f "manifest.json" ]; then
-            FOLDER_ID=$(jq -r '.gdriveFolderId // .folderId // .gdrive_folder_id // empty' manifest.json 2>/dev/null || true)
-          fi
+          OUT_FILE=$(cat final_output_name.txt)
+          FOLDER_ID=$(jq -r '.cloud_export.target_folder_id // .gdriveFolderId // empty' manifest.json 2>/dev/null || true)
 
+          echo "=== Выгрузка $OUT_FILE на Google Диск ==="
           if [ -n "$FOLDER_ID" ]; then
-            echo "Выгрузка в целевую папку по ID: $FOLDER_ID"
-            rclone copy ./output.mp4 gdrive: --drive-root-folder-id "$FOLDER_ID" \
+            rclone copy "./$OUT_FILE" gdrive: --drive-root-folder-id "$FOLDER_ID" \
               --drive-chunk-size 64M --transfers 2 --checkers 4 --retries 5 --low-level-retries 10 --stats 30s -v
           else
-            rclone copy ./output.mp4 gdrive:AetherFlow_Output/ \
+            rclone copy "./$OUT_FILE" gdrive:AetherFlow_Output/ \
               --drive-chunk-size 64M --transfers 2 --checkers 4 --retries 5 --low-level-retries 10 --stats 30s -v
           fi
 
@@ -119,10 +75,11 @@ jobs:
         if: always()
         run: |
           STATUS="${{ job.status }}"
+          OUT_FILE=$(cat final_output_name.txt 2>/dev/null || echo "video.mp4")
           if [ "$STATUS" = "success" ]; then
-            MSG="✅ *3-hour Loop successfully created and uploaded!*%0A%0A📁 File: output.mp4%0A☁️ Target: Google Drive"
+            MSG="✅ *3-часовой мастер-ролик готов и выгружен!*%0A%0A📁 *Файл:* ${OUT_FILE}%0A☁️ *Google Drive:* папка проекта"
           else
-            MSG="❌ *Pipeline Failed!*%0A%0A⚠️ Status: $STATUS"
+            MSG="❌ *Ошибка при сборке проекта!*%0A%0A⚠️ *Статус:* $STATUS"
           fi
 
           curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
