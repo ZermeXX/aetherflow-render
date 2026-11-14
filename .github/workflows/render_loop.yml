@@ -30,8 +30,9 @@ jobs:
 
       - name: Free Disk Space on Runner
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache /usr/local/share/boost
           sudo docker image prune --all --force || true
+          sudo apt-get clean
           df -h
 
       - name: Install Dependencies
@@ -139,7 +140,7 @@ jobs:
       - name: Generate Vertical Shorts & Release Card
         if: github.event.inputs.preflight_only != 'true'
         run: |
-          python3 shorts_factory.py
+          [ -f "shorts_factory.py" ] && python3 shorts_factory.py
           python3 - << 'EOF'
           import json, os
 
@@ -230,11 +231,11 @@ jobs:
           if [ "${{ github.event.inputs.preflight_only }}" = "true" ] && [ "$STATUS" = "success" ]; then
             MSG="🔍 *Preflight-проверка пройдена!*%0A%0A✅ Все исходные клипы и врезки найдены на Google Диске."
           elif [ "$STATUS" = "success" ]; then
-            MSG="✅ *Мастер-ролик готов и прошёл Auto-QC!*%0A%0A📁 *Файл:* \`${OUT_FILE}\` (${FILE_SIZE})%0A🎛 *QC:* ${QC_SUMMARY}\%0A⏱ *Время сборки:* ${MINS} мин%0A📝 *Метаданные:* таймкоды и \`RELEASE_CARD.md\` в папке"
-            [ "${SHORTS_COUNT:-0}" -gt 0 ] && MSG="${MSG}\%0A📱 *Shorts (9:16):* ${SHORTS_COUNT} шт. в подпапке \`Shorts/\`"
-            [ -n "$DRIVE_LINK" ] && MSG="${MSG}\%0A🔗 [Открыть на Google Диске](${DRIVE_LINK})"
+            MSG="✅ *Мастер-ролик готов и прошёл Auto-QC!*%0A%0A📁 *Файл:* \`${OUT_FILE}\` (${FILE_SIZE})%0A🎛 *QC:* ${QC_SUMMARY}%0A⏱ *Время сборки:* ${MINS} мин%0A📝 *Метаданные:* таймкоды и \`RELEASE_CARD.md\` в папке"
+            [ "${SHORTS_COUNT:-0}" -gt 0 ] && MSG="${MSG}%0A📱 *Shorts (9:16):* ${SHORTS_COUNT} шт. в подпапке \`Shorts/\`"
+            [ -n "$DRIVE_LINK" ] && MSG="${MSG}%0A🔗 [Открыть на Google Диске](${DRIVE_LINK})"
           else
-            MSG="❌ *Ошибка при сборке проекта!*%0A%0A⚠️ *Статус:* $STATUS\%0A⏱ *Прошло:* ${MINS} мин"
+            MSG="❌ *Ошибка при сборке проекта!*%0A%0A⚠️ *Статус:* $STATUS%0A⏱ *Прошло:* ${MINS} мин"
           fi
 
           curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
