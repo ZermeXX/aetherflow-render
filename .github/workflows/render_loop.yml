@@ -8,9 +8,13 @@ on:
         required: false
         default: '3'
       manifest_payload:
-        description: 'JSON payload from Web Studio'
+        description: 'JSON or Base64 payload from Web Studio'
         required: false
         default: '{}'
+      preflight_only:
+        description: 'Check assets on Google Drive without rendering'
+        required: false
+        default: 'false'
 
 jobs:
   render_and_upload:
@@ -20,6 +24,9 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+
+      - name: Record Start Time
+        run: echo "START_TS=$(date +%s)" >> $GITHUB_ENV
 
       - name: Free Disk Space on Runner
         run: |
@@ -53,7 +60,6 @@ jobs:
           manifest_saved = False
 
           if raw and raw != "{}":
-              # 1. Пробуем распарсить как прямой JSON
               try:
                   data = json.loads(raw)
                   with open("manifest.json", "w", encoding="utf-8") as f:
@@ -63,7 +69,6 @@ jobs:
               except Exception:
                   pass
 
-              # 2. Пробуем декодировать из Base64
               if not manifest_saved:
                   try:
                       decoded = base64.b64decode(raw).decode("utf-8")
@@ -75,7 +80,6 @@ jobs:
                   except Exception:
                       pass
 
-          # 3. Резерв: берем локальный файл из репозитория или скачиваем с Google Диска
           if not manifest_saved:
               if os.path.exists("assembly_manifest_metel_3h.json"):
                   shutil.copy("assembly_manifest_metel_3h.json", "manifest.json")
@@ -100,43 +104,85 @@ jobs:
           EOF
           ls -lh manifest.json
 
+      - name: Preflight Asset Check
+        run: |
+          python3 - << 'EOF'
+          import json, subprocess
+
+          with open("manifest.json", "r", encoding="utf-8") as f:
+              m = json.load(f)
+
+          folder_id = m.get("cloud_export", {}).get("target_folder_id", "1OuuxKa85KAR-zz9TFXv6Ccg99fZ6JpuK")
+          needed = set()
+          for s in m.get("timeline_slots", []):
+              needed.add(s["base_content"]["file_name"])
+              for ins in s.get("inserts", []):
+                  needed.add(ins["file_name"])
+
+          out = subprocess.check_output([
+              "rclone", "lsf", "gdrive:", "--drive-root-folder-id", folder_id
+          ]).decode("utf-8").splitlines()
+          existing = set(x.strip() for x in out)
+
+          missing = sorted(needed - existing)
+          print(f"Всего уникальных ассетов в манифесте: {len(needed)}")
+          if missing:
+              raise FileNotFoundError(f"На Google Диске отсутствуют файлы: {', '.join(missing)}")
+          print("✅ Все исходные клипы и врезки подтверждены на Google Диске!")
+          EOF
+
       - name: Build and Run FFmpeg Pipeline
+        if: github.event.inputs.preflight_only != 'true'
         run: |
           set -e
-          if [ -f "manifest.json" ] && [ -f "build_timeline.py" ]; then
-            python3 build_timeline.py
-          else
-            echo "Манифест или build_timeline.py не найдены, запуск резервной сборки..."
-            ffmpeg -y -f lavfi -i testsrc=size=1920x1080:rate=24 -f lavfi -i anullsrc=r=48000:cl=stereo -t 60 -c:v libx264 -preset fast -c:a aac output.mp4
-            echo "output.mp4" > final_output_name.txt
-          fi
+          python3 build_timeline.py
 
-      - name: Upload Output Video to Google Drive
+      - name: Upload Output Video and Chapters to Google Drive
+        if: github.event.inputs.preflight_only != 'true'
         run: |
           OUT_FILE=$(cat final_output_name.txt)
+          CHAPTERS_FILE=$(cat final_chapters_name.txt 2>/dev/null || echo "")
           FOLDER_ID=$(jq -r '.cloud_export.target_folder_id // .gdriveFolderId // empty' manifest.json 2>/dev/null || true)
 
-          echo "=== Выгрузка $OUT_FILE на Google Диск ==="
+          echo "=== Выгрузка $OUT_FILE и таймкодов на Google Диск ==="
           if [ -n "$FOLDER_ID" ]; then
             rclone copy "./$OUT_FILE" gdrive: --drive-root-folder-id "$FOLDER_ID" \
               --drive-chunk-size 64M --transfers 2 --checkers 4 --retries 5 --low-level-retries 10 --stats 30s -v
+            [ -f "./$CHAPTERS_FILE" ] && rclone copy "./$CHAPTERS_FILE" gdrive: --drive-root-folder-id "$FOLDER_ID" -v
+            DRIVE_LINK=$(rclone link "gdrive:$OUT_FILE" --drive-root-folder-id "$FOLDER_ID" 2>/dev/null || echo "")
           else
             rclone copy "./$OUT_FILE" gdrive:AetherFlow_Output/ \
               --drive-chunk-size 64M --transfers 2 --checkers 4 --retries 5 --low-level-retries 10 --stats 30s -v
+            [ -f "./$CHAPTERS_FILE" ] && rclone copy "./$CHAPTERS_FILE" gdrive:AetherFlow_Output/ -v
+            DRIVE_LINK=$(rclone link "gdrive:AetherFlow_Output/$OUT_FILE" 2>/dev/null || echo "")
           fi
+
+          FILE_SIZE=$(du -h "./$OUT_FILE" | cut -f1)
+          echo "DRIVE_LINK=$DRIVE_LINK" >> $GITHUB_ENV
+          echo "FILE_SIZE=$FILE_SIZE" >> $GITHUB_ENV
 
       - name: Send Telegram Notification
         if: always()
         run: |
           STATUS="${{ job.status }}"
+          END_TS=$(date +%s)
+          ELAPSED=$((END_TS - START_TS))
+          MINS=$((ELAPSED / 60))
           OUT_FILE=$(cat final_output_name.txt 2>/dev/null || echo "video.mp4")
-          if [ "$STATUS" = "success" ]; then
-            MSG="✅ *3-часовой мастер-ролик готов и выгружен!*%0A%0A📁 *Файл:* ${OUT_FILE}%0A☁️ *Google Drive:* папка проекта"
+
+          if [ "${{ github.event.inputs.preflight_only }}" = "true" ] && [ "$STATUS" = "success" ]; then
+            MSG="🔍 *Preflight-проверка пройдена!*%0A%0A✅ Все исходные клипы и врезки найдены на Google Диске."
+          elif [ "$STATUS" = "success" ]; then
+            MSG="✅ *3-часовой мастер-ролик готов!*%0A%0A📁 *Файл:* \`${OUT_FILE}\` (${FILE_SIZE})%0A⏱ *Время сборки:* ${MINS} мин%0A📝 *Таймкоды YouTube:* выгружены в папку"
+            if [ -n "$DRIVE_LINK" ]; then
+              MSG="${MSG}%0A🔗 [Открыть видео на Google Диске](${DRIVE_LINK})"
+            fi
           else
-            MSG="❌ *Ошибка при сборке проекта!*%0A%0A⚠️ *Статус:* $STATUS"
+            MSG="❌ *Ошибка при сборке проекта!*%0A%0A⚠️ *Статус:* $STATUS%0A⏱ *Прошло:* ${MINS} мин"
           fi
 
           curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
             -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
             -d "parse_mode=Markdown" \
+            -d "disable_web_page_preview=true" \
             -d "text=$MSG"
