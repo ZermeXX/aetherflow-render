@@ -41,6 +41,14 @@ def format_timestamp(seconds):
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
+def sanitize_english_title(text, fallback):
+    if not text:
+        return fallback
+    cleaned = re.sub(r"[А-Яа-яЁё]+", "", str(text)).strip(" -–—|:;,.")
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    return cleaned if cleaned else fallback
+
+
 def ensure_asset(filename, folder_id):
     local_path = os.path.join(ASSETS_DIR, filename)
     if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
@@ -48,7 +56,7 @@ def ensure_asset(filename, folder_id):
     if os.path.exists(filename) and os.path.getsize(filename) > 0:
         return filename
 
-    print(f"Скачиваем {filename} из Google Drive...")
+    print(f"Downloading {filename} from Google Drive...")
     if folder_id:
         subprocess.run([
             "rclone", "copy", f"gdrive:{filename}", ASSETS_DIR,
@@ -62,7 +70,7 @@ def ensure_asset(filename, folder_id):
         ])
 
     if not os.path.exists(local_path):
-        raise FileNotFoundError(f"Исходный файл {filename} не найден ни в репозитории, ни на Google Диске!")
+        raise FileNotFoundError(f"Source file {filename} not found in repository or Google Drive!")
     return local_path
 
 
@@ -71,7 +79,8 @@ def build_seamless_loop(src_file, target_sec, cf_sec, out_file, width, height, f
     run([
         "ffmpeg", "-y", "-i", src_file,
         "-vf", f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},fps={fps},format=yuv420p",
-        "-c:v", v_codec, "-preset", preset, "-crf", crf, "-g", str(fps * 2), "-keyint_min", str(fps * 2),
+        "-c:v", v_codec, "-preset", preset, "-crf", crf, "-pix_fmt", "yuv420p",
+        "-g", str(fps * 2), "-keyint_min", str(fps * 2),
         "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", a_bitrate,
         norm_clip
     ])
@@ -96,7 +105,8 @@ def build_seamless_loop(src_file, target_sec, cf_sec, out_file, width, height, f
             "ffmpeg", "-y", "-i", norm_clip,
             "-filter_complex", filter_complex,
             "-map", "[v]", "-map", "[a]",
-            "-c:v", v_codec, "-preset", preset, "-crf", crf, "-g", str(fps * 2), "-keyint_min", str(fps * 2),
+            "-c:v", v_codec, "-preset", preset, "-crf", crf, "-pix_fmt", "yuv420p",
+            "-g", str(fps * 2), "-keyint_min", str(fps * 2),
             "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", a_bitrate,
             unit_clip
         ])
@@ -162,7 +172,8 @@ def apply_inserts_surgical(base_video, inserts, slot_start_sec, out_video, width
         run([
             "ffmpeg", "-y", "-ss", f"{win_start:.3f}", "-to", f"{win_end:.3f}",
             "-i", current_vid,
-            "-c:v", v_codec, "-preset", preset, "-crf", crf, "-g", str(fps * 2), "-keyint_min", str(fps * 2),
+            "-c:v", v_codec, "-preset", preset, "-crf", crf, "-pix_fmt", "yuv420p",
+            "-g", str(fps * 2), "-keyint_min", str(fps * 2),
             "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", a_bitrate,
             part_mid_raw
         ])
@@ -195,7 +206,8 @@ def apply_inserts_surgical(base_video, inserts, slot_start_sec, out_video, width
             "ffmpeg", "-y", "-i", part_mid_raw, "-i", ins_file,
             "-filter_complex", filter_complex,
             "-map", "[outv]", "-map", "[outa]",
-            "-c:v", v_codec, "-preset", preset, "-crf", crf, "-g", str(fps * 2), "-keyint_min", str(fps * 2),
+            "-c:v", v_codec, "-preset", preset, "-crf", crf, "-pix_fmt", "yuv420p",
+            "-g", str(fps * 2), "-keyint_min", str(fps * 2),
             "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", a_bitrate,
             part_mid_ov
         ])
@@ -265,14 +277,16 @@ def build_smart_concat(built_slots, raw_concat_out, fps, v_codec, preset, crf, a
             run([
                 "ffmpeg", "-y", "-ss", f"{max(0.0, actual_dur - cf_after):.3f}", "-i", path,
                 "-t", f"{cf_after:.3f}",
-                "-c:v", v_codec, "-preset", preset, "-crf", crf, "-g", str(fps * 2), "-keyint_min", str(fps * 2),
+                "-c:v", v_codec, "-preset", preset, "-crf", crf, "-pix_fmt", "yuv420p",
+                "-g", str(fps * 2), "-keyint_min", str(fps * 2),
                 "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", a_bitrate,
                 tail_file
             ])
             run([
                 "ffmpeg", "-y", "-ss", "0", "-i", next_path,
                 "-t", f"{cf_after:.3f}",
-                "-c:v", v_codec, "-preset", preset, "-crf", crf, "-g", str(fps * 2), "-keyint_min", str(fps * 2),
+                "-c:v", v_codec, "-preset", preset, "-crf", crf, "-pix_fmt", "yuv420p",
+                "-g", str(fps * 2), "-keyint_min", str(fps * 2),
                 "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", a_bitrate,
                 head_file
             ])
@@ -286,7 +300,8 @@ def build_smart_concat(built_slots, raw_concat_out, fps, v_codec, preset, crf, a
                 "ffmpeg", "-y", "-i", tail_file, "-i", head_file,
                 "-filter_complex", fc,
                 "-map", "[v]", "-map", "[a]",
-                "-c:v", v_codec, "-preset", preset, "-crf", crf, "-g", str(fps * 2), "-keyint_min", str(fps * 2),
+                "-c:v", v_codec, "-preset", preset, "-crf", crf, "-pix_fmt", "yuv420p",
+                "-g", str(fps * 2), "-keyint_min", str(fps * 2),
                 "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", a_bitrate,
                 bridge_file
             ])
@@ -294,7 +309,6 @@ def build_smart_concat(built_slots, raw_concat_out, fps, v_codec, preset, crf, a
             safe_remove(head_file)
             concat_parts.append(bridge_file)
 
-        # Поэтапно удаляем каждый отработанный слот, освобождая место на диске раннера
         safe_remove(path)
 
     master_list = os.path.join(WORK_DIR, "master_concat.txt")
@@ -317,17 +331,24 @@ def generate_chapters(manifest, chapters_path):
     lines = []
     cur_sec = 0.0
     for idx, slot in enumerate(slots):
-        title = slot.get("title") or slot.get("label") or slot.get("slot_id") or f"Act {idx + 1}"
+        raw_title = (
+            slot.get("title_en")
+            or slot.get("title")
+            or slot.get("label")
+            or slot.get("slot_id")
+            or f"Chapter {idx + 1}: Atmospheric Act"
+        )
+        title = sanitize_english_title(raw_title, f"Chapter {idx + 1}: Atmospheric Act")
         start = float(slot.get("start_sec", cur_sec))
         lines.append(f"{format_timestamp(start)} {title}")
         cur_sec = start + float(slot.get("slot_duration_sec", 0))
     with open(chapters_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
-    print(f"Таймкоды сохранены в {chapters_path}")
+    print(f"English chapters saved to {chapters_path}")
 
 
 def run_auto_qc(out_filename, expected_sec):
-    print("=== Запуск Auto-QC проверки качества ===")
+    print("=== Running Fast Auto-QC ===")
     probe_raw = subprocess.check_output([
         "ffprobe", "-v", "error", "-show_entries",
         "format=duration,size:stream=codec_type,codec_name,width,height,r_frame_rate",
@@ -341,16 +362,17 @@ def run_auto_qc(out_filename, expected_sec):
     has_audio = any(s.get("codec_type") == "audio" for s in streams)
 
     if not has_video or not has_audio:
-        raise RuntimeError(f"Auto-QC провален: отсутствует видео ({has_video}) или аудио ({has_audio}) поток!")
+        raise RuntimeError(f"Auto-QC failed: missing video ({has_video}) or audio ({has_audio}) stream!")
 
     if expected_sec > 0 and abs(actual_dur - expected_sec) > 15.0:
         raise RuntimeError(
-            f"Auto-QC провален: длительность {actual_dur:.1f}с расходится с ожидаемой {expected_sec:.1f}с!"
+            f"Auto-QC failed: actual duration {actual_dur:.1f}s differs from expected {expected_sec:.1f}s!"
         )
 
+    # -vn skips 4K video decoding during EBU R128 loudness check (~10s instead of 15 min)
     lufs_proc = subprocess.run([
-        "ffmpeg", "-nostats", "-i", out_filename,
-        "-filter_complex", "ebur128=framelog=verbose", "-f", "null", "-"
+        "ffmpeg", "-nostats", "-vn", "-i", out_filename,
+        "-filter_complex", "ebur128", "-f", "null", "-"
     ], capture_output=True, text=True)
     m = re.findall(r"I:\s*(-?\d+\.\d+)\s*LUFS", lufs_proc.stderr)
     integrated_lufs = float(m[-1]) if m else -16.0
@@ -365,7 +387,7 @@ def run_auto_qc(out_filename, expected_sec):
     }
     with open("qc_report.json", "w", encoding="utf-8") as f:
         json.dump(qc_data, f, ensure_ascii=False, indent=2)
-    print(f"✅ Auto-QC пройден: {qc_data['duration_formatted']} | Громкость: {integrated_lufs} LUFS")
+    print(f"✅ Auto-QC passed: {qc_data['duration_formatted']} | Loudness: {integrated_lufs} LUFS")
 
 
 def main():
@@ -411,13 +433,13 @@ def main():
         built_slots.append((final_slot_path, slot_dur, cf_out))
 
     raw_master = os.path.join(WORK_DIR, "raw_master.mp4")
-    print("=== Быстрая склейка слотов и кроссфейдов (-c:v copy) ===")
+    print("=== Fast Stream Concat & Crossfades (-c:v copy) ===")
     build_smart_concat(built_slots, raw_master, fps, v_codec, preset, crf, a_bitrate)
 
     for path, _, _ in built_slots:
         safe_remove(path)
 
-    print(f"=== Финальная нормализация звука (-16 LUFS) -> {out_filename} ===")
+    print(f"=== Final Audio Loudness Normalization (-16 LUFS) -> {out_filename} ===")
     run([
         "ffmpeg", "-y", "-i", raw_master,
         "-c:v", "copy",
