@@ -40,7 +40,6 @@ def main():
     total_dur = get_duration(master_video)
     base_name = os.path.splitext(master_video)[0]
 
-    # Собираем точки интереса из врезок (inserts) или начала актов
     triggers = []
     for slot in manifest.get("timeline_slots", []):
         for ins in slot.get("inserts", []):
@@ -58,7 +57,6 @@ def main():
             start_sec = max(0.0, total_dur - clip_len)
 
         out_short = os.path.join(SHORTS_DIR, f"{base_name}_SHORT_{idx+1:02d}.mp4")
-        # Кроп 4K (3840x2160) в 9:16 (1080x1920) с плавным горизонтальным дрейфом камеры
         vf_pan = (
             "scale=-2:1920,"
             "crop=1080:1920:x='(iw-1080)/2 + ((iw-1080)/2.5)*sin(2*PI*t/38)':y=0,"
