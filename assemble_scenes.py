@@ -1,216 +1,422 @@
 import json
 import os
+import shutil
 import subprocess
+import sys
+from pathlib import Path
 
-MANIFEST_FILE = "manifest.json"
-ASSETS_DIR = "assets"
-WORK_DIR = "temp_scenes"
+VALID_XFADE_TRANSITIONS = {
+    "fade",
+    "wipeleft",
+    "wiperight",
+    "wipeup",
+    "wipedown",
+    "slideleft",
+    "slideright",
+    "slideup",
+    "slidedown",
+    "circlecrop",
+    "rectcrop",
+    "distance",
+    "fadeblack",
+    "fadewhite",
+    "radial",
+    "smoothleft",
+    "smoothright",
+    "smoothup",
+    "smoothdown",
+    "circleopen",
+    "circleclose",
+    "vertopen",
+    "vertclose",
+    "horzopen",
+    "horzclose",
+    "dissolve",
+    "pixelize",
+    "diagtl",
+    "diagtr",
+    "diagbl",
+    "diagbr",
+    "hlslice",
+    "hrslice",
+    "vuslice",
+    "vdslice",
+    "hblur",
+    "fadegrays",
+    "wipetl",
+    "wipetr",
+    "wipebl",
+    "wipebr",
+    "squeezeh",
+    "squeezev",
+    "zoomin",
+}
 
-os.makedirs(ASSETS_DIR, exist_ok=True)
-os.makedirs(WORK_DIR, exist_ok=True)
 
-
-def run(cmd):
-    print(f"RUN: {' '.join(cmd)}")
+def run_cmd(cmd: list[str]) -> None:
+    print("▶", " ".join(cmd))
     subprocess.run(cmd, check=True)
 
 
-def safe_remove(path):
-    if path and os.path.exists(path):
-        try:
-            os.remove(path)
-        except OSError:
-            pass
+def has_audio_stream(media_path: Path) -> bool:
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "a",
+        "-show_entries",
+        "stream=index",
+        "-of",
+        "csv=p=0",
+        str(media_path),
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    return bool(res.stdout.strip())
 
 
-def get_duration(file_path):
-    res = subprocess.check_output([
-        "ffprobe", "-v", "error", "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1", file_path
-    ]).decode().strip()
-    return float(res)
+def resolve_asset(filename: str | None, work_dir: Path, folder_id: str | None) -> Path | None:
+    if not filename:
+        return None
 
+    base_name = Path(filename).name
+    candidates = [
+        work_dir / base_name,
+        work_dir / filename,
+        Path("assets") / filename,
+        Path("assets") / base_name,
+        Path("input") / filename,
+        Path(filename),
+    ]
+    for path in candidates:
+        if path.is_file():
+            return path
 
-def ensure_asset(filename, folder_id=""):
-    local_path = os.path.join(ASSETS_DIR, filename)
-    if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
-        return local_path
-    if os.path.exists(filename) and os.path.getsize(filename) > 0:
-        return filename
-
-    print(f"Скачиваем {filename} из Google Drive...")
     if folder_id:
-        subprocess.run([
-            "rclone", "copy", f"gdrive:{filename}", ASSETS_DIR,
-            "--drive-root-folder-id", folder_id, "-v"
-        ], check=False)
-
-    if not os.path.exists(local_path):
-        run([
-            "rclone", "copy", "gdrive:", ASSETS_DIR,
-            "--include", filename, "-v"
+        remote = os.getenv("GDRIVE_REMOTE", "gdrive")
+        dest = work_dir / base_name
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        run_cmd([
+            "rclone",
+            "copyto",
+            f"{remote}:{filename}",
+            str(dest),
+            "--drive-root-folder-id",
+            folder_id,
         ])
+        if dest.is_file():
+            return dest
 
-    if not os.path.exists(local_path):
-        raise FileNotFoundError(f"Файл {filename} не найден ни локально, ни на Google Диске!")
-    return local_path
+    return None
 
 
-def prepare_scene(scene, idx, width, height, fps, folder_id):
-    vid_name = scene.get("file_name") or scene.get("video_file") or scene.get("asset")
-    if not vid_name:
+def get_normalized_scenes(manifest: dict) -> list[dict]:
+    raw_scenes = (
+        manifest.get("timeline")
+        or manifest.get("scenes")
+        or manifest.get("timeline_slots")
+        or []
+    )
+    normalized = []
+
+    for item in raw_scenes:
+        scene = dict(item)
+        assets = scene.get("assets") or {}
+        vid_proc = scene.get("video_processing") or {}
+        aud_proc = scene.get("audio_processing") or {}
+        trans_in = vid_proc.get("transition_in") or {}
+        trans_out = vid_proc.get("transition_out") or {}
+
+        video_file = (
+            scene.get("file_name")
+            or scene.get("video_file")
+            or assets.get("video_file")
+            or assets.get("image_reference")
+        )
+        voice_file = (
+            scene.get("voiceover_file")
+            or scene.get("audio_file")
+            or assets.get("voiceover_file")
+        )
+
+        scene["file_name"] = video_file
+        scene["video_file"] = video_file
+        if voice_file:
+            scene["voiceover_file"] = voice_file
+            scene["audio_file"] = voice_file
+
+        if "transition" not in scene and trans_in:
+            scene["transition"] = trans_in.get("type", "cut")
+            scene["transition_duration"] = float(trans_in.get("duration_sec", 0.0))
+
+        if "transition_out_type" not in scene and trans_out:
+            scene["transition_out_type"] = trans_out.get("type", "none")
+            scene["transition_out_duration"] = float(trans_out.get("duration_sec", 0.0))
+
+        if "mute_audio" not in scene and "video_ambient_mute" in aud_proc:
+            scene["mute_audio"] = bool(aud_proc["video_ambient_mute"])
+        if "ambient_gain_db" not in scene and "video_ambient_gain_db" in aud_proc:
+            scene["ambient_gain_db"] = float(aud_proc["video_ambient_gain_db"])
+        if "voiceover_gain_db" not in scene and "voiceover_gain_db" in aud_proc:
+            scene["voiceover_gain_db"] = float(aud_proc["voiceover_gain_db"])
+
+        normalized.append(scene)
+
+    return normalized
+
+
+def prepare_scene(
+    scene: dict,
+    idx: int,
+    width: int,
+    height: int,
+    fps: int,
+    folder_id: str | None,
+) -> tuple[Path, float, float]:
+    assets = scene.get("assets") or {}
+    video_name = (
+        scene.get("file_name")
+        or scene.get("video_file")
+        or assets.get("video_file")
+        or assets.get("image_reference")
+    )
+    if not video_name:
         raise KeyError(f"В сцене #{idx + 1} не указано имя видеофайла (file_name / video_file)")
 
-    vid_path = ensure_asset(vid_name, folder_id)
-    audio_name = scene.get("audio_file") or scene.get("voiceover_file")
-    out_scene = os.path.join(WORK_DIR, f"scene_{idx:03d}.mp4")
-
-    # Проверяем наличие аудиодорожки в исходном видео
-    probe_audio = subprocess.check_output([
-        "ffprobe", "-v", "error", "-select_streams", "a",
-        "-show_entries", "stream=codec_type", "-of", "csv=p=0", vid_path
-    ]).decode().strip()
-
-    vf_chain = (
-        f"scale={width}:{height}:force_original_aspect_ratio=increase,"
-        f"crop={width}:{height},fps={fps},format=yuv420p"
+    voice_name = (
+        scene.get("voiceover_file")
+        or scene.get("audio_file")
+        or assets.get("voiceover_file")
     )
 
-    if audio_name:
-        audio_path = ensure_asset(audio_name, folder_id)
-        aud_dur = get_duration(audio_path)
-        vid_dur = get_duration(vid_path)
-        target_dur = float(scene.get("duration_sec") or max(vid_dur, aud_dur))
+    dur = float(scene.get("duration_sec") or scene.get("duration") or 10.0)
+    trans_type = str(scene.get("transition") or "cut").strip().lower()
+    cf_dur = float(scene.get("transition_duration") or 0.0)
+    if trans_type == "cut" or cf_dur <= 0.0:
+        cf_dur = 0.0
 
-        # Если видео короче озвучки, зацикливаем или подгоняем длительность под звук
-        cmd = ["ffmpeg", "-y"]
-        if vid_dur < target_dur:
-            cmd.extend(["-stream_loop", "-1"])
-        cmd.extend([
-            "-i", vid_path, "-i", audio_path,
-            "-t", str(target_dur),
-            "-vf", vf_chain,
-            "-map", "0:v:0", "-map", "1:a:0",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
-            "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "320k",
-            out_scene
-        ])
-        run(cmd)
+    work_dir = Path("build/scenes")
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    src_video = resolve_asset(video_name, work_dir, folder_id)
+    if not src_video or not src_video.is_file():
+        raise FileNotFoundError(f"Не найден видеофайл для сцены #{idx + 1}: {video_name}")
+
+    src_voice = resolve_asset(voice_name, work_dir, folder_id) if voice_name else None
+
+    out_path = work_dir / f"norm_{idx + 1:03d}.mp4"
+    is_image = src_video.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}
+
+    v_filters = [
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease",
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black",
+        f"fps={fps}",
+        "setsar=1",
+        "format=yuv420p",
+        "setpts=PTS-STARTPTS",
+    ]
+
+    if idx == 0 and cf_dur > 0.0 and trans_type in {"fade", "fadeblack"}:
+        v_filters.append(f"fade=t=in:st=0:d={cf_dur:.3f}")
+        cf_dur = 0.0
+
+    out_trans = str(scene.get("transition_out_type") or "none").strip().lower()
+    out_trans_dur = float(scene.get("transition_out_duration") or 0.0)
+    if out_trans in {"fade_to_black", "fadeblack", "fade"} and out_trans_dur > 0.0:
+        fade_start = max(0.0, dur - out_trans_dur)
+        v_filters.append(f"fade=t=out:st={fade_start:.3f}:d={out_trans_dur:.3f}")
+
+    cmd = ["ffmpeg", "-y"]
+    if is_image:
+        cmd += ["-loop", "1", "-t", f"{dur:.3f}", "-i", str(src_video)]
     else:
-        target_dur = float(scene.get("duration_sec") or get_duration(vid_path))
-        if probe_audio:
-            run([
-                "ffmpeg", "-y", "-i", vid_path,
-                "-t", str(target_dur),
-                "-vf", vf_chain,
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
-                "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "320k",
-                out_scene
-            ])
+        cmd += ["-i", str(src_video)]
+
+    filter_parts = [f"[0:v]{','.join(v_filters)}[vout]"]
+    mute_ambient = bool(scene.get("mute_audio", False))
+    ambient_gain = float(scene.get("ambient_gain_db", -22.0))
+    voice_gain = float(scene.get("voiceover_gain_db", 0.0))
+    video_has_audio = (not is_image) and has_audio_stream(src_video)
+
+    if src_voice and src_voice.is_file():
+        cmd += ["-i", str(src_voice)]
+        filter_parts.append(
+            f"[1:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
+            f"volume={voice_gain}dB,apad,atrim=0:{dur:.3f},asetpts=PTS-STARTPTS[avo]"
+        )
+        if video_has_audio and not mute_ambient and ambient_gain > -90.0:
+            filter_parts.append(
+                f"[0:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
+                f"volume={ambient_gain}dB,apad,atrim=0:{dur:.3f},asetpts=PTS-STARTPTS[aamb]"
+            )
+            filter_parts.append("[avo][aamb]amix=inputs=2:duration=first:normalize=0[aout]")
         else:
-            # Добавляем тихую стереодорожку, если исходник без звука
-            run([
-                "ffmpeg", "-y", "-i", vid_path,
-                "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
-                "-t", str(target_dur),
-                "-vf", vf_chain,
-                "-map", "0:v:0", "-map", "1:a:0",
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
-                "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "320k",
-                out_scene
-            ])
-
-    dur = get_duration(out_scene)
-    trans_out = scene.get("transition_out") or {}
-    if isinstance(trans_out, dict):
-        cf_dur = float(trans_out.get("duration_sec", 0)) if trans_out.get("type") not in (None, "none") else 0.0
+            filter_parts.append("[avo]acopy[aout]")
+    elif video_has_audio and not mute_ambient and ambient_gain > -90.0:
+        filter_parts.append(
+            f"[0:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
+            f"volume={ambient_gain}dB,apad,atrim=0:{dur:.3f},asetpts=PTS-STARTPTS[aout]"
+        )
     else:
-        cf_dur = float(scene.get("crossfade_sec", 0))
+        filter_parts.append(f"anullsrc=r=48000:cl=stereo:d={dur:.3f}[aout]")
 
-    return out_scene, dur, cf_dur
+    cmd += [
+        "-filter_complex",
+        ";".join(filter_parts),
+        "-map",
+        "[vout]",
+        "-map",
+        "[aout]",
+        "-t",
+        f"{dur:.3f}",
+        "-r",
+        str(fps),
+        "-vsync",
+        "cfr",
+        "-c:v",
+        "libx264",
+        "-crf",
+        "16",
+        "-preset",
+        "fast",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "320k",
+        "-ar",
+        "48000",
+        "-ac",
+        "2",
+        str(out_path),
+    ]
+    run_cmd(cmd)
+    return out_path, dur, cf_dur
 
 
-def main():
-    with open(MANIFEST_FILE, "r", encoding="utf-8") as f:
+def main() -> None:
+    manifest_path = Path(
+        sys.argv[1] if len(sys.argv) > 1 else os.getenv("MANIFEST_PATH", "manifest.json")
+    )
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"Манифест не найден: {manifest_path}")
+
+    with manifest_path.open("r", encoding="utf-8") as f:
         manifest = json.load(f)
 
-    exp = manifest.get("export_settings", {})
-    width = exp.get("width", 1920)
-    height = exp.get("height", 1080)
-    fps = exp.get("fps", 24)
-    v_codec = exp.get("video_codec", "libx264")
-    preset = exp.get("preset", "veryfast")
-    crf = str(exp.get("crf", 20))
-    a_bitrate = exp.get("audio_bitrate", "320k")
-    out_filename = exp.get("output_filename", "scenes_master.mp4")
-    folder_id = manifest.get("cloud_export", {}).get("target_folder_id", "")
-
-    scenes = manifest.get("scenes") or manifest.get("timeline_slots") or []
+    scenes = get_normalized_scenes(manifest)
     if not scenes:
-        raise ValueError("В манифесте не найден список сцен ('scenes' или 'timeline_slots')!")
+        raise ValueError("В манифесте не найден список сцен ('timeline', 'scenes' или 'timeline_slots')!")
 
-    prepared = []
+    render_cfg = manifest.get("render_settings") or {}
+    res_str = str(render_cfg.get("resolution", "3840x2160")).split()[0]
+    width, height = (int(x) for x in res_str.lower().split("x"))
+    fps = int(render_cfg.get("fps", 24))
+    crf = int(render_cfg.get("crf", 18))
+    preset = str(render_cfg.get("preset", "slow"))
+    audio_bitrate = str(render_cfg.get("audio_bitrate", "320k"))
+    folder_id = (
+        os.getenv("GDRIVE_FOLDER_ID")
+        or os.getenv("EFFECTIVE_FOLDER_ID")
+        or manifest.get("gdrive_folder_id")
+        or manifest.get("folder_id")
+    )
+
+    prepared: list[tuple[Path, float, float, str]] = []
     for idx, scene in enumerate(scenes):
         sc_path, dur, cf_dur = prepare_scene(scene, idx, width, height, fps, folder_id)
-        prepared.append((sc_path, dur, cf_dur))
+        trans_type = str(scene.get("transition") or "cut").strip().lower()
+        if trans_type not in VALID_XFADE_TRANSITIONS and trans_type != "cut":
+            trans_type = "fade"
+        prepared.append((sc_path, dur, cf_dur, trans_type))
 
-    print(f"=== Сборка {len(prepared)} сцен в один проход: {out_filename} ===")
-    inputs_cmd = []
-    for path, _, _ in prepared:
-        inputs_cmd.extend(["-i", path])
+    project_name = manifest.get("project_name", "output")
+    out_dir = Path("output")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    final_video = out_dir / f"{project_name}.mp4"
 
-    filter_parts = []
-    prev_v = "[0:v]"
-    prev_a = "[0:a]"
-    offset = prepared[0][1]
+    if len(prepared) == 1:
+        shutil.copy2(prepared[0][0], final_video)
+        print(f"✅ Render complete (single scene): {final_video}")
+        return
+
+    cmd = ["ffmpeg", "-y"]
+    for sc_path, _, _, _ in prepared:
+        cmd += ["-i", str(sc_path)]
+
+    filters = []
+    cur_v = "[0:v]"
+    cur_a = "[0:a]"
+    total_dur = prepared[0][1]
 
     for idx in range(1, len(prepared)):
-        cf_dur = prepared[idx - 1][2]
-        out_v = f"[v{idx}]"
-        out_a = f"[a{idx}]"
-        if cf_dur > 0 and offset > cf_dur:
-            offset_adj = offset - cf_dur
-            filter_parts.append(f"{prev_v}[{idx}:v]xfade=transition=fade:duration={cf_dur}:offset={offset_adj}{out_v}")
-            filter_parts.append(f"{prev_a}[{idx}:a]acrossfade=d={cf_dur}{out_a}")
-            offset = offset_adj + prepared[idx][1]
+        _, dur_i, cf_dur_i, trans_type = prepared[idx]
+        next_v = f"[v{idx}]"
+        next_a = f"[a{idx}]"
+
+        if cf_dur_i > 0.0 and trans_type != "cut":
+            offset = max(0.0, total_dur - cf_dur_i)
+            filters.append(
+                f"{cur_v}[{idx}:v]xfade=transition={trans_type}:duration={cf_dur_i:.3f}:offset={offset:.3f}{next_v}"
+            )
+            filters.append(
+                f"{cur_a}[{idx}:a]acrossfade=d={cf_dur_i:.3f}:c1=tri:c2=tri{next_a}"
+            )
+            total_dur = total_dur + dur_i - cf_dur_i
         else:
-            filter_parts.append(f"{prev_v}[{idx}:v]concat=n=2:v=1:a=0{out_v}")
-            filter_parts.append(f"{prev_a}[{idx}:a]concat=n=2:v=0:a=1{out_a}")
-            offset += prepared[idx][1]
-        prev_v = out_v
-        prev_a = out_a
+            filters.append(f"{cur_v}[{idx}:v]concat=n=2:v=1:a=0{next_v}")
+            filters.append(f"{cur_a}[{idx}:a]concat=n=2:v=0:a=1{next_a}")
+            total_dur += dur_i
 
-    # Подмешиваем фоновую музыку (если включена в манифесте) и нормализуем громкость
-    bg_music = manifest.get("background_music") or manifest.get("audio_rules", {}).get("continuous_bed", {})
-    if isinstance(bg_music, dict) and bg_music.get("enabled") and bg_music.get("source_file"):
-        bg_path = ensure_asset(bg_music["source_file"], folder_id)
-        bg_idx = len(prepared)
-        inputs_cmd.extend(["-stream_loop", "-1", "-i", bg_path])
-        gain_db = float(bg_music.get("volume_gain_db", -14.0))
-        filter_parts.append(f"[{bg_idx}:a]volume={gain_db}dB[bg_a]")
-        filter_parts.append(f"{prev_a}[bg_a]amix=inputs=2:duration=first:dropout_transition=2[amixed]")
-        filter_parts.append("[amixed]loudnorm=I=-16.0:TP=-3.0:LRA=11.0[afinal]")
-    else:
-        filter_parts.append(f"{prev_a}loudnorm=I=-16.0:TP=-3.0:LRA=11.0[afinal]")
+        cur_v = next_v
+        cur_a = next_a
 
-    full_fc = ";".join(filter_parts)
+    loudnorm = render_cfg.get("loudness_normalization") or {}
+    if loudnorm.get("enabled", True):
+        lufs = float(loudnorm.get("target_lufs", -14.0))
+        tp = float(loudnorm.get("true_peak_db", -1.0))
+        lra = float(loudnorm.get("lra", 7.0))
+        filters.append(f"{cur_a}loudnorm=I={lufs}:TP={tp}:LRA={lra}[afinal]")
+        cur_a = "[afinal]"
 
-    run([
-        "ffmpeg", "-y",
-        *inputs_cmd,
-        "-filter_complex", full_fc,
-        "-map", prev_v, "-map", "[afinal]",
-        "-c:v", v_codec, "-preset", preset, "-crf", crf, "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", a_bitrate, "-ar", "48000",
-        out_filename
-    ])
-
-    # Очищаем временные файлы сцен
-    for path, _, _ in prepared:
-        safe_remove(path)
-
-    with open("final_output_name.txt", "w", encoding="utf-8") as f:
-        f.write(out_filename)
+    cmd += [
+        "-filter_complex",
+        ";".join(filters),
+        "-map",
+        cur_v,
+        "-map",
+        cur_a,
+        "-r",
+        str(fps),
+        "-vsync",
+        "cfr",
+        "-c:v",
+        "libx264",
+        "-profile:v",
+        "high",
+        "-level",
+        "5.1",
+        "-crf",
+        str(crf),
+        "-preset",
+        preset,
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        "-c:a",
+        "aac",
+        "-b:a",
+        audio_bitrate,
+        "-ar",
+        "48000",
+        "-ac",
+        "2",
+        str(final_video),
+    ]
+    run_cmd(cmd)
+    print(f"✅ Render complete: {final_video} ({total_dur:.2f}s)")
 
 
 if __name__ == "__main__":
