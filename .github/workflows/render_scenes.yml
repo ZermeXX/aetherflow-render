@@ -41,7 +41,7 @@ env:
 jobs:
   render:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 360
 
     steps:
       - name: Checkout Repository
@@ -292,6 +292,12 @@ jobs:
                       return True
               return default
 
+          def fmt_chapter_time(sec: float) -> str:
+              total_s = max(0, int(round(sec)))
+              h, rem = divmod(total_s, 3600)
+              m, s = divmod(rem, 60)
+              return f"{h:02d}:{m:02d}:{s:02d}" if h > 0 else f"{m:02d}:{s:02d}"
+
           manifest = json.loads(Path("manifest.json").read_text(encoding="utf-8"))
           project_name = manifest.get("project_name", "output")
           video_title = manifest.get("video_title", project_name)
@@ -314,10 +320,13 @@ jobs:
           size_mb = int(qc_info["format"]["size"]) / (1024 * 1024)
           print(f"✅ Auto-QC passed: {main_video.name} | {duration_sec:.2f}s | {size_mb:.1f} MB")
 
+          timings_path = Path("build/actual_timings.json")
+          actual_timings = json.loads(timings_path.read_text(encoding="utf-8")) if timings_path.is_file() else []
+
           ui_montage = (manifest.get("studio_ui_presets") or {}).get("tab_1_montage") or {}
           render_cfg = manifest.get("render_settings") or {}
 
-          # 2. Export sidecar SRT subtitles ONLY if enabled in manifest
+          # 2. Export sidecar SRT subtitles synced to actual voiceover timings
           sub_cfg = (
               manifest.get("subtitles_export")
               or manifest.get("subtitles_settings")
@@ -354,14 +363,20 @@ jobs:
                   srt_lines = []
                   cur_t = 0.0
                   idx_sub = 1
-                  for sc in scenes:
-                      dur = float(sc.get("duration_sec") or sc.get("duration") or 10.0)
+                  for idx_sc, sc in enumerate(scenes):
+                      if idx_sc < len(actual_timings):
+                          st = float(actual_timings[idx_sc]["voice_start"])
+                          en = float(actual_timings[idx_sc]["scene_end"])
+                      else:
+                          dur = float(sc.get("duration_sec") or sc.get("duration") or 10.0)
+                          st, en = cur_t, cur_t + dur
+                          cur_t = en
+
                       subs = sc.get("subtitles") or {}
                       text = (subs.get(lang) or "").strip()
                       if text:
-                          srt_lines.append(f"{idx_sub}\n{fmt_srt_time(cur_t)} --> {fmt_srt_time(cur_t + dur)}\n{text}\n")
+                          srt_lines.append(f"{idx_sub}\n{fmt_srt_time(st)} --> {fmt_srt_time(en)}\n{text}\n")
                           idx_sub += 1
-                      cur_t += dur
                   if srt_lines:
                       srt_file = out_dir / f"{project_name}_{lang.upper()}.srt"
                       srt_file.write_text("\n".join(srt_lines), encoding="utf-8")
@@ -370,9 +385,16 @@ jobs:
           else:
               print("⏭️ SRT subtitles export disabled by manifest settings — skipped.")
 
-          # 3. Export output_chapters.txt (English-only YouTube chapters)
+          # 3. Export output_chapters.txt (English-only YouTube chapters synced to actual timings if scene_index present)
           chapters = manifest.get("chapters_youtube") or []
-          chapters_lines = [f"{ch.get('timecode', '00:00')} {ch.get('title', 'Chapter')}" for ch in chapters]
+          chapters_lines = []
+          for ch in chapters:
+              sc_idx = ch.get("scene_index")
+              if isinstance(sc_idx, int) and 1 <= sc_idx <= len(actual_timings):
+                  tc = fmt_chapter_time(float(actual_timings[sc_idx - 1]["scene_start"]))
+              else:
+                  tc = ch.get("timecode", "00:00")
+              chapters_lines.append(f"{tc} {ch.get('title', 'Chapter')}")
           (out_dir / "output_chapters.txt").write_text("\n".join(chapters_lines) + "\n", encoding="utf-8")
 
           # 4. Export RELEASE_CARD.md (English release metadata)
@@ -381,7 +403,7 @@ jobs:
               "",
               f"- **Project:** `{project_name}`",
               f"- **Channel:** `{manifest.get('channel', '@Histoviva')}`",
-              f"- **Duration:** `{duration_sec:.2f}s` (`{manifest.get('total_duration_formatted', '')}`)",
+              f"- **Duration:** `{duration_sec:.2f}s` (`{fmt_chapter_time(duration_sec)}`)",
               f"- **File Size:** `{size_mb:.1f} MB`",
               f"- **Resolution / FPS:** `3840x2160 @ 24fps`",
               "",
