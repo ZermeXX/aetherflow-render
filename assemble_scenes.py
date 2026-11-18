@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 BATCH_SIZE = 6
-BREATH_PAUSE_SEC = 0.35  # Пауза дыхания после фразы (сек)
+BREATH_PAUSE_SEC = 0.35  # Пауза дыхания диктора после фразы (сек)
 
 VALID_XFADE_TRANSITIONS = {
     "fade", "wipeleft", "wiperight", "wipeup", "wipedown",
@@ -173,9 +173,10 @@ def prepare_scene(
     if trans_type == "cut" or cf_dur <= 0.0:
         cf_dur = 0.0
 
-    # Задержка старта голоса на время входного перехода (чтобы речь начиналась ровно после проявления нового кадра)
-    lead_in_ms = int(round(cf_dur * 1000)) if (idx > 0 and cf_dur > 0.0) else 0
-    lead_in_sec = lead_in_ms / 1000.0
+    # Привязываем длительность перехода к точному числу кадров (fps)
+    cf_frames = int(round(cf_dur * fps)) if (idx > 0 and cf_dur > 0.0) else 0
+    cf_dur = cf_frames / float(fps)
+    lead_in_ms = int(round(cf_dur * 1000))
 
     work_dir = Path("build/scenes")
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -191,24 +192,25 @@ def prepare_scene(
     real_voice_dur = get_media_duration(src_voice) if (src_voice and src_voice.is_file()) else 0.0
 
     if real_voice_dur > 0.0:
-        target_dur = round(lead_in_sec + real_voice_dur + BREATH_PAUSE_SEC, 3)
+        raw_target_dur = cf_dur + real_voice_dur + BREATH_PAUSE_SEC
     else:
-        target_dur = round(max(manifest_dur, lead_in_sec + 1.0), 3)
+        raw_target_dur = max(manifest_dur, cf_dur + 1.0)
+
+    # Жёстко квантуем длину сцены по сетке кадров (исключает дрейф между аудио и видео)
+    exact_frames = max(fps, int(round(raw_target_dur * fps)))
+    target_dur = exact_frames / float(fps)
 
     real_video_dur = target_dur if is_image else get_media_duration(src_video)
     if real_video_dur <= 0.05:
         real_video_dur = target_dur
 
-    print(
-        f"🎬 Сцена #{idx + 1:02d}: вход_xfade={lead_in_sec:.2f}s | голос={real_voice_dur:.2f}s "
-        f"| исходное_видео={real_video_dur:.2f}s | итог={target_dur:.2f}s"
-    )
-
-    out_path = work_dir / f"norm_{idx + 1:03d}.mp4"
+    out_path = work_dir / f"norm_{idx + 1:03d}.mkv"
 
     cmd = ["ffmpeg", "-y"]
+    speed_factor = 1.0  # >1.0 означает замедление видео
+
     if is_image:
-        cmd += ["-loop", "1", "-t", f"{target_dur:.3f}", "-i", str(src_video)]
+        cmd += ["-loop", "1", "-t", f"{target_dur:.6f}", "-i", str(src_video)]
         v_filters = [
             "setpts=PTS-STARTPTS",
             f"scale={width}:{height}:force_original_aspect_ratio=decrease",
@@ -219,9 +221,23 @@ def prepare_scene(
         ]
     else:
         cmd += ["-i", str(src_video)]
-        # Плавно растягиваем клип до 2.2x без стоп-кадров (10с видео -> до 22с речи абсолютно плавно)
-        max_stretch = 2.20
-        if target_dur <= real_video_dur * max_stretch:
+        # Если видео отстаёт от голоса не более чем на 2.5 сек (напр. 10с клип vs 12с речь),
+        # оставляем естественную скорость 1.0x (чтобы анимации/кнопки не замедлялись) + мягкий стоп-кадр в конце.
+        if real_video_dur <= target_dur <= real_video_dur + 2.5:
+            speed_factor = 1.0
+            hold_dur = max(0.0, target_dur - real_video_dur + 0.25)
+            v_filters = [
+                "setpts=PTS-STARTPTS",
+                f"scale={width}:{height}:force_original_aspect_ratio=decrease",
+                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black",
+                f"fps={fps}",
+                "setsar=1",
+                "format=yuv420p",
+                f"tpad=stop_mode=clone:stop_duration={hold_dur:.6f}",
+                f"trim=0:{target_dur:.6f}",
+                "setpts=PTS-STARTPTS",
+            ]
+        elif target_dur <= real_video_dur * 1.65:
             speed_factor = target_dur / real_video_dur
             v_filters = [
                 f"setpts={speed_factor:.6f}*(PTS-STARTPTS)",
@@ -230,72 +246,87 @@ def prepare_scene(
                 f"fps={fps}",
                 "setsar=1",
                 "format=yuv420p",
-                f"trim=0:{target_dur:.3f}",
+                f"trim=0:{target_dur:.6f}",
                 "setpts=PTS-STARTPTS",
             ]
         else:
-            stretched_dur = real_video_dur * max_stretch
+            speed_factor = 1.65
+            stretched_dur = real_video_dur * speed_factor
             hold_dur = max(0.0, target_dur - stretched_dur + 0.25)
             v_filters = [
-                f"setpts={max_stretch:.6f}*(PTS-STARTPTS)",
+                f"setpts={speed_factor:.6f}*(PTS-STARTPTS)",
                 f"scale={width}:{height}:force_original_aspect_ratio=decrease",
                 f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black",
                 f"fps={fps}",
                 "setsar=1",
                 "format=yuv420p",
-                f"tpad=stop_mode=clone:stop_duration={hold_dur:.3f}",
-                f"trim=0:{target_dur:.3f}",
+                f"tpad=stop_mode=clone:stop_duration={hold_dur:.6f}",
+                f"trim=0:{target_dur:.6f}",
                 "setpts=PTS-STARTPTS",
             ]
 
     if idx == 0 and cf_dur > 0.0 and trans_type in {"fade", "fadeblack"}:
-        v_filters.append(f"fade=t=in:st=0:d={cf_dur:.3f}")
+        v_filters.append(f"fade=t=in:st=0:d={cf_dur:.6f}")
         cf_dur = 0.0
 
     out_trans = str(scene.get("transition_out_type") or "none").strip().lower()
     out_trans_dur = float(scene.get("transition_out_duration") or 0.0)
     if out_trans in {"fade_to_black", "fadeblack", "fade"} and out_trans_dur > 0.0:
         fade_start = max(0.0, target_dur - out_trans_dur)
-        v_filters.append(f"fade=t=out:st={fade_start:.3f}:d={out_trans_dur:.3f}")
+        v_filters.append(f"fade=t=out:st={fade_start:.6f}:d={out_trans_dur:.6f}")
 
     filter_parts = [f"[0:v]{','.join(v_filters)}[vout]"]
-    mute_ambient = bool(scene.get("mute_audio", False))
-    ambient_gain = float(scene.get("ambient_gain_db", -22.0))
+
+    has_voice = bool(src_voice and src_voice.is_file() and real_voice_dur > 0.0)
+    # Если в сцене есть голос диктора, встроенный звук клипа по умолчанию глушим,
+    # если только в манифесте явно не указано mute_audio: false
+    mute_ambient = bool(scene.get("mute_audio", True if has_voice else False))
+    ambient_gain = float(scene.get("ambient_gain_db", -18.0))
     voice_gain = float(scene.get("voiceover_gain_db", 0.0))
     video_has_audio = (not is_image) and has_audio_stream(src_video)
+
+    print(
+        f"🎬 Сцена #{idx + 1:02d}: xfade={cf_dur:.2f}s | голос={real_voice_dur:.2f}s "
+        f"| видео={real_video_dur:.2f}s (x{speed_factor:.2f}) | итог={target_dur:.3f}s ({exact_frames} кадров)"
+    )
 
     fade_out_st = max(0.0, target_dur - 0.02)
     delay_filter = f"adelay={lead_in_ms}|{lead_in_ms}," if lead_in_ms > 0 else ""
 
-    if src_voice and src_voice.is_file() and real_voice_dur > 0.0:
+    # Встроенный звук клипа [0:a] синхронизируется по скорости (atempo) и задержке (adelay) с картинкой [0:v]
+    amb_tempo = 1.0 / speed_factor
+    amb_tempo_filter = f"atempo={amb_tempo:.6f}," if abs(amb_tempo - 1.0) > 0.002 else ""
+
+    if has_voice:
         cmd += ["-i", str(src_voice)]
         filter_parts.append(
-            f"[1:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
-            f"volume={voice_gain}dB,{delay_filter}apad,atrim=0:{target_dur:.3f},"
-            f"afade=t=in:st=0:d=0.015,afade=t=out:st={fade_out_st:.3f}:d=0.020,asetpts=PTS-STARTPTS[avo]"
+            f"[1:a]aresample=48000,aformat=sample_fmts=s16:channel_layouts=stereo,"
+            f"volume={voice_gain}dB,{delay_filter}apad,atrim=0:{target_dur:.6f},"
+            f"afade=t=in:st=0:d=0.015,afade=t=out:st={fade_out_st:.6f}:d=0.020,asetpts=PTS-STARTPTS[avo]"
         )
         if video_has_audio and not mute_ambient and ambient_gain > -90.0:
             filter_parts.append(
-                f"[0:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
-                f"volume={ambient_gain}dB,apad,atrim=0:{target_dur:.3f},asetpts=PTS-STARTPTS[aamb]"
+                f"[0:a]aresample=48000,aformat=sample_fmts=s16:channel_layouts=stereo,"
+                f"{amb_tempo_filter}volume={ambient_gain}dB,{delay_filter}apad,atrim=0:{target_dur:.6f},"
+                f"asetpts=PTS-STARTPTS[aamb]"
             )
             filter_parts.append("[avo][aamb]amix=inputs=2:duration=first:normalize=0[aout]")
         else:
             filter_parts.append("[avo]acopy[aout]")
     elif video_has_audio and not mute_ambient and ambient_gain > -90.0:
         filter_parts.append(
-            f"[0:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
-            f"volume={ambient_gain}dB,apad,atrim=0:{target_dur:.3f},"
-            f"afade=t=in:st=0:d=0.015,afade=t=out:st={fade_out_st:.3f}:d=0.020,asetpts=PTS-STARTPTS[aout]"
+            f"[0:a]aresample=48000,aformat=sample_fmts=s16:channel_layouts=stereo,"
+            f"{amb_tempo_filter}volume={ambient_gain}dB,{delay_filter}apad,atrim=0:{target_dur:.6f},"
+            f"afade=t=in:st=0:d=0.015,afade=t=out:st={fade_out_st:.6f}:d=0.020,asetpts=PTS-STARTPTS[aout]"
         )
     else:
-        filter_parts.append(f"anullsrc=r=48000:cl=stereo:d={target_dur:.3f}[aout]")
+        filter_parts.append(f"anullsrc=r=48000:cl=stereo:d={target_dur:.6f}[aout]")
 
     cmd += [
         "-filter_complex", ";".join(filter_parts),
         "-map", "[vout]",
         "-map", "[aout]",
-        "-t", f"{target_dur:.3f}",
+        "-frames:v", str(exact_frames),
         "-r", str(fps),
         "-vsync", "cfr",
         "-c:v", "libx264",
@@ -303,14 +334,13 @@ def prepare_scene(
         "-preset", "superfast",
         "-rc-lookahead", "10",
         "-pix_fmt", "yuv420p",
-        "-c:a", "aac",
-        "-b:a", "320k",
+        "-c:a", "pcm_s16le",
         "-ar", "48000",
         "-ac", "2",
         str(out_path),
     ]
     run_cmd(cmd)
-    return out_path, target_dur, cf_dur, lead_in_sec
+    return out_path, target_dur, cf_dur, cf_dur
 
 
 def merge_segment_group(
@@ -319,7 +349,6 @@ def merge_segment_group(
     fps: int,
     crf: int,
     preset: str,
-    audio_bitrate: str,
 ) -> float:
     if len(segments) == 1:
         shutil.copy2(segments[0][0], out_path)
@@ -332,7 +361,7 @@ def merge_segment_group(
     filters = []
     for idx in range(len(segments)):
         filters.append(f"[{idx}:v]fps={fps},settb=1/24000,format=yuv420p,setpts=PTS-STARTPTS[iv{idx}]")
-        filters.append(f"[{idx}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,asetpts=PTS-STARTPTS[ia{idx}]")
+        filters.append(f"[{idx}:a]aresample=48000,aformat=sample_fmts=s16:channel_layouts=stereo,asetpts=PTS-STARTPTS[ia{idx}]")
 
     cur_v = "[iv0]"
     cur_a = "[ia0]"
@@ -347,10 +376,10 @@ def merge_segment_group(
             offset = max(0.0, total_dur - cf_dur_i)
             trim_prev_a = max(0.05, total_dur - cf_dur_i)
             filters.append(
-                f"{cur_v}[iv{idx}]xfade=transition={trans_type}:duration={cf_dur_i:.3f}:offset={offset:.3f},settb=1/24000{next_v}"
+                f"{cur_v}[iv{idx}]xfade=transition={trans_type}:duration={cf_dur_i:.6f}:offset={offset:.6f},settb=1/24000{next_v}"
             )
             filters.append(
-                f"{cur_a}atrim=0:{trim_prev_a:.3f},asetpts=PTS-STARTPTS[a_prev_trim{idx}];"
+                f"{cur_a}atrim=0:{trim_prev_a:.6f},asetpts=PTS-STARTPTS[a_prev_trim{idx}];"
                 f"[a_prev_trim{idx}][ia{idx}]concat=n=2:v=0:a=1{next_a}"
             )
             total_dur = offset + dur_i
@@ -362,10 +391,14 @@ def merge_segment_group(
         cur_v = next_v
         cur_a = next_a
 
+    exact_frames = max(fps, int(round(total_dur * fps)))
+    exact_dur = exact_frames / float(fps)
+
     cmd += [
         "-filter_complex", ";".join(filters),
         "-map", cur_v,
         "-map", cur_a,
+        "-frames:v", str(exact_frames),
         "-r", str(fps),
         "-vsync", "cfr",
         "-c:v", "libx264",
@@ -375,14 +408,13 @@ def merge_segment_group(
         "-preset", preset,
         "-rc-lookahead", "12",
         "-pix_fmt", "yuv420p",
-        "-c:a", "aac",
-        "-b:a", audio_bitrate,
+        "-c:a", "pcm_s16le",
         "-ar", "48000",
         "-ac", "2",
         str(out_path),
     ]
     run_cmd(cmd)
-    return total_dur
+    return exact_dur
 
 
 def finalize_audio_and_container(
@@ -411,7 +443,11 @@ def finalize_audio_and_container(
         run_cmd([
             "ffmpeg", "-y",
             "-i", str(raw_video),
-            "-c", "copy",
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-b:a", audio_bitrate,
+            "-ar", "48000",
+            "-ac", "2",
             "-movflags", "+faststart",
             str(final_video),
         ])
@@ -478,13 +514,13 @@ def main() -> None:
     project_name = manifest.get("project_name", "output")
     out_dir = Path("output")
     out_dir.mkdir(parents=True, exist_ok=True)
-    raw_master = Path("build/raw_master.mp4")
+    raw_master = Path("build/raw_master.mkv")
     final_video = out_dir / f"{project_name}.mp4"
     loudnorm = render_cfg.get("loudness_normalization") or {}
 
     if len(prepared) <= BATCH_SIZE:
         total_dur = merge_segment_group(
-            prepared, raw_master, fps=fps, crf=crf, preset="faster", audio_bitrate=audio_bitrate
+            prepared, raw_master, fps=fps, crf=crf, preset="faster"
         )
     else:
         batches_dir = Path("build/batches")
@@ -496,19 +532,19 @@ def main() -> None:
             in_cf_dur = chunk[0][2]
             in_trans = chunk[0][3]
             chunk_for_merge = [(chunk[0][0], chunk[0][1], 0.0, "cut")] + chunk[1:]
-            batch_out = batches_dir / f"batch_{b_idx:02d}.mp4"
+            batch_out = batches_dir / f"batch_{b_idx:02d}.mkv"
             batch_dur = merge_segment_group(
-                chunk_for_merge, batch_out, fps=fps, crf=15, preset="superfast", audio_bitrate="320k"
+                chunk_for_merge, batch_out, fps=fps, crf=15, preset="superfast"
             )
             batch_segments.append((batch_out, batch_dur, in_cf_dur, in_trans))
-            print(f"✅ Batch {b_idx + 1} merged ({len(chunk)} scenes, {batch_dur:.2f}s)")
+            print(f"✅ Batch {b_idx + 1} merged ({len(chunk)} scenes, {batch_dur:.3f}s)")
 
         total_dur = merge_segment_group(
-            batch_segments, raw_master, fps=fps, crf=crf, preset="faster", audio_bitrate=audio_bitrate
+            batch_segments, raw_master, fps=fps, crf=crf, preset="faster"
         )
 
     finalize_audio_and_container(raw_master, final_video, audio_bitrate, loudnorm)
-    print(f"✅ Render complete: {final_video} ({total_dur:.2f}s)")
+    print(f"✅ Render complete: {final_video} ({total_dur:.3f}s)")
 
 
 if __name__ == "__main__":
