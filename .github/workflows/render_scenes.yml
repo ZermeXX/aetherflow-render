@@ -47,10 +47,10 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Install FFmpeg & Rclone
+      - name: Install FFmpeg, Fonts & Rclone
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg curl unzip
+          sudo apt-get install -y -qq ffmpeg curl unzip fonts-dejavu-core
           if ! command -v rclone &> /dev/null; then
             curl -fsSL https://rclone.org/install.sh | sudo bash
           fi
@@ -345,26 +345,65 @@ jobs:
           ]
           (out_dir / "RELEASE_CARD.md").write_text("\n".join(release_md), encoding="utf-8")
 
-          # 5. Shorts Factory (3 vertical 9:16 30s highlights)
+          # 5. Shorts Factory (2 or 3 vertical 9:16 highlights with individual English Hook Text Overlay)
           shorts_dir = out_dir / "shorts"
           shorts_dir.mkdir(parents=True, exist_ok=True)
-          offsets = [0.0, max(0.0, duration_sec * 0.35), max(0.0, duration_sec * 0.70)]
-          for i, start_t in enumerate(offsets, 1):
-              clip_len = min(30.0, max(5.0, duration_sec - start_t))
-              short_out = shorts_dir / f"{project_name}_Short_0{i}.mp4"
-              subprocess.run(
-                  [
-                      "ffmpeg", "-y",
-                      "-ss", f"{start_t:.2f}",
-                      "-t", f"{clip_len:.2f}",
-                      "-i", str(main_video),
-                      "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1",
-                      "-c:v", "libx264", "-crf", "20", "-preset", "fast", "-pix_fmt", "yuv420p",
-                      "-c:a", "aac", "-b:a", "192k",
-                      str(short_out),
-                  ],
-                  check=True,
+
+          ui_montage = (manifest.get("studio_ui_presets") or {}).get("tab_1_montage") or {}
+          shorts_cfg = manifest.get("shorts_factory") or ui_montage.get("shorts_factory") or {}
+          shorts_enabled = shorts_cfg.get("enabled", True)
+
+          if shorts_enabled:
+              raw_hooks = shorts_cfg.get("hook_texts") or ui_montage.get("hook_texts") or []
+              fallback_hook = (
+                  shorts_cfg.get("hook_text")
+                  or ui_montage.get("hook_text")
+                  or "WAIT FOR THE 14TH SECOND..."
               )
+              shorts_count = int(shorts_cfg.get("shorts_count") or ui_montage.get("shorts_count") or len(raw_hooks) or 3)
+              shorts_count = max(1, min(3, shorts_count))
+
+              offsets = [0.0, max(0.0, duration_sec * 0.35)] if shorts_count == 2 else [
+                  0.0,
+                  max(0.0, duration_sec * 0.35),
+                  max(0.0, duration_sec * 0.70),
+              ]
+              font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+
+              for i, start_t in enumerate(offsets[:shorts_count], 1):
+                  clip_len = min(30.0, max(5.0, duration_sec - start_t))
+                  short_out = shorts_dir / f"{project_name}_Short_0{i}.mp4"
+                  hook_str = (raw_hooks[i - 1] if i - 1 < len(raw_hooks) else fallback_hook).strip()
+
+                  vf_chain = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1"
+                  if hook_str:
+                      safe_text = (
+                          hook_str.replace("\\", "\\\\")
+                          .replace(":", "\\:")
+                          .replace("'", "\u2019")
+                          .replace("%", "\\%")
+                      )
+                      vf_chain += (
+                          f",drawtext=fontfile={font_path}:text='{safe_text}':"
+                          f"fontcolor=white:fontsize=54:line_spacing=10:"
+                          f"x=(w-text_w)/2:y=240:"
+                          f"box=1:boxcolor=black@0.68:boxborderw=24:"
+                          f"shadowcolor=black@0.85:shadowx=3:shadowy=3"
+                      )
+
+                  subprocess.run(
+                      [
+                          "ffmpeg", "-y",
+                          "-ss", f"{start_t:.2f}",
+                          "-t", f"{clip_len:.2f}",
+                          "-i", str(main_video),
+                          "-vf", vf_chain,
+                          "-c:v", "libx264", "-crf", "20", "-preset", "fast", "-pix_fmt", "yuv420p",
+                          "-c:a", "aac", "-b:a", "192k",
+                          str(short_out),
+                      ],
+                      check=True,
+                  )
 
           # 6. Lightweight 720p review copy (~60-80 MB)
           preview_720p = out_dir / f"{project_name}_720p_preview.mp4"
@@ -380,7 +419,7 @@ jobs:
               check=True,
           )
           preview_mb = preview_720p.stat().st_size / (1024 * 1024)
-          print(f"✅ Metadata, SRT files, RELEASE_CARD.md, 3 Shorts, and 720p preview ({preview_mb:.1f} MB) generated!")
+          print(f"✅ Metadata, SRT files, RELEASE_CARD.md, Shorts, and 720p preview ({preview_mb:.1f} MB) generated!")
           EOF
 
       - name: Upload Output Video, Shorts & Metadata to Google Drive
