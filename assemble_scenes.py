@@ -6,52 +6,19 @@ import sys
 from pathlib import Path
 
 BATCH_SIZE = 6
+BREATH_PAUSE_SEC = 0.40  # Естественная пауза диктора между фразами (сек)
 
 VALID_XFADE_TRANSITIONS = {
-    "fade",
-    "wipeleft",
-    "wiperight",
-    "wipeup",
-    "wipedown",
-    "slideleft",
-    "slideright",
-    "slideup",
-    "slidedown",
-    "circlecrop",
-    "rectcrop",
-    "distance",
-    "fadeblack",
-    "fadewhite",
-    "radial",
-    "smoothleft",
-    "smoothright",
-    "smoothup",
-    "smoothdown",
-    "circleopen",
-    "circleclose",
-    "vertopen",
-    "vertclose",
-    "horzopen",
-    "horzclose",
-    "dissolve",
-    "pixelize",
-    "diagtl",
-    "diagtr",
-    "diagbl",
-    "diagbr",
-    "hlslice",
-    "hrslice",
-    "vuslice",
-    "vdslice",
-    "hblur",
-    "fadegrays",
-    "wipetl",
-    "wipetr",
-    "wipebl",
-    "wipebr",
-    "squeezeh",
-    "squeezev",
-    "zoomin",
+    "fade", "wipeleft", "wiperight", "wipeup", "wipedown",
+    "slideleft", "slideright", "slideup", "slidedown",
+    "circlecrop", "rectcrop", "distance", "fadeblack", "fadewhite",
+    "radial", "smoothleft", "smoothright", "smoothup", "smoothdown",
+    "circleopen", "circleclose", "vertopen", "vertclose",
+    "horzopen", "horzclose", "dissolve", "pixelize",
+    "diagtl", "diagtr", "diagbl", "diagbr",
+    "hlslice", "hrslice", "vuslice", "vdslice",
+    "hblur", "fadegrays", "wipetl", "wipetr", "wipebl", "wipebr",
+    "squeezeh", "squeezev", "zoomin",
 }
 
 
@@ -60,17 +27,29 @@ def run_cmd(cmd: list[str]) -> None:
     subprocess.run(cmd, check=True)
 
 
+def get_media_duration(media_path: Path) -> float:
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(media_path),
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        val = float(res.stdout.strip())
+        return val if val > 0.05 else 0.0
+    except ValueError:
+        return 0.0
+
+
 def has_audio_stream(media_path: Path) -> bool:
     cmd = [
         "ffprobe",
-        "-v",
-        "error",
-        "-select_streams",
-        "a",
-        "-show_entries",
-        "stream=index",
-        "-of",
-        "csv=p=0",
+        "-v", "error",
+        "-select_streams", "a",
+        "-show_entries", "stream=index",
+        "-of", "csv=p=0",
         str(media_path),
     ]
     res = subprocess.run(cmd, capture_output=True, text=True)
@@ -99,12 +78,10 @@ def resolve_asset(filename: str | None, work_dir: Path, folder_id: str | None) -
         dest = work_dir / base_name
         dest.parent.mkdir(parents=True, exist_ok=True)
         run_cmd([
-            "rclone",
-            "copyto",
+            "rclone", "copyto",
             f"{remote}:{filename}",
             str(dest),
-            "--drive-root-folder-id",
-            folder_id,
+            "--drive-root-folder-id", folder_id,
         ])
         if dest.is_file():
             return dest
@@ -174,6 +151,7 @@ def prepare_scene(
     height: int,
     fps: int,
     folder_id: str | None,
+    next_xfade_overlap: float,
 ) -> tuple[Path, float, float]:
     assets = scene.get("assets") or {}
     video_name = (
@@ -183,7 +161,7 @@ def prepare_scene(
         or assets.get("image_reference")
     )
     if not video_name:
-        raise KeyError(f"В сцене #{idx + 1} не указано имя видеофайла (file_name / video_file)")
+        raise KeyError(f"В сцене #{idx + 1} не указано имя видеофайла")
 
     voice_name = (
         scene.get("voiceover_file")
@@ -191,7 +169,6 @@ def prepare_scene(
         or assets.get("voiceover_file")
     )
 
-    dur = float(scene.get("duration_sec") or scene.get("duration") or 10.0)
     trans_type = str(scene.get("transition") or "cut").strip().lower()
     cf_dur = float(scene.get("transition_duration") or 0.0)
     if trans_type == "cut" or cf_dur <= 0.0:
@@ -205,17 +182,51 @@ def prepare_scene(
         raise FileNotFoundError(f"Не найден видеофайл для сцены #{idx + 1}: {video_name}")
 
     src_voice = resolve_asset(voice_name, work_dir, folder_id) if voice_name else None
-
-    out_path = work_dir / f"norm_{idx + 1:03d}.mp4"
     is_image = src_video.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}
 
+    # 1. AUDIO-FIRST: определяем точную длительность сцены по реальному файлу озвучки
+    manifest_dur = float(scene.get("duration_sec") or scene.get("duration") or 8.0)
+    real_voice_dur = get_media_duration(src_voice) if (src_voice and src_voice.is_file()) else 0.0
+
+    if real_voice_dur > 0.0:
+        # Речь диктора + пауза дыхания + компенсация нахлёста следующего визуального xfade
+        target_dur = round(real_voice_dur + BREATH_PAUSE_SEC + next_xfade_overlap, 3)
+    else:
+        target_dur = round(manifest_dur + next_xfade_overlap, 3)
+
+    real_video_dur = target_dur if is_image else get_media_duration(src_video)
+    if real_video_dur <= 0.05:
+        real_video_dur = target_dur
+
+    print(
+        f"🎬 Сцена #{idx + 1:02d}: голос={real_voice_dur:.2f}s | исходное видео={real_video_dur:.2f}s "
+        f"| итоговая длина сцены={target_dur:.2f}s (запас под xfade={next_xfade_overlap:.2f}s)"
+    )
+
+    out_path = work_dir / f"norm_{idx + 1:03d}.mp4"
+
+    # 2. ELASTIC VIDEO RETIMING: плавно подгоняем видеоклип под точную длину озвучки
+    cmd = ["ffmpeg", "-y"]
+    if is_image:
+        cmd += ["-loop", "1", "-t", f"{target_dur:.3f}", "-i", str(src_video)]
+        pts_expr = "PTS-STARTPTS"
+    else:
+        # Если видео более чем в 1.75 раза короче озвучки — зацикливаем поток, иначе плавно растягиваем setpts
+        if target_dur > real_video_dur * 1.75:
+            cmd += ["-stream_loop", "-1", "-i", str(src_video)]
+            pts_expr = "PTS-STARTPTS"
+        else:
+            speed_factor = target_dur / real_video_dur
+            cmd += ["-i", str(src_video)]
+            pts_expr = f"{speed_factor:.6f}*(PTS-STARTPTS)"
+
     v_filters = [
+        f"setpts={pts_expr}",
         f"scale={width}:{height}:force_original_aspect_ratio=decrease",
         f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black",
         f"fps={fps}",
         "setsar=1",
         "format=yuv420p",
-        "setpts=PTS-STARTPTS",
     ]
 
     if idx == 0 and cf_dur > 0.0 and trans_type in {"fade", "fadeblack"}:
@@ -225,14 +236,8 @@ def prepare_scene(
     out_trans = str(scene.get("transition_out_type") or "none").strip().lower()
     out_trans_dur = float(scene.get("transition_out_duration") or 0.0)
     if out_trans in {"fade_to_black", "fadeblack", "fade"} and out_trans_dur > 0.0:
-        fade_start = max(0.0, dur - out_trans_dur)
+        fade_start = max(0.0, target_dur - out_trans_dur)
         v_filters.append(f"fade=t=out:st={fade_start:.3f}:d={out_trans_dur:.3f}")
-
-    cmd = ["ffmpeg", "-y"]
-    if is_image:
-        cmd += ["-loop", "1", "-t", f"{dur:.3f}", "-i", str(src_video)]
-    else:
-        cmd += ["-i", str(src_video)]
 
     filter_parts = [f"[0:v]{','.join(v_filters)}[vout]"]
     mute_ambient = bool(scene.get("mute_audio", False))
@@ -240,16 +245,19 @@ def prepare_scene(
     voice_gain = float(scene.get("voiceover_gain_db", 0.0))
     video_has_audio = (not is_image) and has_audio_stream(src_video)
 
-    if src_voice and src_voice.is_file():
+    # 3. CLEAN AUDIO WITHOUT OVERLAP: речь идёт целиком, остаток дополняется тишиной (apad)
+    fade_out_st = max(0.0, target_dur - 0.02)
+    if src_voice and src_voice.is_file() and real_voice_dur > 0.0:
         cmd += ["-i", str(src_voice)]
         filter_parts.append(
             f"[1:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
-            f"volume={voice_gain}dB,apad,atrim=0:{dur:.3f},asetpts=PTS-STARTPTS[avo]"
+            f"volume={voice_gain}dB,apad,atrim=0:{target_dur:.3f},"
+            f"afade=t=in:st=0:d=0.015,afade=t=out:st={fade_out_st:.3f}:d=0.020,asetpts=PTS-STARTPTS[avo]"
         )
         if video_has_audio and not mute_ambient and ambient_gain > -90.0:
             filter_parts.append(
                 f"[0:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
-                f"volume={ambient_gain}dB,apad,atrim=0:{dur:.3f},asetpts=PTS-STARTPTS[aamb]"
+                f"volume={ambient_gain}dB,apad,atrim=0:{target_dur:.3f},asetpts=PTS-STARTPTS[aamb]"
             )
             filter_parts.append("[avo][aamb]amix=inputs=2:duration=first:normalize=0[aout]")
         else:
@@ -257,46 +265,32 @@ def prepare_scene(
     elif video_has_audio and not mute_ambient and ambient_gain > -90.0:
         filter_parts.append(
             f"[0:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
-            f"volume={ambient_gain}dB,apad,atrim=0:{dur:.3f},asetpts=PTS-STARTPTS[aout]"
+            f"volume={ambient_gain}dB,apad,atrim=0:{target_dur:.3f},"
+            f"afade=t=in:st=0:d=0.015,afade=t=out:st={fade_out_st:.3f}:d=0.020,asetpts=PTS-STARTPTS[aout]"
         )
     else:
-        filter_parts.append(f"anullsrc=r=48000:cl=stereo:d={dur:.3f}[aout]")
+        filter_parts.append(f"anullsrc=r=48000:cl=stereo:d={target_dur:.3f}[aout]")
 
     cmd += [
-        "-filter_complex",
-        ";".join(filter_parts),
-        "-map",
-        "[vout]",
-        "-map",
-        "[aout]",
-        "-t",
-        f"{dur:.3f}",
-        "-r",
-        str(fps),
-        "-vsync",
-        "cfr",
-        "-c:v",
-        "libx264",
-        "-crf",
-        "14",
-        "-preset",
-        "superfast",
-        "-rc-lookahead",
-        "10",
-        "-pix_fmt",
-        "yuv420p",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "320k",
-        "-ar",
-        "48000",
-        "-ac",
-        "2",
+        "-filter_complex", ";".join(filter_parts),
+        "-map", "[vout]",
+        "-map", "[aout]",
+        "-t", f"{target_dur:.3f}",
+        "-r", str(fps),
+        "-vsync", "cfr",
+        "-c:v", "libx264",
+        "-crf", "14",
+        "-preset", "superfast",
+        "-rc-lookahead", "10",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", "320k",
+        "-ar", "48000",
+        "-ac", "2",
         str(out_path),
     ]
     run_cmd(cmd)
-    return out_path, dur, cf_dur
+    return out_path, target_dur, cf_dur
 
 
 def merge_segment_group(
@@ -330,14 +324,18 @@ def merge_segment_group(
         next_a = f"[a{idx}]"
 
         if cf_dur_i > 0.0 and trans_type != "cut":
+            # Визуальный переход xfade перекрывает заложенный в конец предыдущей сцены буфер тишины,
+            # а аудио стыкуется строго последовательно (concat) без наезда голосов друг на друга!
             offset = max(0.0, total_dur - cf_dur_i)
+            trim_prev_a = max(0.05, total_dur - cf_dur_i)
             filters.append(
                 f"{cur_v}[iv{idx}]xfade=transition={trans_type}:duration={cf_dur_i:.3f}:offset={offset:.3f},settb=1/24000{next_v}"
             )
             filters.append(
-                f"{cur_a}[ia{idx}]acrossfade=d={cf_dur_i:.3f}:c1=tri:c2=tri{next_a}"
+                f"{cur_a}atrim=0:{trim_prev_a:.3f},asetpts=PTS-STARTPTS[a_prev_trim{idx}];"
+                f"[a_prev_trim{idx}][ia{idx}]concat=n=2:v=0:a=1{next_a}"
             )
-            total_dur = total_dur + dur_i - cf_dur_i
+            total_dur = offset + dur_i
         else:
             filters.append(f"{cur_v}[iv{idx}]concat=n=2:v=1:a=0,settb=1/24000{next_v}")
             filters.append(f"{cur_a}[ia{idx}]concat=n=2:v=0:a=1{next_a}")
@@ -347,38 +345,22 @@ def merge_segment_group(
         cur_a = next_a
 
     cmd += [
-        "-filter_complex",
-        ";".join(filters),
-        "-map",
-        cur_v,
-        "-map",
-        cur_a,
-        "-r",
-        str(fps),
-        "-vsync",
-        "cfr",
-        "-c:v",
-        "libx264",
-        "-profile:v",
-        "high",
-        "-level",
-        "5.1",
-        "-crf",
-        str(crf),
-        "-preset",
-        preset,
-        "-rc-lookahead",
-        "12",
-        "-pix_fmt",
-        "yuv420p",
-        "-c:a",
-        "aac",
-        "-b:a",
-        audio_bitrate,
-        "-ar",
-        "48000",
-        "-ac",
-        "2",
+        "-filter_complex", ";".join(filters),
+        "-map", cur_v,
+        "-map", cur_a,
+        "-r", str(fps),
+        "-vsync", "cfr",
+        "-c:v", "libx264",
+        "-profile:v", "high",
+        "-level", "5.1",
+        "-crf", str(crf),
+        "-preset", preset,
+        "-rc-lookahead", "12",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", audio_bitrate,
+        "-ar", "48000",
+        "-ac", "2",
         str(out_path),
     ]
     run_cmd(cmd)
@@ -396,36 +378,23 @@ def finalize_audio_and_container(
         tp = float(loudnorm_cfg.get("true_peak_db", -1.0))
         lra = float(loudnorm_cfg.get("lra", 7.0))
         run_cmd([
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(raw_video),
-            "-c:v",
-            "copy",
-            "-af",
-            f"loudnorm=I={lufs}:TP={tp}:LRA={lra}",
-            "-c:a",
-            "aac",
-            "-b:a",
-            audio_bitrate,
-            "-ar",
-            "48000",
-            "-ac",
-            "2",
-            "-movflags",
-            "+faststart",
+            "ffmpeg", "-y",
+            "-i", str(raw_video),
+            "-c:v", "copy",
+            "-af", f"loudnorm=I={lufs}:TP={tp}:LRA={lra}",
+            "-c:a", "aac",
+            "-b:a", audio_bitrate,
+            "-ar", "48000",
+            "-ac", "2",
+            "-movflags", "+faststart",
             str(final_video),
         ])
     else:
         run_cmd([
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(raw_video),
-            "-c",
-            "copy",
-            "-movflags",
-            "+faststart",
+            "ffmpeg", "-y",
+            "-i", str(raw_video),
+            "-c", "copy",
+            "-movflags", "+faststart",
             str(final_video),
         ])
 
@@ -442,7 +411,7 @@ def main() -> None:
 
     scenes = get_normalized_scenes(manifest)
     if not scenes:
-        raise ValueError("В манифесте не найден список сцен ('timeline', 'scenes' или 'timeline_slots')!")
+        raise ValueError("В манифесте не найден список сцен!")
 
     render_cfg = manifest.get("render_settings") or {}
     res_str = str(render_cfg.get("resolution", "3840x2160")).split()[0]
@@ -457,9 +426,23 @@ def main() -> None:
         or manifest.get("folder_id")
     )
 
+    # Заранее вычисляем для каждой сцены длительность визуального перехода следующей сцены,
+    # чтобы заложить этот буфер в хвост сцены без потери ни миллисекунды речи
+    next_overlaps: list[float] = []
+    for i in range(len(scenes)):
+        if i + 1 < len(scenes):
+            nxt = scenes[i + 1]
+            t_type = str(nxt.get("transition") or "cut").strip().lower()
+            t_dur = float(nxt.get("transition_duration") or 0.0)
+            next_overlaps.append(t_dur if (t_type != "cut" and t_dur > 0.0) else 0.0)
+        else:
+            next_overlaps.append(0.0)
+
     prepared: list[tuple[Path, float, float, str]] = []
     for idx, scene in enumerate(scenes):
-        sc_path, dur, cf_dur = prepare_scene(scene, idx, width, height, fps, folder_id)
+        sc_path, dur, cf_dur = prepare_scene(
+            scene, idx, width, height, fps, folder_id, next_overlaps[idx]
+        )
         trans_type = str(scene.get("transition") or "cut").strip().lower()
         if trans_type not in VALID_XFADE_TRANSITIONS and trans_type != "cut":
             trans_type = "fade"
@@ -474,12 +457,7 @@ def main() -> None:
 
     if len(prepared) <= BATCH_SIZE:
         total_dur = merge_segment_group(
-            prepared,
-            raw_master,
-            fps=fps,
-            crf=crf,
-            preset="faster",
-            audio_bitrate=audio_bitrate,
+            prepared, raw_master, fps=fps, crf=crf, preset="faster", audio_bitrate=audio_bitrate
         )
     else:
         batches_dir = Path("build/batches")
@@ -493,23 +471,13 @@ def main() -> None:
             chunk_for_merge = [(chunk[0][0], chunk[0][1], 0.0, "cut")] + chunk[1:]
             batch_out = batches_dir / f"batch_{b_idx:02d}.mp4"
             batch_dur = merge_segment_group(
-                chunk_for_merge,
-                batch_out,
-                fps=fps,
-                crf=15,
-                preset="superfast",
-                audio_bitrate="320k",
+                chunk_for_merge, batch_out, fps=fps, crf=15, preset="superfast", audio_bitrate="320k"
             )
             batch_segments.append((batch_out, batch_dur, in_cf_dur, in_trans))
             print(f"✅ Batch {b_idx + 1} merged ({len(chunk)} scenes, {batch_dur:.2f}s)")
 
         total_dur = merge_segment_group(
-            batch_segments,
-            raw_master,
-            fps=fps,
-            crf=crf,
-            preset="faster",
-            audio_bitrate=audio_bitrate,
+            batch_segments, raw_master, fps=fps, crf=crf, preset="faster", audio_bitrate=audio_bitrate
         )
 
     finalize_audio_and_container(raw_master, final_video, audio_bitrate, loudnorm)
