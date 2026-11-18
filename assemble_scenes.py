@@ -281,6 +281,8 @@ def prepare_scene(
         "14",
         "-preset",
         "superfast",
+        "-rc-lookahead",
+        "10",
         "-pix_fmt",
         "yuv420p",
         "-c:a",
@@ -304,10 +306,8 @@ def merge_segment_group(
     crf: int,
     preset: str,
     audio_bitrate: str,
-    loudnorm_cfg: dict | None = None,
-    faststart: bool = False,
 ) -> float:
-    if len(segments) == 1 and not loudnorm_cfg:
+    if len(segments) == 1:
         shutil.copy2(segments[0][0], out_path)
         return segments[0][1]
 
@@ -316,7 +316,6 @@ def merge_segment_group(
         cmd += ["-i", str(seg_path)]
 
     filters = []
-    # Lock identical timebase (1/24000) and format on every input stream to prevent xfade/concat mismatch
     for idx in range(len(segments)):
         filters.append(f"[{idx}:v]fps={fps},settb=1/24000,format=yuv420p,setpts=PTS-STARTPTS[iv{idx}]")
         filters.append(f"[{idx}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,asetpts=PTS-STARTPTS[ia{idx}]")
@@ -347,13 +346,6 @@ def merge_segment_group(
         cur_v = next_v
         cur_a = next_a
 
-    if loudnorm_cfg and loudnorm_cfg.get("enabled", True):
-        lufs = float(loudnorm_cfg.get("target_lufs", -14.0))
-        tp = float(loudnorm_cfg.get("true_peak_db", -1.0))
-        lra = float(loudnorm_cfg.get("lra", 7.0))
-        filters.append(f"{cur_a}loudnorm=I={lufs}:TP={tp}:LRA={lra}[afinal]")
-        cur_a = "[afinal]"
-
     cmd += [
         "-filter_complex",
         ";".join(filters),
@@ -375,12 +367,10 @@ def merge_segment_group(
         str(crf),
         "-preset",
         preset,
+        "-rc-lookahead",
+        "12",
         "-pix_fmt",
         "yuv420p",
-    ]
-    if faststart:
-        cmd += ["-movflags", "+faststart"]
-    cmd += [
         "-c:a",
         "aac",
         "-b:a",
@@ -393,6 +383,51 @@ def merge_segment_group(
     ]
     run_cmd(cmd)
     return total_dur
+
+
+def finalize_audio_and_container(
+    raw_video: Path,
+    final_video: Path,
+    audio_bitrate: str,
+    loudnorm_cfg: dict,
+) -> None:
+    if loudnorm_cfg.get("enabled", True):
+        lufs = float(loudnorm_cfg.get("target_lufs", -14.0))
+        tp = float(loudnorm_cfg.get("true_peak_db", -1.0))
+        lra = float(loudnorm_cfg.get("lra", 7.0))
+        run_cmd([
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(raw_video),
+            "-c:v",
+            "copy",
+            "-af",
+            f"loudnorm=I={lufs}:TP={tp}:LRA={lra}",
+            "-c:a",
+            "aac",
+            "-b:a",
+            audio_bitrate,
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "-movflags",
+            "+faststart",
+            str(final_video),
+        ])
+    else:
+        run_cmd([
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(raw_video),
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            str(final_video),
+        ])
 
 
 def main() -> None:
@@ -413,9 +448,7 @@ def main() -> None:
     res_str = str(render_cfg.get("resolution", "3840x2160")).split()[0]
     width, height = (int(x) for x in res_str.lower().split("x"))
     fps = int(render_cfg.get("fps", 24))
-    crf = int(render_cfg.get("crf", 18))
-    raw_preset = str(render_cfg.get("preset", "medium")).strip().lower()
-    final_preset = "medium" if raw_preset in {"slow", "slower", "veryslow"} else raw_preset
+    crf = min(int(render_cfg.get("crf", 18)), 17)
     audio_bitrate = str(render_cfg.get("audio_bitrate", "320k"))
     folder_id = (
         os.getenv("GDRIVE_FOLDER_ID")
@@ -435,56 +468,51 @@ def main() -> None:
     project_name = manifest.get("project_name", "output")
     out_dir = Path("output")
     out_dir.mkdir(parents=True, exist_ok=True)
+    raw_master = Path("build/raw_master.mp4")
     final_video = out_dir / f"{project_name}.mp4"
     loudnorm = render_cfg.get("loudness_normalization") or {}
 
     if len(prepared) <= BATCH_SIZE:
         total_dur = merge_segment_group(
             prepared,
-            final_video,
+            raw_master,
             fps=fps,
             crf=crf,
-            preset=final_preset,
+            preset="faster",
             audio_bitrate=audio_bitrate,
-            loudnorm_cfg=loudnorm,
-            faststart=True,
         )
-        print(f"✅ Render complete: {final_video} ({total_dur:.2f}s)")
-        return
+    else:
+        batches_dir = Path("build/batches")
+        batches_dir.mkdir(parents=True, exist_ok=True)
+        batch_segments: list[tuple[Path, float, float, str]] = []
 
-    batches_dir = Path("build/batches")
-    batches_dir.mkdir(parents=True, exist_ok=True)
-    batch_segments: list[tuple[Path, float, float, str]] = []
+        for b_idx, start in enumerate(range(0, len(prepared), BATCH_SIZE)):
+            chunk = prepared[start : start + BATCH_SIZE]
+            in_cf_dur = chunk[0][2]
+            in_trans = chunk[0][3]
+            chunk_for_merge = [(chunk[0][0], chunk[0][1], 0.0, "cut")] + chunk[1:]
+            batch_out = batches_dir / f"batch_{b_idx:02d}.mp4"
+            batch_dur = merge_segment_group(
+                chunk_for_merge,
+                batch_out,
+                fps=fps,
+                crf=15,
+                preset="superfast",
+                audio_bitrate="320k",
+            )
+            batch_segments.append((batch_out, batch_dur, in_cf_dur, in_trans))
+            print(f"✅ Batch {b_idx + 1} merged ({len(chunk)} scenes, {batch_dur:.2f}s)")
 
-    for b_idx, start in enumerate(range(0, len(prepared), BATCH_SIZE)):
-        chunk = prepared[start : start + BATCH_SIZE]
-        in_cf_dur = chunk[0][2]
-        in_trans = chunk[0][3]
-        chunk_for_merge = [(chunk[0][0], chunk[0][1], 0.0, "cut")] + chunk[1:]
-        batch_out = batches_dir / f"batch_{b_idx:02d}.mp4"
-        batch_dur = merge_segment_group(
-            chunk_for_merge,
-            batch_out,
+        total_dur = merge_segment_group(
+            batch_segments,
+            raw_master,
             fps=fps,
-            crf=15,
-            preset="superfast",
-            audio_bitrate="320k",
-            loudnorm_cfg=None,
-            faststart=False,
+            crf=crf,
+            preset="faster",
+            audio_bitrate=audio_bitrate,
         )
-        batch_segments.append((batch_out, batch_dur, in_cf_dur, in_trans))
-        print(f"✅ Batch {b_idx + 1} merged ({len(chunk)} scenes, {batch_dur:.2f}s)")
 
-    total_dur = merge_segment_group(
-        batch_segments,
-        final_video,
-        fps=fps,
-        crf=crf,
-        preset=final_preset,
-        audio_bitrate=audio_bitrate,
-        loudnorm_cfg=loudnorm,
-        faststart=True,
-    )
+    finalize_audio_and_container(raw_master, final_video, audio_bitrate, loudnorm)
     print(f"✅ Render complete: {final_video} ({total_dur:.2f}s)")
 
 
