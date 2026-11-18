@@ -5,6 +5,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+BATCH_SIZE = 6
+
 VALID_XFADE_TRANSITIONS = {
     "fade",
     "wipeleft",
@@ -276,9 +278,9 @@ def prepare_scene(
         "-c:v",
         "libx264",
         "-crf",
-        "16",
+        "15",
         "-preset",
-        "fast",
+        "faster",
         "-pix_fmt",
         "yuv420p",
         "-c:a",
@@ -293,6 +295,100 @@ def prepare_scene(
     ]
     run_cmd(cmd)
     return out_path, dur, cf_dur
+
+
+def merge_segment_group(
+    segments: list[tuple[Path, float, float, str]],
+    out_path: Path,
+    fps: int,
+    crf: int,
+    preset: str,
+    audio_bitrate: str,
+    loudnorm_cfg: dict | None = None,
+    faststart: bool = False,
+) -> float:
+    if len(segments) == 1 and not loudnorm_cfg:
+        shutil.copy2(segments[0][0], out_path)
+        return segments[0][1]
+
+    cmd = ["ffmpeg", "-y"]
+    for seg_path, _, _, _ in segments:
+        cmd += ["-i", str(seg_path)]
+
+    filters = []
+    cur_v = "[0:v]"
+    cur_a = "[0:a]"
+    total_dur = segments[0][1]
+
+    for idx in range(1, len(segments)):
+        _, dur_i, cf_dur_i, trans_type = segments[idx]
+        next_v = f"[v{idx}]"
+        next_a = f"[a{idx}]"
+
+        if cf_dur_i > 0.0 and trans_type != "cut":
+            offset = max(0.0, total_dur - cf_dur_i)
+            filters.append(
+                f"{cur_v}[{idx}:v]xfade=transition={trans_type}:duration={cf_dur_i:.3f}:offset={offset:.3f}{next_v}"
+            )
+            filters.append(
+                f"{cur_a}[{idx}:a]acrossfade=d={cf_dur_i:.3f}:c1=tri:c2=tri{next_a}"
+            )
+            total_dur = total_dur + dur_i - cf_dur_i
+        else:
+            filters.append(f"{cur_v}[{idx}:v]concat=n=2:v=1:a=0{next_v}")
+            filters.append(f"{cur_a}[{idx}:a]concat=n=2:v=0:a=1{next_a}")
+            total_dur += dur_i
+
+        cur_v = next_v
+        cur_a = next_a
+
+    if loudnorm_cfg and loudnorm_cfg.get("enabled", True):
+        lufs = float(loudnorm_cfg.get("target_lufs", -14.0))
+        tp = float(loudnorm_cfg.get("true_peak_db", -1.0))
+        lra = float(loudnorm_cfg.get("lra", 7.0))
+        filters.append(f"{cur_a}loudnorm=I={lufs}:TP={tp}:LRA={lra}[afinal]")
+        cur_a = "[afinal]"
+
+    if filters:
+        cmd += ["-filter_complex", ";".join(filters)]
+
+    cmd += [
+        "-map",
+        cur_v,
+        "-map",
+        cur_a,
+        "-r",
+        str(fps),
+        "-vsync",
+        "cfr",
+        "-c:v",
+        "libx264",
+        "-profile:v",
+        "high",
+        "-level",
+        "5.1",
+        "-crf",
+        str(crf),
+        "-preset",
+        preset,
+        "-pix_fmt",
+        "yuv420p",
+    ]
+    if faststart:
+        cmd += ["-movflags", "+faststart"]
+    cmd += [
+        "-c:a",
+        "aac",
+        "-b:a",
+        audio_bitrate,
+        "-ar",
+        "48000",
+        "-ac",
+        "2",
+        str(out_path),
+    ]
+    run_cmd(cmd)
+    return total_dur
 
 
 def main() -> None:
@@ -314,7 +410,8 @@ def main() -> None:
     width, height = (int(x) for x in res_str.lower().split("x"))
     fps = int(render_cfg.get("fps", 24))
     crf = int(render_cfg.get("crf", 18))
-    preset = str(render_cfg.get("preset", "slow"))
+    raw_preset = str(render_cfg.get("preset", "medium")).strip().lower()
+    final_preset = "medium" if raw_preset in {"slow", "slower", "veryslow"} else raw_preset
     audio_bitrate = str(render_cfg.get("audio_bitrate", "320k"))
     folder_id = (
         os.getenv("GDRIVE_FOLDER_ID")
@@ -335,87 +432,55 @@ def main() -> None:
     out_dir = Path("output")
     out_dir.mkdir(parents=True, exist_ok=True)
     final_video = out_dir / f"{project_name}.mp4"
+    loudnorm = render_cfg.get("loudness_normalization") or {}
 
-    if len(prepared) == 1:
-        shutil.copy2(prepared[0][0], final_video)
-        print(f"✅ Render complete (single scene): {final_video}")
+    if len(prepared) <= BATCH_SIZE:
+        total_dur = merge_segment_group(
+            prepared,
+            final_video,
+            fps=fps,
+            crf=crf,
+            preset=final_preset,
+            audio_bitrate=audio_bitrate,
+            loudnorm_cfg=loudnorm,
+            faststart=True,
+        )
+        print(f"✅ Render complete: {final_video} ({total_dur:.2f}s)")
         return
 
-    cmd = ["ffmpeg", "-y"]
-    for sc_path, _, _, _ in prepared:
-        cmd += ["-i", str(sc_path)]
+    batches_dir = Path("build/batches")
+    batches_dir.mkdir(parents=True, exist_ok=True)
+    batch_segments: list[tuple[Path, float, float, str]] = []
 
-    filters = []
-    cur_v = "[0:v]"
-    cur_a = "[0:a]"
-    total_dur = prepared[0][1]
+    for b_idx, start in enumerate(range(0, len(prepared), BATCH_SIZE)):
+        chunk = prepared[start : start + BATCH_SIZE]
+        in_cf_dur = chunk[0][2]
+        in_trans = chunk[0][3]
+        chunk_for_merge = [(chunk[0][0], chunk[0][1], 0.0, "cut")] + chunk[1:]
+        batch_out = batches_dir / f"batch_{b_idx:02d}.mp4"
+        batch_dur = merge_segment_group(
+            chunk_for_merge,
+            batch_out,
+            fps=fps,
+            crf=16,
+            preset="faster",
+            audio_bitrate="320k",
+            loudnorm_cfg=None,
+            faststart=False,
+        )
+        batch_segments.append((batch_out, batch_dur, in_cf_dur, in_trans))
+        print(f"✅ Batch {b_idx + 1} merged ({len(chunk)} scenes, {batch_dur:.2f}s)")
 
-    for idx in range(1, len(prepared)):
-        _, dur_i, cf_dur_i, trans_type = prepared[idx]
-        next_v = f"[v{idx}]"
-        next_a = f"[a{idx}]"
-
-        if cf_dur_i > 0.0 and trans_type != "cut":
-            offset = max(0.0, total_dur - cf_dur_i)
-            filters.append(
-                f"{cur_v}[{idx}:v]xfade=transition={trans_type}:duration={cf_dur_i:.3f}:offset={offset:.3f}{next_v}"
-            )
-            filters.append(
-                f"{cur_a}[{idx}:a]acrossfade=d={cf_dur_i:.3f}:c1=tri:c2=tri{next_a}"
-            )
-            total_dur = total_dur + dur_i - cf_dur_i
-        else:
-            filters.append(f"{cur_v}[{idx}:v]concat=n=2:v=1:a=0{next_v}")
-            filters.append(f"{cur_a}[{idx}:a]concat=n=2:v=0:a=1{next_a}")
-            total_dur += dur_i
-
-        cur_v = next_v
-        cur_a = next_a
-
-    loudnorm = render_cfg.get("loudness_normalization") or {}
-    if loudnorm.get("enabled", True):
-        lufs = float(loudnorm.get("target_lufs", -14.0))
-        tp = float(loudnorm.get("true_peak_db", -1.0))
-        lra = float(loudnorm.get("lra", 7.0))
-        filters.append(f"{cur_a}loudnorm=I={lufs}:TP={tp}:LRA={lra}[afinal]")
-        cur_a = "[afinal]"
-
-    cmd += [
-        "-filter_complex",
-        ";".join(filters),
-        "-map",
-        cur_v,
-        "-map",
-        cur_a,
-        "-r",
-        str(fps),
-        "-vsync",
-        "cfr",
-        "-c:v",
-        "libx264",
-        "-profile:v",
-        "high",
-        "-level",
-        "5.1",
-        "-crf",
-        str(crf),
-        "-preset",
-        preset,
-        "-pix_fmt",
-        "yuv420p",
-        "-movflags",
-        "+faststart",
-        "-c:a",
-        "aac",
-        "-b:a",
-        audio_bitrate,
-        "-ar",
-        "48000",
-        "-ac",
-        "2",
-        str(final_video),
-    ]
-    run_cmd(cmd)
+    total_dur = merge_segment_group(
+        batch_segments,
+        final_video,
+        fps=fps,
+        crf=crf,
+        preset=final_preset,
+        audio_bitrate=audio_bitrate,
+        loudnorm_cfg=loudnorm,
+        faststart=True,
+    )
     print(f"✅ Render complete: {final_video} ({total_dur:.2f}s)")
 
 
