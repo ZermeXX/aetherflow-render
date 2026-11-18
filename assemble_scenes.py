@@ -278,9 +278,9 @@ def prepare_scene(
         "-c:v",
         "libx264",
         "-crf",
-        "15",
+        "14",
         "-preset",
-        "faster",
+        "superfast",
         "-pix_fmt",
         "yuv420p",
         "-c:a",
@@ -316,8 +316,13 @@ def merge_segment_group(
         cmd += ["-i", str(seg_path)]
 
     filters = []
-    cur_v = "[0:v]"
-    cur_a = "[0:a]"
+    # Lock identical timebase (1/24000) and format on every input stream to prevent xfade/concat mismatch
+    for idx in range(len(segments)):
+        filters.append(f"[{idx}:v]fps={fps},settb=1/24000,format=yuv420p,setpts=PTS-STARTPTS[iv{idx}]")
+        filters.append(f"[{idx}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,asetpts=PTS-STARTPTS[ia{idx}]")
+
+    cur_v = "[iv0]"
+    cur_a = "[ia0]"
     total_dur = segments[0][1]
 
     for idx in range(1, len(segments)):
@@ -328,15 +333,15 @@ def merge_segment_group(
         if cf_dur_i > 0.0 and trans_type != "cut":
             offset = max(0.0, total_dur - cf_dur_i)
             filters.append(
-                f"{cur_v}[{idx}:v]xfade=transition={trans_type}:duration={cf_dur_i:.3f}:offset={offset:.3f}{next_v}"
+                f"{cur_v}[iv{idx}]xfade=transition={trans_type}:duration={cf_dur_i:.3f}:offset={offset:.3f},settb=1/24000{next_v}"
             )
             filters.append(
-                f"{cur_a}[{idx}:a]acrossfade=d={cf_dur_i:.3f}:c1=tri:c2=tri{next_a}"
+                f"{cur_a}[ia{idx}]acrossfade=d={cf_dur_i:.3f}:c1=tri:c2=tri{next_a}"
             )
             total_dur = total_dur + dur_i - cf_dur_i
         else:
-            filters.append(f"{cur_v}[{idx}:v]concat=n=2:v=1:a=0{next_v}")
-            filters.append(f"{cur_a}[{idx}:a]concat=n=2:v=0:a=1{next_a}")
+            filters.append(f"{cur_v}[iv{idx}]concat=n=2:v=1:a=0,settb=1/24000{next_v}")
+            filters.append(f"{cur_a}[ia{idx}]concat=n=2:v=0:a=1{next_a}")
             total_dur += dur_i
 
         cur_v = next_v
@@ -349,10 +354,9 @@ def merge_segment_group(
         filters.append(f"{cur_a}loudnorm=I={lufs}:TP={tp}:LRA={lra}[afinal]")
         cur_a = "[afinal]"
 
-    if filters:
-        cmd += ["-filter_complex", ";".join(filters)]
-
     cmd += [
+        "-filter_complex",
+        ";".join(filters),
         "-map",
         cur_v,
         "-map",
@@ -462,8 +466,8 @@ def main() -> None:
             chunk_for_merge,
             batch_out,
             fps=fps,
-            crf=16,
-            preset="faster",
+            crf=15,
+            preset="superfast",
             audio_bitrate="320k",
             loudnorm_cfg=None,
             faststart=False,
