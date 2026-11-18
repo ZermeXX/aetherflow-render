@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 BATCH_SIZE = 6
-BREATH_PAUSE_SEC = 0.40  # Естественная пауза диктора между фразами (сек)
+BREATH_PAUSE_SEC = 0.35  # Пауза дыхания после фразы (сек)
 
 VALID_XFADE_TRANSITIONS = {
     "fade", "wipeleft", "wiperight", "wipeup", "wipedown",
@@ -151,8 +151,7 @@ def prepare_scene(
     height: int,
     fps: int,
     folder_id: str | None,
-    next_xfade_overlap: float,
-) -> tuple[Path, float, float]:
+) -> tuple[Path, float, float, float]:
     assets = scene.get("assets") or {}
     video_name = (
         scene.get("file_name")
@@ -174,6 +173,10 @@ def prepare_scene(
     if trans_type == "cut" or cf_dur <= 0.0:
         cf_dur = 0.0
 
+    # Задержка старта голоса на время входного перехода (чтобы речь начиналась ровно после проявления нового кадра)
+    lead_in_ms = int(round(cf_dur * 1000)) if (idx > 0 and cf_dur > 0.0) else 0
+    lead_in_sec = lead_in_ms / 1000.0
+
     work_dir = Path("build/scenes")
     work_dir.mkdir(parents=True, exist_ok=True)
 
@@ -184,50 +187,66 @@ def prepare_scene(
     src_voice = resolve_asset(voice_name, work_dir, folder_id) if voice_name else None
     is_image = src_video.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}
 
-    # 1. AUDIO-FIRST: определяем точную длительность сцены по реальному файлу озвучки
     manifest_dur = float(scene.get("duration_sec") or scene.get("duration") or 8.0)
     real_voice_dur = get_media_duration(src_voice) if (src_voice and src_voice.is_file()) else 0.0
 
     if real_voice_dur > 0.0:
-        # Речь диктора + пауза дыхания + компенсация нахлёста следующего визуального xfade
-        target_dur = round(real_voice_dur + BREATH_PAUSE_SEC + next_xfade_overlap, 3)
+        target_dur = round(lead_in_sec + real_voice_dur + BREATH_PAUSE_SEC, 3)
     else:
-        target_dur = round(manifest_dur + next_xfade_overlap, 3)
+        target_dur = round(max(manifest_dur, lead_in_sec + 1.0), 3)
 
     real_video_dur = target_dur if is_image else get_media_duration(src_video)
     if real_video_dur <= 0.05:
         real_video_dur = target_dur
 
     print(
-        f"🎬 Сцена #{idx + 1:02d}: голос={real_voice_dur:.2f}s | исходное видео={real_video_dur:.2f}s "
-        f"| итоговая длина сцены={target_dur:.2f}s (запас под xfade={next_xfade_overlap:.2f}s)"
+        f"🎬 Сцена #{idx + 1:02d}: вход_xfade={lead_in_sec:.2f}s | голос={real_voice_dur:.2f}s "
+        f"| исходное_видео={real_video_dur:.2f}s | итог={target_dur:.2f}s"
     )
 
     out_path = work_dir / f"norm_{idx + 1:03d}.mp4"
 
-    # 2. ELASTIC VIDEO RETIMING: плавно подгоняем видеоклип под точную длину озвучки
     cmd = ["ffmpeg", "-y"]
     if is_image:
         cmd += ["-loop", "1", "-t", f"{target_dur:.3f}", "-i", str(src_video)]
-        pts_expr = "PTS-STARTPTS"
+        v_filters = [
+            "setpts=PTS-STARTPTS",
+            f"scale={width}:{height}:force_original_aspect_ratio=decrease",
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black",
+            f"fps={fps}",
+            "setsar=1",
+            "format=yuv420p",
+        ]
     else:
-        # Если видео более чем в 1.75 раза короче озвучки — зацикливаем поток, иначе плавно растягиваем setpts
-        if target_dur > real_video_dur * 1.75:
-            cmd += ["-stream_loop", "-1", "-i", str(src_video)]
-            pts_expr = "PTS-STARTPTS"
-        else:
+        cmd += ["-i", str(src_video)]
+        # Плавно растягиваем клип до 2.2x без стоп-кадров (10с видео -> до 22с речи абсолютно плавно)
+        max_stretch = 2.20
+        if target_dur <= real_video_dur * max_stretch:
             speed_factor = target_dur / real_video_dur
-            cmd += ["-i", str(src_video)]
-            pts_expr = f"{speed_factor:.6f}*(PTS-STARTPTS)"
-
-    v_filters = [
-        f"setpts={pts_expr}",
-        f"scale={width}:{height}:force_original_aspect_ratio=decrease",
-        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black",
-        f"fps={fps}",
-        "setsar=1",
-        "format=yuv420p",
-    ]
+            v_filters = [
+                f"setpts={speed_factor:.6f}*(PTS-STARTPTS)",
+                f"scale={width}:{height}:force_original_aspect_ratio=decrease",
+                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black",
+                f"fps={fps}",
+                "setsar=1",
+                "format=yuv420p",
+                f"trim=0:{target_dur:.3f}",
+                "setpts=PTS-STARTPTS",
+            ]
+        else:
+            stretched_dur = real_video_dur * max_stretch
+            hold_dur = max(0.0, target_dur - stretched_dur + 0.25)
+            v_filters = [
+                f"setpts={max_stretch:.6f}*(PTS-STARTPTS)",
+                f"scale={width}:{height}:force_original_aspect_ratio=decrease",
+                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black",
+                f"fps={fps}",
+                "setsar=1",
+                "format=yuv420p",
+                f"tpad=stop_mode=clone:stop_duration={hold_dur:.3f}",
+                f"trim=0:{target_dur:.3f}",
+                "setpts=PTS-STARTPTS",
+            ]
 
     if idx == 0 and cf_dur > 0.0 and trans_type in {"fade", "fadeblack"}:
         v_filters.append(f"fade=t=in:st=0:d={cf_dur:.3f}")
@@ -245,13 +264,14 @@ def prepare_scene(
     voice_gain = float(scene.get("voiceover_gain_db", 0.0))
     video_has_audio = (not is_image) and has_audio_stream(src_video)
 
-    # 3. CLEAN AUDIO WITHOUT OVERLAP: речь идёт целиком, остаток дополняется тишиной (apad)
     fade_out_st = max(0.0, target_dur - 0.02)
+    delay_filter = f"adelay={lead_in_ms}|{lead_in_ms}," if lead_in_ms > 0 else ""
+
     if src_voice and src_voice.is_file() and real_voice_dur > 0.0:
         cmd += ["-i", str(src_voice)]
         filter_parts.append(
             f"[1:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
-            f"volume={voice_gain}dB,apad,atrim=0:{target_dur:.3f},"
+            f"volume={voice_gain}dB,{delay_filter}apad,atrim=0:{target_dur:.3f},"
             f"afade=t=in:st=0:d=0.015,afade=t=out:st={fade_out_st:.3f}:d=0.020,asetpts=PTS-STARTPTS[avo]"
         )
         if video_has_audio and not mute_ambient and ambient_gain > -90.0:
@@ -290,7 +310,7 @@ def prepare_scene(
         str(out_path),
     ]
     run_cmd(cmd)
-    return out_path, target_dur, cf_dur
+    return out_path, target_dur, cf_dur, lead_in_sec
 
 
 def merge_segment_group(
@@ -324,8 +344,6 @@ def merge_segment_group(
         next_a = f"[a{idx}]"
 
         if cf_dur_i > 0.0 and trans_type != "cut":
-            # Визуальный переход xfade перекрывает заложенный в конец предыдущей сцены буфер тишины,
-            # а аудио стыкуется строго последовательно (concat) без наезда голосов друг на друга!
             offset = max(0.0, total_dur - cf_dur_i)
             trim_prev_a = max(0.05, total_dur - cf_dur_i)
             filters.append(
@@ -426,27 +444,36 @@ def main() -> None:
         or manifest.get("folder_id")
     )
 
-    # Заранее вычисляем для каждой сцены длительность визуального перехода следующей сцены,
-    # чтобы заложить этот буфер в хвост сцены без потери ни миллисекунды речи
-    next_overlaps: list[float] = []
-    for i in range(len(scenes)):
-        if i + 1 < len(scenes):
-            nxt = scenes[i + 1]
-            t_type = str(nxt.get("transition") or "cut").strip().lower()
-            t_dur = float(nxt.get("transition_duration") or 0.0)
-            next_overlaps.append(t_dur if (t_type != "cut" and t_dur > 0.0) else 0.0)
-        else:
-            next_overlaps.append(0.0)
-
     prepared: list[tuple[Path, float, float, str]] = []
+    actual_timings: list[dict] = []
+    cursor_t = 0.0
+
     for idx, scene in enumerate(scenes):
-        sc_path, dur, cf_dur = prepare_scene(
-            scene, idx, width, height, fps, folder_id, next_overlaps[idx]
+        sc_path, dur, cf_dur, lead_in_sec = prepare_scene(
+            scene, idx, width, height, fps, folder_id
         )
         trans_type = str(scene.get("transition") or "cut").strip().lower()
         if trans_type not in VALID_XFADE_TRANSITIONS and trans_type != "cut":
             trans_type = "fade"
         prepared.append((sc_path, dur, cf_dur, trans_type))
+
+        overlap = cf_dur if (idx > 0 and trans_type != "cut" and cf_dur > 0.0) else 0.0
+        scene_start = max(0.0, cursor_t - overlap)
+        voice_start = scene_start + lead_in_sec
+        scene_end = scene_start + dur
+        actual_timings.append({
+            "scene_index": idx + 1,
+            "scene_start": round(scene_start, 3),
+            "voice_start": round(voice_start, 3),
+            "scene_end": round(scene_end, 3),
+            "duration": round(scene_end - scene_start, 3),
+        })
+        cursor_t = scene_end
+
+    Path("build").mkdir(parents=True, exist_ok=True)
+    Path("build/actual_timings.json").write_text(
+        json.dumps(actual_timings, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
 
     project_name = manifest.get("project_name", "output")
     out_dir = Path("output")
