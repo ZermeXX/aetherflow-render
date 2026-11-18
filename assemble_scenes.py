@@ -89,6 +89,52 @@ def resolve_asset(filename: str | None, work_dir: Path, folder_id: str | None) -
     return None
 
 
+def parse_enabled_overlays(manifest: dict) -> set[str]:
+    """Извлекает активные оверлеи из manifest.overlays или studio_ui_presets."""
+    ui_montage = (manifest.get("studio_ui_presets") or {}).get("tab_1_montage") or {}
+    raw_overlays = manifest.get("overlays")
+    if raw_overlays is None:
+        raw_overlays = ui_montage.get("overlays") or []
+
+    enabled: set[str] = set()
+
+    def register_key(raw_key: str) -> None:
+        k = raw_key.strip().lower()
+        if any(w in k for w in ("grain", "35mm", "film", "vignette", "зерн", "пленк", "плёнк")):
+            enabled.add("film_grain")
+        if any(w in k for w in ("glow", "halation", "bloom", "warm", "свечен")):
+            enabled.add("warm_glow")
+        if any(w in k for w in ("particle", "snow", "spark", "dust", "частиц", "искр", "снег")):
+            enabled.add("particles")
+        if any(w in k for w in ("lower", "third", "date", "location", "титр", "дат", "локац")):
+            enabled.add("lower_thirds")
+
+    if isinstance(raw_overlays, dict):
+        for k, v in raw_overlays.items():
+            if bool(v):
+                register_key(str(k))
+    elif isinstance(raw_overlays, list):
+        for item in raw_overlays:
+            if isinstance(item, str):
+                register_key(item)
+            elif isinstance(item, dict):
+                if item.get("enabled", True):
+                    ident = item.get("id") or item.get("type") or item.get("name") or ""
+                    register_key(str(ident))
+
+    return enabled
+
+
+def escape_drawtext(text: str) -> str:
+    return (
+        text.replace("\\", "\\\\")
+        .replace(":", "\\:")
+        .replace("'", "\u2019")
+        .replace("%", "\\%")
+        .replace(",", "\\,")
+    )
+
+
 def get_normalized_scenes(manifest: dict) -> list[dict]:
     raw_scenes = (
         manifest.get("timeline")
@@ -151,6 +197,7 @@ def prepare_scene(
     height: int,
     fps: int,
     folder_id: str | None,
+    overlays: set[str],
 ) -> tuple[Path, float, float, float]:
     assets = scene.get("assets") or {}
     video_name = (
@@ -173,7 +220,6 @@ def prepare_scene(
     if trans_type == "cut" or cf_dur <= 0.0:
         cf_dur = 0.0
 
-    # Привязываем длительность перехода к точному числу кадров (fps)
     cf_frames = int(round(cf_dur * fps)) if (idx > 0 and cf_dur > 0.0) else 0
     cf_dur = cf_frames / float(fps)
     lead_in_ms = int(round(cf_dur * 1000))
@@ -196,7 +242,6 @@ def prepare_scene(
     else:
         raw_target_dur = max(manifest_dur, cf_dur + 1.0)
 
-    # Жёстко квантуем длину сцены по сетке кадров (исключает дрейф между аудио и видео)
     exact_frames = max(fps, int(round(raw_target_dur * fps)))
     target_dur = exact_frames / float(fps)
 
@@ -207,7 +252,7 @@ def prepare_scene(
     out_path = work_dir / f"norm_{idx + 1:03d}.mkv"
 
     cmd = ["ffmpeg", "-y"]
-    speed_factor = 1.0  # >1.0 означает замедление видео
+    speed_factor = 1.0
 
     if is_image:
         cmd += ["-loop", "1", "-t", f"{target_dur:.6f}", "-i", str(src_video)]
@@ -221,8 +266,6 @@ def prepare_scene(
         ]
     else:
         cmd += ["-i", str(src_video)]
-        # Если видео отстаёт от голоса не более чем на 2.5 сек (напр. 10с клип vs 12с речь),
-        # оставляем естественную скорость 1.0x (чтобы анимации/кнопки не замедлялись) + мягкий стоп-кадр в конце.
         if real_video_dur <= target_dur <= real_video_dur + 2.5:
             speed_factor = 1.0
             hold_dur = max(0.0, target_dur - real_video_dur + 0.25)
@@ -265,6 +308,83 @@ def prepare_scene(
                 "setpts=PTS-STARTPTS",
             ]
 
+    # --- КИНЕМАТОГРАФИЧНЫЕ ОВЕРЛЕИ (manifest.overlays) ---
+    # 1. Warm Glow (тёплая анаморфная цветокоррекция и мягкий ореол свечения)
+    if "warm_glow" in overlays:
+        v_filters.append(
+            "eq=gamma=1.03:contrast=1.03:saturation=1.10,"
+            "colorbalance=rs=0.045:gs=0.015:bs=-0.035:rm=0.03:gm=0.01:bm=-0.02"
+        )
+
+    # 2. Зерно 35mm плёнки и виньетка (Cinematic Film Grain)
+    if "film_grain" in overlays:
+        v_filters.append("noise=alls=7:allf=t+u,vignette=PI/5")
+
+    # 3. Исторические титры дат и локаций (Lower Thirds)
+    lt_obj = scene.get("lower_third") if isinstance(scene.get("lower_third"), dict) else {}
+    hist_date = str(
+        scene.get("historical_date")
+        or scene.get("date")
+        or scene.get("year")
+        or lt_obj.get("date")
+        or lt_obj.get("title")
+        or ""
+    ).strip()
+    hist_loc = str(
+        scene.get("historical_location")
+        or scene.get("location")
+        or lt_obj.get("location")
+        or lt_obj.get("subtitle")
+        or ""
+    ).strip()
+
+    if "lower_thirds" in overlays and (hist_date or hist_loc):
+        lt_start = round(cf_dur + 0.35, 3)
+        lt_end = round(max(lt_start + 2.5, min(target_dur - 0.35, lt_start + 5.5)), 3)
+        if lt_end > lt_start + 0.8:
+            font_bold = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+            font_reg = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+            scale_k = width / 3840.0
+            box_x = int(round(140 * scale_k))
+            bar_w = max(4, int(round(10 * scale_k)))
+            text_x = box_x + int(round(36 * scale_k))
+            date_y = height - int(round(270 * scale_k))
+            loc_y = height - int(round(205 * scale_k))
+            box_y = date_y - int(round(24 * scale_k))
+            box_h = int(round(135 * scale_k)) if (hist_date and hist_loc) else int(round(82 * scale_k))
+
+            alpha_expr = (
+                f"if(lt(t-{lt_start:.3f}\\,0.35)\\,(t-{lt_start:.3f})/0.35\\,"
+                f"if(gt(t\\,{lt_end:.3f}-0.35)\\,({lt_end:.3f}-t)/0.35\\,1))"
+            )
+            enable_expr = f"between(t,{lt_start:.3f},{lt_end:.3f})"
+
+            # Полупрозрачная тёмная подложка и янтарный документальный акцент слева
+            v_filters.append(
+                f"drawbox=x={box_x}:y={box_y}:w={int(round(1150 * scale_k))}:h={box_h}:"
+                f"color=black@0.68:t=fill:enable='{enable_expr}'"
+            )
+            v_filters.append(
+                f"drawbox=x={box_x}:y={box_y}:w={bar_w}:h={box_h}:"
+                f"color=0xf59e0b@0.95:t=fill:enable='{enable_expr}'"
+            )
+
+            if hist_date:
+                safe_date = escape_drawtext(hist_date.upper())
+                v_filters.append(
+                    f"drawtext=fontfile={font_bold}:text='{safe_date}':"
+                    f"fontcolor=white:fontsize={max(18, int(round(44 * scale_k)))}:"
+                    f"x={text_x}:y={date_y}:alpha='{alpha_expr}':enable='{enable_expr}'"
+                )
+            if hist_loc:
+                safe_loc = escape_drawtext(hist_loc)
+                y_pos = loc_y if hist_date else date_y
+                v_filters.append(
+                    f"drawtext=fontfile={font_reg}:text='{safe_loc}':"
+                    f"fontcolor=0xe5e7eb:fontsize={max(16, int(round(34 * scale_k)))}:"
+                    f"x={text_x}:y={y_pos}:alpha='{alpha_expr}':enable='{enable_expr}'"
+                )
+
     if idx == 0 and cf_dur > 0.0 and trans_type in {"fade", "fadeblack"}:
         v_filters.append(f"fade=t=in:st=0:d={cf_dur:.6f}")
         cf_dur = 0.0
@@ -275,11 +395,21 @@ def prepare_scene(
         fade_start = max(0.0, target_dur - out_trans_dur)
         v_filters.append(f"fade=t=out:st={fade_start:.6f}:d={out_trans_dur:.6f}")
 
-    filter_parts = [f"[0:v]{','.join(v_filters)}[vout]"]
+    # 4. Частицы / Снег / Искры (Ambient Particles — лёгкий процедурный слой пылинок поверх кадра)
+    if "particles" in overlays:
+        filter_parts = [
+            f"[0:v]{','.join(v_filters)}[vbase]",
+            f"color=c=black:s=480x270:r={fps}:d={target_dur:.6f},"
+            f"noise=alls=45:allf=t,"
+            f"lutyuv=y='if(gt(val,244),255,0)':u=128:v=128,"
+            f"boxblur=1:1,"
+            f"scale={width}:{height}:flags=bilinear[vpart]",
+            "[vbase][vpart]blend=all_mode=screen:all_opacity=0.22[vout]",
+        ]
+    else:
+        filter_parts = [f"[0:v]{','.join(v_filters)}[vout]"]
 
     has_voice = bool(src_voice and src_voice.is_file() and real_voice_dur > 0.0)
-    # Если в сцене есть голос диктора, встроенный звук клипа по умолчанию глушим,
-    # если только в манифесте явно не указано mute_audio: false
     mute_ambient = bool(scene.get("mute_audio", True if has_voice else False))
     ambient_gain = float(scene.get("ambient_gain_db", -18.0))
     voice_gain = float(scene.get("voiceover_gain_db", 0.0))
@@ -287,13 +417,13 @@ def prepare_scene(
 
     print(
         f"🎬 Сцена #{idx + 1:02d}: xfade={cf_dur:.2f}s | голос={real_voice_dur:.2f}s "
-        f"| видео={real_video_dur:.2f}s (x{speed_factor:.2f}) | итог={target_dur:.3f}s ({exact_frames} кадров)"
+        f"| видео={real_video_dur:.2f}s (x{speed_factor:.2f}) | итог={target_dur:.3f}s"
+        + (f" | титр: {hist_date} • {hist_loc}" if ("lower_thirds" in overlays and (hist_date or hist_loc)) else "")
     )
 
     fade_out_st = max(0.0, target_dur - 0.02)
     delay_filter = f"adelay={lead_in_ms}|{lead_in_ms}," if lead_in_ms > 0 else ""
 
-    # Встроенный звук клипа [0:a] синхронизируется по скорости (atempo) и задержке (adelay) с картинкой [0:v]
     amb_tempo = 1.0 / speed_factor
     amb_tempo_filter = f"atempo={amb_tempo:.6f}," if abs(amb_tempo - 1.0) > 0.002 else ""
 
@@ -467,6 +597,9 @@ def main() -> None:
     if not scenes:
         raise ValueError("В манифесте не найден список сцен!")
 
+    overlays = parse_enabled_overlays(manifest)
+    print(f"✨ Активные оверлеи: {sorted(overlays) if overlays else 'нет'}")
+
     render_cfg = manifest.get("render_settings") or {}
     res_str = str(render_cfg.get("resolution", "3840x2160")).split()[0]
     width, height = (int(x) for x in res_str.lower().split("x"))
@@ -486,7 +619,7 @@ def main() -> None:
 
     for idx, scene in enumerate(scenes):
         sc_path, dur, cf_dur, lead_in_sec = prepare_scene(
-            scene, idx, width, height, fps, folder_id
+            scene, idx, width, height, fps, folder_id, overlays
         )
         trans_type = str(scene.get("transition") or "cut").strip().lower()
         if trans_type not in VALID_XFADE_TRANSITIONS and trans_type != "cut":
