@@ -89,14 +89,19 @@ def resolve_asset(filename: str | None, work_dir: Path, folder_id: str | None) -
     return None
 
 
-def parse_enabled_overlays(manifest: dict) -> set[str]:
-    """Извлекает активные оверлеи из manifest.overlays или studio_ui_presets."""
+def parse_overlay_config(manifest: dict) -> tuple[set[str], str]:
+    """Возвращает (набор активных оверлеев, выбранный стиль плашки lower_thirds)."""
     ui_montage = (manifest.get("studio_ui_presets") or {}).get("tab_1_montage") or {}
     raw_overlays = manifest.get("overlays")
     if raw_overlays is None:
         raw_overlays = ui_montage.get("overlays") or []
 
     enabled: set[str] = set()
+    raw_style = str(
+        manifest.get("lower_third_style")
+        or ui_montage.get("lower_third_style")
+        or "rossiya24"
+    ).strip().lower()
 
     def register_key(raw_key: str) -> None:
         k = raw_key.strip().lower()
@@ -121,8 +126,17 @@ def parse_enabled_overlays(manifest: dict) -> set[str]:
                 if item.get("enabled", True):
                     ident = item.get("id") or item.get("type") or item.get("name") or ""
                     register_key(str(ident))
+                    if item.get("style"):
+                        raw_style = str(item["style"]).strip().lower()
 
-    return enabled
+    if "ictv" in raw_style or "факт" in raw_style:
+        lt_style = "ictv"
+    elif "sky" in raw_style:
+        lt_style = "sky_news"
+    else:
+        lt_style = "rossiya24"
+
+    return enabled, lt_style
 
 
 def escape_drawtext(text: str) -> str:
@@ -133,6 +147,181 @@ def escape_drawtext(text: str) -> str:
         .replace("%", "\\%")
         .replace(",", "\\,")
     )
+
+
+def build_lower_third_filters(
+    hist_date: str,
+    hist_loc: str,
+    style: str,
+    width: int,
+    height: int,
+    lt_start: float,
+    lt_end: float,
+) -> list[str]:
+    """Строит фильтры FFmpeg для новостных плашек: rossiya24, ictv, sky_news."""
+    font_bold = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+    font_reg = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+    scale_k = width / 3840.0
+    max_bar_w = width - int(round(280 * scale_k))
+
+    alpha_expr = (
+        f"if(lt(t-{lt_start:.3f}\\,0.35)\\,(t-{lt_start:.3f})/0.35\\,"
+        f"if(gt(t\\,{lt_end:.3f}-0.35)\\,({lt_end:.3f}-t)/0.35\\,1))"
+    )
+    enable_expr = f"between(t,{lt_start:.3f},{lt_end:.3f})"
+
+    date_up = hist_date.upper()
+    loc_up = hist_loc.upper()
+    filters: list[str] = []
+
+    if style == "ictv":
+        # Стиль #17 Факти ICTV: оранжевый верхний тег даты + тёмно-синяя металлическая основная плашка локации
+        box_x = int(round(140 * scale_k))
+        main_y = height - int(round(250 * scale_k))
+        main_h = int(round(104 * scale_k))
+        accent_w = max(6, int(round(16 * scale_k)))
+        text_x = box_x + accent_w + int(round(32 * scale_k))
+
+        main_text = loc_up if loc_up else date_up
+        main_w = min(max_bar_w, max(int(round(620 * scale_k)), int(round((len(main_text) * 26 + 110) * scale_k))))
+
+        if date_up and loc_up:
+            tag_h = int(round(52 * scale_k))
+            tag_y = main_y - tag_h
+            tag_w = min(main_w, max(int(round(260 * scale_k)), int(round((len(date_up) * 21 + 64) * scale_k))))
+            # Тёплый оранжевый тег даты сверху
+            filters.append(
+                f"drawbox=x={box_x}:y={tag_y}:w={tag_w}:h={tag_h}:color=0xd97706@0.96:t=fill:enable='{enable_expr}'"
+            )
+            filters.append(
+                f"drawtext=fontfile={font_bold}:text='{escape_drawtext(date_up)}':"
+                f"fontcolor=white:fontsize={max(16, int(round(30 * scale_k)))}:"
+                f"x={box_x + int(round(28 * scale_k))}:y={tag_y + int(round(11 * scale_k))}:"
+                f"alpha='{alpha_expr}':enable='{enable_expr}'"
+            )
+
+        # Тёмно-синяя плашка + янтарно-оранжевая левая полоса
+        filters.append(
+            f"drawbox=x={box_x}:y={main_y}:w={main_w}:h={main_h}:color=0x0f172a@0.90:t=fill:enable='{enable_expr}'"
+        )
+        filters.append(
+            f"drawbox=x={box_x}:y={main_y}:w={accent_w}:h={main_h}:color=0xf59e0b@0.98:t=fill:enable='{enable_expr}'"
+        )
+        filters.append(
+            f"drawtext=fontfile={font_bold}:text='{escape_drawtext(main_text)}':"
+            f"fontcolor=white:fontsize={max(20, int(round(44 * scale_k)))}:"
+            f"x={text_x}:y={main_y + int(round(30 * scale_k))}:"
+            f"alpha='{alpha_expr}':enable='{enable_expr}'"
+        )
+
+    elif style == "sky_news":
+        # Стиль #4 Sky News UK: матовая стеклянная графитовая лента + яркий красный квадратный акцент слева
+        box_x = int(round(140 * scale_k))
+        box_y = height - int(round(265 * scale_k))
+        box_h = int(round(122 * scale_k))
+        red_w = int(round(112 * scale_k))
+        text_x = box_x + red_w + int(round(34 * scale_k))
+
+        top_line = date_up if date_up else loc_up
+        sub_line = hist_loc if (date_up and hist_loc) else ""
+        longest = max(len(top_line) * 25, len(sub_line) * 19)
+        total_w = min(max_bar_w, max(int(round(680 * scale_k)), red_w + int(round((longest + 90) * scale_k))))
+
+        # Стеклянная графитовая основа
+        filters.append(
+            f"drawbox=x={box_x}:y={box_y}:w={total_w}:h={box_h}:color=0x1e293b@0.82:t=fill:enable='{enable_expr}'"
+        )
+        # Ярко-красный акцентный блок слева
+        filters.append(
+            f"drawbox=x={box_x}:y={box_y}:w={red_w}:h={box_h}:color=0xe11d48@0.95:t=fill:enable='{enable_expr}'"
+        )
+        # Тонкая светлая верхняя кромка стекла
+        filters.append(
+            f"drawbox=x={box_x + red_w}:y={box_y}:w={total_w - red_w}:h={max(2, int(round(4 * scale_k)))}:"
+            f"color=white@0.35:t=fill:enable='{enable_expr}'"
+        )
+
+        if sub_line:
+            filters.append(
+                f"drawtext=fontfile={font_bold}:text='{escape_drawtext(top_line)}':"
+                f"fontcolor=white:fontsize={max(18, int(round(42 * scale_k)))}:"
+                f"x={text_x}:y={box_y + int(round(22 * scale_k))}:"
+                f"alpha='{alpha_expr}':enable='{enable_expr}'"
+            )
+            filters.append(
+                f"drawtext=fontfile={font_reg}:text='{escape_drawtext(sub_line)}':"
+                f"fontcolor=0xe2e8f0:fontsize={max(15, int(round(32 * scale_k)))}:"
+                f"x={text_x}:y={box_y + int(round(72 * scale_k))}:"
+                f"alpha='{alpha_expr}':enable='{enable_expr}'"
+            )
+        else:
+            filters.append(
+                f"drawtext=fontfile={font_bold}:text='{escape_drawtext(top_line)}':"
+                f"fontcolor=white:fontsize={max(20, int(round(44 * scale_k)))}:"
+                f"x={text_x}:y={box_y + int(round(38 * scale_k))}:"
+                f"alpha='{alpha_expr}':enable='{enable_expr}'"
+            )
+
+    else:
+        # Стиль #7 Россия 24 (по умолчанию): красный прямоугольный тег даты слева + синий основной блок локации справа
+        box_x = int(round(140 * scale_k))
+        box_y = height - int(round(255 * scale_k))
+        box_h = int(round(108 * scale_k))
+        stripe_h = max(4, int(round(8 * scale_k)))
+
+        if date_up and loc_up:
+            red_w = max(int(round(260 * scale_k)), int(round((len(date_up) * 25 + 68) * scale_k)))
+            blue_w = max(int(round(520 * scale_k)), int(round((len(loc_up) * 26 + 84) * scale_k)))
+            if red_w + blue_w > max_bar_w:
+                blue_w = max(int(round(360 * scale_k)), max_bar_w - red_w)
+
+            # Красный блок даты слева
+            filters.append(
+                f"drawbox=x={box_x}:y={box_y}:w={red_w}:h={box_h}:color=0xdc2626@0.95:t=fill:enable='{enable_expr}'"
+            )
+            # Синий основной блок локации справа
+            filters.append(
+                f"drawbox=x={box_x + red_w}:y={box_y}:w={blue_w}:h={box_h}:color=0x1e3a8a@0.92:t=fill:enable='{enable_expr}'"
+            )
+            # Ярко-синяя нижняя полоса акцента
+            filters.append(
+                f"drawbox=x={box_x + red_w}:y={box_y + box_h - stripe_h}:w={blue_w}:h={stripe_h}:"
+                f"color=0x3b82f6@0.95:t=fill:enable='{enable_expr}'"
+            )
+            filters.append(
+                f"drawtext=fontfile={font_bold}:text='{escape_drawtext(date_up)}':"
+                f"fontcolor=white:fontsize={max(18, int(round(40 * scale_k)))}:"
+                f"x={box_x + int(round(32 * scale_k))}:y={box_y + int(round(34 * scale_k))}:"
+                f"alpha='{alpha_expr}':enable='{enable_expr}'"
+            )
+            filters.append(
+                f"drawtext=fontfile={font_bold}:text='{escape_drawtext(loc_up)}':"
+                f"fontcolor=white:fontsize={max(18, int(round(42 * scale_k)))}:"
+                f"x={box_x + red_w + int(round(36 * scale_k))}:y={box_y + int(round(33 * scale_k))}:"
+                f"alpha='{alpha_expr}':enable='{enable_expr}'"
+            )
+        else:
+            single_text = date_up if date_up else loc_up
+            red_w = max(8, int(round(22 * scale_k)))
+            blue_w = min(max_bar_w - red_w, max(int(round(520 * scale_k)), int(round((len(single_text) * 26 + 84) * scale_k))))
+            filters.append(
+                f"drawbox=x={box_x}:y={box_y}:w={red_w}:h={box_h}:color=0xdc2626@0.95:t=fill:enable='{enable_expr}'"
+            )
+            filters.append(
+                f"drawbox=x={box_x + red_w}:y={box_y}:w={blue_w}:h={box_h}:color=0x1e3a8a@0.92:t=fill:enable='{enable_expr}'"
+            )
+            filters.append(
+                f"drawbox=x={box_x + red_w}:y={box_y + box_h - stripe_h}:w={blue_w}:h={stripe_h}:"
+                f"color=0x3b82f6@0.95:t=fill:enable='{enable_expr}'"
+            )
+            filters.append(
+                f"drawtext=fontfile={font_bold}:text='{escape_drawtext(single_text)}':"
+                f"fontcolor=white:fontsize={max(18, int(round(42 * scale_k)))}:"
+                f"x={box_x + red_w + int(round(34 * scale_k))}:y={box_y + int(round(33 * scale_k))}:"
+                f"alpha='{alpha_expr}':enable='{enable_expr}'"
+            )
+
+    return filters
 
 
 def get_normalized_scenes(manifest: dict) -> list[dict]:
@@ -198,6 +387,7 @@ def prepare_scene(
     fps: int,
     folder_id: str | None,
     overlays: set[str],
+    lt_style: str,
 ) -> tuple[Path, float, float, float]:
     assets = scene.get("assets") or {}
     video_name = (
@@ -308,19 +498,16 @@ def prepare_scene(
                 "setpts=PTS-STARTPTS",
             ]
 
-    # --- КИНЕМАТОГРАФИЧНЫЕ ОВЕРЛЕИ (manifest.overlays) ---
-    # 1. Warm Glow (тёплая анаморфная цветокоррекция и мягкий ореол свечения)
+    # --- КИНЕМАТОГРАФИЧНЫЕ ОВЕРЛЕИ ---
     if "warm_glow" in overlays:
         v_filters.append(
             "eq=gamma=1.03:contrast=1.03:saturation=1.10,"
             "colorbalance=rs=0.045:gs=0.015:bs=-0.035:rm=0.03:gm=0.01:bm=-0.02"
         )
 
-    # 2. Зерно 35mm плёнки и виньетка (Cinematic Film Grain)
     if "film_grain" in overlays:
         v_filters.append("noise=alls=7:allf=t+u,vignette=PI/5")
 
-    # 3. Исторические титры дат и локаций (Lower Thirds)
     lt_obj = scene.get("lower_third") if isinstance(scene.get("lower_third"), dict) else {}
     hist_date = str(
         scene.get("historical_date")
@@ -337,53 +524,21 @@ def prepare_scene(
         or lt_obj.get("subtitle")
         or ""
     ).strip()
+    scene_lt_style = str(scene.get("lower_third_style") or lt_obj.get("style") or lt_style).strip().lower()
+    if "ictv" in scene_lt_style or "факт" in scene_lt_style:
+        scene_lt_style = "ictv"
+    elif "sky" in scene_lt_style:
+        scene_lt_style = "sky_news"
+    else:
+        scene_lt_style = "rossiya24"
 
     if "lower_thirds" in overlays and (hist_date or hist_loc):
         lt_start = round(cf_dur + 0.35, 3)
         lt_end = round(max(lt_start + 2.5, min(target_dur - 0.35, lt_start + 5.5)), 3)
         if lt_end > lt_start + 0.8:
-            font_bold = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-            font_reg = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-            scale_k = width / 3840.0
-            box_x = int(round(140 * scale_k))
-            bar_w = max(4, int(round(10 * scale_k)))
-            text_x = box_x + int(round(36 * scale_k))
-            date_y = height - int(round(270 * scale_k))
-            loc_y = height - int(round(205 * scale_k))
-            box_y = date_y - int(round(24 * scale_k))
-            box_h = int(round(135 * scale_k)) if (hist_date and hist_loc) else int(round(82 * scale_k))
-
-            alpha_expr = (
-                f"if(lt(t-{lt_start:.3f}\\,0.35)\\,(t-{lt_start:.3f})/0.35\\,"
-                f"if(gt(t\\,{lt_end:.3f}-0.35)\\,({lt_end:.3f}-t)/0.35\\,1))"
+            v_filters.extend(
+                build_lower_third_filters(hist_date, hist_loc, scene_lt_style, width, height, lt_start, lt_end)
             )
-            enable_expr = f"between(t,{lt_start:.3f},{lt_end:.3f})"
-
-            # Полупрозрачная тёмная подложка и янтарный документальный акцент слева
-            v_filters.append(
-                f"drawbox=x={box_x}:y={box_y}:w={int(round(1150 * scale_k))}:h={box_h}:"
-                f"color=black@0.68:t=fill:enable='{enable_expr}'"
-            )
-            v_filters.append(
-                f"drawbox=x={box_x}:y={box_y}:w={bar_w}:h={box_h}:"
-                f"color=0xf59e0b@0.95:t=fill:enable='{enable_expr}'"
-            )
-
-            if hist_date:
-                safe_date = escape_drawtext(hist_date.upper())
-                v_filters.append(
-                    f"drawtext=fontfile={font_bold}:text='{safe_date}':"
-                    f"fontcolor=white:fontsize={max(18, int(round(44 * scale_k)))}:"
-                    f"x={text_x}:y={date_y}:alpha='{alpha_expr}':enable='{enable_expr}'"
-                )
-            if hist_loc:
-                safe_loc = escape_drawtext(hist_loc)
-                y_pos = loc_y if hist_date else date_y
-                v_filters.append(
-                    f"drawtext=fontfile={font_reg}:text='{safe_loc}':"
-                    f"fontcolor=0xe5e7eb:fontsize={max(16, int(round(34 * scale_k)))}:"
-                    f"x={text_x}:y={y_pos}:alpha='{alpha_expr}':enable='{enable_expr}'"
-                )
 
     if idx == 0 and cf_dur > 0.0 and trans_type in {"fade", "fadeblack"}:
         v_filters.append(f"fade=t=in:st=0:d={cf_dur:.6f}")
@@ -395,7 +550,6 @@ def prepare_scene(
         fade_start = max(0.0, target_dur - out_trans_dur)
         v_filters.append(f"fade=t=out:st={fade_start:.6f}:d={out_trans_dur:.6f}")
 
-    # 4. Частицы / Снег / Искры (Ambient Particles — лёгкий процедурный слой пылинок поверх кадра)
     if "particles" in overlays:
         filter_parts = [
             f"[0:v]{','.join(v_filters)}[vbase]",
@@ -418,7 +572,7 @@ def prepare_scene(
     print(
         f"🎬 Сцена #{idx + 1:02d}: xfade={cf_dur:.2f}s | голос={real_voice_dur:.2f}s "
         f"| видео={real_video_dur:.2f}s (x{speed_factor:.2f}) | итог={target_dur:.3f}s"
-        + (f" | титр: {hist_date} • {hist_loc}" if ("lower_thirds" in overlays and (hist_date or hist_loc)) else "")
+        + (f" | плашка [{scene_lt_style}]: {hist_date} • {hist_loc}" if ("lower_thirds" in overlays and (hist_date or hist_loc)) else "")
     )
 
     fade_out_st = max(0.0, target_dur - 0.02)
@@ -597,8 +751,8 @@ def main() -> None:
     if not scenes:
         raise ValueError("В манифесте не найден список сцен!")
 
-    overlays = parse_enabled_overlays(manifest)
-    print(f"✨ Активные оверлеи: {sorted(overlays) if overlays else 'нет'}")
+    overlays, lt_style = parse_overlay_config(manifest)
+    print(f"✨ Активные оверлеи: {sorted(overlays) if overlays else 'нет'} | Стиль плашки: {lt_style}")
 
     render_cfg = manifest.get("render_settings") or {}
     res_str = str(render_cfg.get("resolution", "3840x2160")).split()[0]
@@ -619,7 +773,7 @@ def main() -> None:
 
     for idx, scene in enumerate(scenes):
         sc_path, dur, cf_dur, lead_in_sec = prepare_scene(
-            scene, idx, width, height, fps, folder_id, overlays
+            scene, idx, width, height, fps, folder_id, overlays, lt_style
         )
         trans_type = str(scene.get("transition") or "cut").strip().lower()
         if trans_type not in VALID_XFADE_TRANSITIONS and trans_type != "cut":
