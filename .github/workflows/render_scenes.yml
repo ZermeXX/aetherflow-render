@@ -150,6 +150,10 @@ jobs:
           if folder_id and not manifest_data.get("gdrive_folder_id"):
               manifest_data["gdrive_folder_id"] = folder_id
 
+          project_override = (inputs.get("project_name") or "").strip()
+          if project_override:
+              manifest_data["project_name"] = project_override
+
           Path("manifest.json").write_text(json.dumps(manifest_data, ensure_ascii=False, indent=2), encoding="utf-8")
           scenes = manifest_data.get("timeline") or manifest_data.get("scenes") or []
           print(f"✅ manifest.json сохранён ({len(scenes)} сцен)")
@@ -275,6 +279,19 @@ jobs:
           import subprocess
           from pathlib import Path
 
+          def to_bool(val, default=True):
+              if isinstance(val, bool):
+                  return val
+              if isinstance(val, (int, float)):
+                  return bool(val)
+              if isinstance(val, str):
+                  v = val.strip().lower()
+                  if v in {"false", "0", "no", "off", "disabled", ""}:
+                      return False
+                  if v in {"true", "1", "yes", "on", "enabled"}:
+                      return True
+              return default
+
           manifest = json.loads(Path("manifest.json").read_text(encoding="utf-8"))
           project_name = manifest.get("project_name", "output")
           video_title = manifest.get("video_title", project_name)
@@ -297,31 +314,61 @@ jobs:
           size_mb = int(qc_info["format"]["size"]) / (1024 * 1024)
           print(f"✅ Auto-QC passed: {main_video.name} | {duration_sec:.2f}s | {size_mb:.1f} MB")
 
-          # 2. Export sidecar SRT subtitles (EN, RU, FR, DE, ES)
-          def fmt_srt_time(sec: float) -> str:
-              ms = int(round(sec * 1000))
-              h, rem = divmod(ms, 3600000)
-              m, rem = divmod(rem, 60000)
-              s, ms = divmod(rem, 1000)
-              return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+          ui_montage = (manifest.get("studio_ui_presets") or {}).get("tab_1_montage") or {}
+          render_cfg = manifest.get("render_settings") or {}
 
-          scenes = manifest.get("timeline") or manifest.get("scenes") or []
-          langs = ["en", "ru", "fr", "de", "es"]
-          for lang in langs:
-              srt_lines = []
-              cur_t = 0.0
-              idx_sub = 1
-              for sc in scenes:
-                  dur = float(sc.get("duration_sec") or sc.get("duration") or 10.0)
-                  subs = sc.get("subtitles") or {}
-                  text = (subs.get(lang) or "").strip()
-                  if text:
-                      srt_lines.append(f"{idx_sub}\n{fmt_srt_time(cur_t)} --> {fmt_srt_time(cur_t + dur)}\n{text}\n")
-                      idx_sub += 1
-                  cur_t += dur
-              if srt_lines:
-                  srt_file = out_dir / f"{project_name}_{lang.upper()}.srt"
-                  srt_file.write_text("\n".join(srt_lines), encoding="utf-8")
+          # 2. Export sidecar SRT subtitles ONLY if enabled in manifest
+          sub_cfg = (
+              manifest.get("subtitles_export")
+              or manifest.get("subtitles_settings")
+              or ui_montage.get("subtitles_export")
+              or render_cfg.get("subtitles")
+              or {}
+          )
+          raw_sub_flag = (
+              sub_cfg.get("enabled")
+              if isinstance(sub_cfg, dict) and "enabled" in sub_cfg
+              else manifest.get("export_subtitles", ui_montage.get("export_subtitles", render_cfg.get("export_subtitles", True)))
+          )
+          subtitles_enabled = to_bool(raw_sub_flag, default=True)
+
+          selected_langs = (
+              (sub_cfg.get("languages") if isinstance(sub_cfg, dict) else None)
+              or manifest.get("subtitle_languages")
+              or ui_montage.get("subtitle_languages")
+              or ["en", "ru", "fr", "de", "es"]
+          )
+          langs = [str(l).strip().lower() for l in selected_langs if str(l).strip()]
+
+          if subtitles_enabled and langs:
+              def fmt_srt_time(sec: float) -> str:
+                  ms = int(round(sec * 1000))
+                  h, rem = divmod(ms, 3600000)
+                  m, rem = divmod(rem, 60000)
+                  s, ms = divmod(rem, 1000)
+                  return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+              scenes = manifest.get("timeline") or manifest.get("scenes") or []
+              created_srts = []
+              for lang in langs:
+                  srt_lines = []
+                  cur_t = 0.0
+                  idx_sub = 1
+                  for sc in scenes:
+                      dur = float(sc.get("duration_sec") or sc.get("duration") or 10.0)
+                      subs = sc.get("subtitles") or {}
+                      text = (subs.get(lang) or "").strip()
+                      if text:
+                          srt_lines.append(f"{idx_sub}\n{fmt_srt_time(cur_t)} --> {fmt_srt_time(cur_t + dur)}\n{text}\n")
+                          idx_sub += 1
+                      cur_t += dur
+                  if srt_lines:
+                      srt_file = out_dir / f"{project_name}_{lang.upper()}.srt"
+                      srt_file.write_text("\n".join(srt_lines), encoding="utf-8")
+                      created_srts.append(srt_file.name)
+              print(f"✅ SRT subtitles exported: {', '.join(created_srts) if created_srts else 'none'}")
+          else:
+              print("⏭️ SRT subtitles export disabled by manifest settings — skipped.")
 
           # 3. Export output_chapters.txt (English-only YouTube chapters)
           chapters = manifest.get("chapters_youtube") or []
@@ -345,15 +392,19 @@ jobs:
           ]
           (out_dir / "RELEASE_CARD.md").write_text("\n".join(release_md), encoding="utf-8")
 
-          # 5. Shorts Factory (2 or 3 vertical 9:16 highlights with individual English Hook Text Overlay)
-          shorts_dir = out_dir / "shorts"
-          shorts_dir.mkdir(parents=True, exist_ok=True)
-
-          ui_montage = (manifest.get("studio_ui_presets") or {}).get("tab_1_montage") or {}
+          # 5. Shorts Factory ONLY if enabled in manifest
           shorts_cfg = manifest.get("shorts_factory") or ui_montage.get("shorts_factory") or {}
-          shorts_enabled = shorts_cfg.get("enabled", True)
+          raw_shorts_flag = (
+              shorts_cfg.get("enabled")
+              if isinstance(shorts_cfg, dict) and "enabled" in shorts_cfg
+              else manifest.get("generate_shorts", ui_montage.get("generate_shorts", render_cfg.get("generate_shorts", False)))
+          )
+          shorts_enabled = to_bool(raw_shorts_flag, default=False)
 
           if shorts_enabled:
+              shorts_dir = out_dir / "shorts"
+              shorts_dir.mkdir(parents=True, exist_ok=True)
+
               raw_hooks = shorts_cfg.get("hook_texts") or ui_montage.get("hook_texts") or []
               fallback_hook = (
                   shorts_cfg.get("hook_text")
@@ -404,6 +455,9 @@ jobs:
                       ],
                       check=True,
                   )
+              print(f"✅ Generated {shorts_count} Shorts in output/shorts/")
+          else:
+              print("⏭️ Shorts Factory disabled by manifest settings — skipped.")
 
           # 6. Lightweight 720p review copy (~60-80 MB)
           preview_720p = out_dir / f"{project_name}_720p_preview.mp4"
@@ -419,7 +473,7 @@ jobs:
               check=True,
           )
           preview_mb = preview_720p.stat().st_size / (1024 * 1024)
-          print(f"✅ Metadata, SRT files, RELEASE_CARD.md, Shorts, and 720p preview ({preview_mb:.1f} MB) generated!")
+          print(f"✅ All enabled artifacts and 720p preview ({preview_mb:.1f} MB) generated!")
           EOF
 
       - name: Upload Output Video, Shorts & Metadata to Google Drive
@@ -447,7 +501,7 @@ jobs:
             exit 0
           fi
           if [ "$JOB_STATUS" = "success" ]; then
-            MSG="✅ AetherFlow Render завершён: ${PROJECT_NAME:-output} (4K + 720p Preview + Shorts + SRT + RELEASE_CARD загружены на Google Drive)"
+            MSG="✅ AetherFlow Render завершён: ${PROJECT_NAME:-output} (4K + 720p Preview + выбранные артефакты загружены на Google Drive)"
           else
             MSG="❌ AetherFlow Render упал (статус: ${JOB_STATUS}) для проекта ${PROJECT_NAME:-output}. Проверьте логи GitHub Actions."
           fi
