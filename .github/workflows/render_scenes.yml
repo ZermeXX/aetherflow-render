@@ -365,7 +365,22 @@ jobs:
                   ],
                   check=True,
               )
-          print("✅ Metadata, SRT files, RELEASE_CARD.md, and 3 Shorts generated!")
+
+          # 6. Lightweight 720p review copy (~60-80 MB)
+          preview_720p = out_dir / f"{project_name}_720p_preview.mp4"
+          subprocess.run(
+              [
+                  "ffmpeg", "-y",
+                  "-i", str(main_video),
+                  "-vf", "scale=1280:720",
+                  "-c:v", "libx264", "-crf", "24", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+                  "-c:a", "aac", "-b:a", "128k",
+                  str(preview_720p),
+              ],
+              check=True,
+          )
+          preview_mb = preview_720p.stat().st_size / (1024 * 1024)
+          print(f"✅ Metadata, SRT files, RELEASE_CARD.md, 3 Shorts, and 720p preview ({preview_mb:.1f} MB) generated!")
           EOF
 
       - name: Upload Output Video, Shorts & Metadata to Google Drive
@@ -393,7 +408,7 @@ jobs:
             exit 0
           fi
           if [ "$JOB_STATUS" = "success" ]; then
-            MSG="✅ AetherFlow Render завершён: ${PROJECT_NAME:-output} (4K + Shorts + SRT + RELEASE_CARD загружены на Google Drive)"
+            MSG="✅ AetherFlow Render завершён: ${PROJECT_NAME:-output} (4K + 720p Preview + Shorts + SRT + RELEASE_CARD загружены на Google Drive)"
           else
             MSG="❌ AetherFlow Render упал (статус: ${JOB_STATUS}) для проекта ${PROJECT_NAME:-output}. Проверьте логи GitHub Actions."
           fi
