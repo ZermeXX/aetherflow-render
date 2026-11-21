@@ -14,14 +14,6 @@ on:
         description: 'Check assets on Google Drive without rendering'
         required: false
         default: 'false'
-      stream_upload:
-        description: 'Stream final mux to Drive (no local final file)'
-        required: false
-        default: 'true'
-      resolution:
-        description: '4k | 2k | 1080p | 720p (proxy)'
-        required: false
-        default: '4k'
 permissions:
   contents: read
 concurrency:
@@ -32,7 +24,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Repository
+        uses: actions/checkout@v4
       - name: Record Start Time
         run: echo "START_TS=$(date +%s)" >> $GITHUB_ENV
       - name: Free Disk Space on Runner
@@ -44,7 +37,7 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg curl jq python3
+          sudo apt-get install -y ffmpeg curl jq python3 python3-pil fonts-dejavu-core numfmt || sudo apt-get install -y ffmpeg curl jq python3 python3-pil fonts-dejavu-core
           curl https://rclone.org/install.sh | sudo bash
       - name: Setup Personal Rclone Config
         env:
@@ -63,7 +56,6 @@ jobs:
       - name: Parse and Sanitize Studio Manifest Payload
         env:
           RAW_PAYLOAD: ${{ github.event.inputs.manifest_payload }}
-          RESOLUTION: ${{ github.event.inputs.resolution }}
         run: |
           python3 - << 'EOF'
           import os, base64, json, shutil, subprocess
@@ -80,61 +72,67 @@ jobs:
           if raw and raw != "{}":
               try:
                   data = json.loads(raw)
+                  print("Received direct JSON from Web Studio.")
               except Exception:
                   try:
                       data = json.loads(base64.b64decode(raw).decode("utf-8"))
+                      print("Received Base64 manifest from Web Studio.")
                   except Exception:
                       data = None
           if data is None:
               if os.path.exists("assembly_manifest_metel_3h.json"):
-                  data = json.load(open("assembly_manifest_metel_3h.json", encoding="utf-8"))
+                  shutil.copy("assembly_manifest_metel_3h.json", "manifest.json")
+                  data = json.load(open("manifest.json", encoding="utf-8"))
+                  print("Used local assembly_manifest_metel_3h.json.")
               else:
+                  print("Payload empty — downloading *manifest*.json from Google Drive...")
                   subprocess.run(["rclone","copy","gdrive:",".","--drive-root-folder-id",
                                   "1OuuxKa85KAR-zz9TFXv6Ccg99fZ6JpuK","--include","*manifest*.json","-v"],
                                  check=False)
                   for fn in os.listdir("."):
                       if "manifest" in fn and fn.endswith(".json") and fn != "manifest.json":
-                          data = json.load(open(fn, encoding="utf-8")); break
+                          data = json.load(open(fn, encoding="utf-8"))
+                          print(f"Attached manifest: {fn}")
+                          break
           if not data:
-              raise RuntimeError("Failed to obtain non-empty manifest!")
+              raise RuntimeError("Failed to obtain non-empty manifest.json!")
           data = scrub(data)
-          data.setdefault("export_settings", {})["resolution"] = os.environ.get("RESOLUTION", "4k")
-          json.dump(data, open("manifest.json","w",encoding="utf-8"), ensure_ascii=False, indent=2)
-          print("Manifest parsed and sanitized (client-supplied secrets stripped).")
+          with open("manifest.json", "w", encoding="utf-8") as f:
+              json.dump(data, f, ensure_ascii=False, indent=2)
+          print("Manifest saved and sanitized (client-supplied secrets stripped).")
           EOF
           ls -lh manifest.json
-      - name: Preflight Asset Check (guards empty names)
+      - name: Preflight Asset Check
         run: |
           python3 - << 'EOF'
           import json, subprocess
           m = json.load(open("manifest.json", encoding="utf-8"))
-          folder = (m.get("cloud_export") or {}).get("target_folder_id", "1OuuxKa85KAR-zz9TFXv6Ccg99fZ6JpuK")
+          folder_id = (m.get("cloud_export") or {}).get("target_folder_id", "1OuuxKa85KAR-zz9TFXv6Ccg99fZ6JpuK")
           slots = m.get("timeline_slots") or []
           if not slots:
-              raise SystemExit("P0-GUARD: timeline_slots empty.")
+              raise SystemExit("P0-GUARD: timeline_slots пуст — рендер запрещён.")
           needed, empty = set(), []
-          for i, s in enumerate(slots):
+          for i, s in enumerate(slots, 1):
               name = ((s.get("base_content") or {}).get("file_name") or s.get("file_name") or "").strip()
               if not name:
-                  empty.append(i + 1); continue
+                  empty.append(i); continue
               needed.add(name)
               for ins in s.get("inserts") or []:
                   if (ins.get("file_name") or "").strip():
                       needed.add(ins["file_name"].strip())
           if empty:
-              raise SystemExit(f"P0-GUARD: empty file_name in slots {empty}. Fill them in Studio.")
-          out = subprocess.check_output(["rclone","lsf","gdrive:","--drive-root-folder-id",folder]).decode().splitlines()
-          existing = {x.strip().lower() for x in out}
+              raise SystemExit(f"P0-GUARD: пустые file_name в слотах {empty}. Заполните их в Studio.")
+          out = subprocess.check_output(["rclone","lsf","gdrive:","--drive-root-folder-id",folder_id]).decode().splitlines()
+          existing = {x.strip().lower() for x in out if x.strip()}
           missing = sorted(n for n in needed if n.lower() not in existing)
           if missing:
               raise FileNotFoundError(f"Missing assets on Google Drive: {', '.join(missing)}")
           with open("needed_assets.txt","w",encoding="utf-8") as f:
               for n in sorted(needed):
                   f.write("/" + n + "\n")
-          print(f"Preflight OK: {len(needed)} assets verified.")
+          print(f"✅ All {len(needed)} source clips and inserts verified on Google Drive!")
           EOF
       - name: Download Source Clips (only needed files)
-        if: github.event.inputs.preflight_only != 'true'
         run: |
           FOLDER_ID=$(jq -r '.cloud_export.target_folder_id // "1OuuxKa85KAR-zz9TFXv6Ccg99fZ6JpuK"' manifest.json)
           mkdir -p input_clips
@@ -144,19 +142,25 @@ jobs:
       - name: Preflight Probe (local sources)
         if: github.event.inputs.preflight_only == 'true'
         run: |
-          FOLDER_ID=$(jq -r '.cloud_export.target_folder_id // "1OuuxKa85KAR-zz9TFXv6Ccg99fZ6JpuK"' manifest.json)
-          mkdir -p input_clips
-          rclone copy gdrive: ./input_clips --drive-root-folder-id "$FOLDER_ID" \
-            --include-from needed_assets.txt --ignore-case --transfers 4 -v
-          python3 assemble_pipeline.py manifest.json --preflight
-      - name: Build and Run FFmpeg Pipeline (P0)
+          python3 - << 'EOF'
+          import json, os, subprocess
+          m = json.load(open("manifest.json", encoding="utf-8"))
+          for i, s in enumerate(m.get("timeline_slots") or [], 1):
+              name = ((s.get("base_content") or {}).get("file_name") or s.get("file_name") or "").strip()
+              p = os.path.join("input_clips", name)
+              if not os.path.exists(p):
+                  cands = [f for f in os.listdir("input_clips") if f.lower() == name.lower()]
+                  p = os.path.join("input_clips", cands[0]) if cands else p
+              d = subprocess.check_output(["ffprobe","-v","error","-show_entries","format=duration",
+                                           "-of","default=noprint_wrappers=1:nokey=1", p]).decode().strip()
+              print(f"[PREFLIGHT] slot {i}: {name} = {float(d):.2f}s (slot target {s.get('slot_duration_sec')}s)")
+          print("[PREFLIGHT] OK")
+          EOF
+      - name: Build and Run FFmpeg Pipeline
         if: github.event.inputs.preflight_only != 'true'
         run: |
           set -e
-          python3 assemble_pipeline.py manifest.json --selftest
-          STREAM_FLAG=""
-          [ "${{ github.event.inputs.stream_upload }}" = "true" ] && STREAM_FLAG="--stream"
-          python3 assemble_pipeline.py manifest.json $STREAM_FLAG
+          python3 build_timeline.py
       - name: Generate Vertical Shorts & Release Card
         if: github.event.inputs.preflight_only != 'true'
         run: |
@@ -164,10 +168,11 @@ jobs:
           python3 - << 'EOF'
           import json, os, re
           def clean_en(text, fallback=""):
-              if not text: return fallback
+              if not text:
+                  return fallback
               res = re.sub(r"[А-Яа-яЁё]+", "", str(text)).strip(" -–—|:;,.")
               res = re.sub(r"\s{2,}", " ", res).strip()
-              return res or fallback
+              return res if res else fallback
           m = json.load(open("manifest.json", encoding="utf-8"))
           out_file = open("final_output_name.txt", encoding="utf-8").read().strip()
           qc = json.load(open("qc_report.json", encoding="utf-8")) if os.path.exists("qc_report.json") else {}
@@ -182,34 +187,40 @@ jobs:
           tags_en = [clean_en(t) for t in seo.get("tags", []) if clean_en(t)]
           if not tags_en:
               tags_en = ["4K Ambience","Atmospheric Soundscape","Deep Focus","Sleep Sounds","Cinematic 4K"]
-          card = [f"# RELEASE CARD: {title_en}", "",
+          card = [
+              f"# RELEASE CARD: {title_en}", "",
               f"- **Master File:** `{out_file}`",
               f"- **Duration:** {qc.get('duration_formatted','N/A')}",
-              f"- **Loudness:** {qc.get('integrated_lufs','N/A')} LUFS ({qc.get('loudness_mode','n/a')})",
-              "", "## YouTube Description", desc_en, "",
-              "## Timestamps (Chapters)", "```text", chapters.strip(), "```", "",
-              "## Tags", ", ".join(tags_en)]
+              f"- **Integrated Loudness (EBU R128):** {qc.get('integrated_lufs','N/A')} LUFS",
+              "", "## YouTube Description", desc_en,
+              "", "## Timestamps (Chapters)", "```text", chapters.strip(), "```",
+              "", "## Tags", ", ".join(tags_en),
+          ]
           open("RELEASE_CARD.md","w",encoding="utf-8").write("\n".join(card) + "\n")
           EOF
-      - name: Upload Metadata & Shorts to Google Drive
+      - name: Upload Output Video, Shorts & Metadata to Google Drive
         if: github.event.inputs.preflight_only != 'true'
         run: |
           OUT_FILE=$(cat final_output_name.txt)
           CHAPTERS_FILE=$(cat final_chapters_name.txt 2>/dev/null || echo "")
-          FOLDER_ID=$(jq -r '.cloud_export.target_folder_id // empty' manifest.json 2>/dev/null || true)
-          FLAGS=(--drive-chunk-size 128M --transfers 1 --checkers 2 --tpslimit 2 --tpslimit-burst 4
-                 --timeout 15m --contimeout 60s --retries 3 --low-level-retries 5 --stats 30s -v)
-          if [ -f "./output/$OUT_FILE" ]; then
-            if [ -n "$FOLDER_ID" ]; then
-              rclone copy "./output/$OUT_FILE" gdrive: --drive-root-folder-id "$FOLDER_ID" "${FLAGS[@]}"
-            else
-              rclone copy "./output/$OUT_FILE" gdrive:AetherFlow_Output/ "${FLAGS[@]}"
-            fi
+          FOLDER_ID=$(jq -r '.cloud_export.target_folder_id // .gdriveFolderId // empty' manifest.json 2>/dev/null || true)
+          RCLONE_FLAGS=(--drive-chunk-size 128M --drive-upload-cutoff 128M --transfers 1 --checkers 2
+                        --tpslimit 2 --tpslimit-burst 4 --timeout 15m --contimeout 60s
+                        --retries 3 --low-level-retries 5 --stats 30s -v)
+          ROOT=(); DEST="gdrive:AetherFlow_Output/"
+          if [ -n "$FOLDER_ID" ]; then ROOT=(--drive-root-folder-id "$FOLDER_ID"); DEST="gdrive:"; fi
+          if [ -f "./$OUT_FILE" ]; then
+            echo "=== Uploading local master $OUT_FILE ==="
+            rclone copy "./$OUT_FILE" "$DEST" "${ROOT[@]}" "${RCLONE_FLAGS[@]}"
+            FILE_SIZE=$(du -h "./$OUT_FILE" | cut -f1)
+          elif [ -f "./output/$OUT_FILE" ]; then
+            rclone copy "./output/$OUT_FILE" "$DEST" "${ROOT[@]}" "${RCLONE_FLAGS[@]}"
+            FILE_SIZE=$(du -h "./output/$OUT_FILE" | cut -f1)
           else
-            echo "Final was stream-uploaded by pipeline; skipping local video upload."
+            echo "Master was stream-uploaded by pipeline (rclone rcat) — skipping video upload."
+            SIZE_BYTES=$(rclone size "gdrive:$OUT_FILE" "${ROOT[@]}" --json 2>/dev/null | jq -r '.bytes // 0')
+            FILE_SIZE=$(numfmt --to=iec --suffix=B "$SIZE_BYTES" 2>/dev/null || echo "n/a")
           fi
-          DEST="gdrive:"; [ -n "$FOLDER_ID" ] && DEST="gdrive:"
-          ROOT=(); [ -n "$FOLDER_ID" ] && ROOT=(--drive-root-folder-id "$FOLDER_ID")
           [ -f "./$CHAPTERS_FILE" ] && rclone copy "./$CHAPTERS_FILE" "$DEST" "${ROOT[@]}" --tpslimit 2 -v
           [ -f "RELEASE_CARD.md" ] && rclone copy "./RELEASE_CARD.md" "$DEST" "${ROOT[@]}" --tpslimit 2 -v
           [ -f "qc_report.json" ] && rclone copy "./qc_report.json" "$DEST" "${ROOT[@]}" --tpslimit 2 -v
@@ -217,8 +228,6 @@ jobs:
             rclone copy "./shorts_out/" "${DEST}Shorts/" "${ROOT[@]}" --transfers 1 --tpslimit 2 -v
           fi
           DRIVE_LINK=$(rclone link "gdrive:$OUT_FILE" "${ROOT[@]}" 2>/dev/null || echo "")
-          SIZE_BYTES=$(rclone size "gdrive:$OUT_FILE" "${ROOT[@]}" --json 2>/dev/null | jq -r '.bytes // 0')
-          FILE_SIZE=$(numfmt --to=iec --suffix=B "$SIZE_BYTES" 2>/dev/null || echo "n/a")
           QC_SUMMARY=$(jq -r '"\(.duration_formatted) • \(.integrated_lufs) LUFS"' qc_report.json 2>/dev/null || echo "OK")
           SHORTS_COUNT=$(ls -1 shorts_out/*.mp4 2>/dev/null | wc -l | tr -d ' ')
           echo "DRIVE_LINK=$DRIVE_LINK" >> $GITHUB_ENV
@@ -234,6 +243,7 @@ jobs:
             qc_report.json
             RELEASE_CARD.md
             *_chapters.txt
+            generated_shorts.txt
           if-no-files-found: ignore
       - name: Send Telegram Notification
         if: always()
@@ -244,11 +254,13 @@ jobs:
           TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python3 - << 'EOF'
-          import os, time, json, urllib.request, urllib.parse
-          token, chat = os.environ.get("TG_TOKEN","").strip(), os.environ.get("TG_CHAT","").strip()
+          import os, time, urllib.request, urllib.parse
+          token = os.environ.get("TG_TOKEN","").strip()
+          chat = os.environ.get("TG_CHAT","").strip()
           if not token or not chat:
-              print("Telegram secrets not set — skipping notification."); raise SystemExit(0)
-          elapsed = int(time.time()) - int(os.environ.get("START_TS", time.time()))
+              print("Telegram secrets not set — skipping notification.")
+              raise SystemExit(0)
+          elapsed = int(time.time()) - int(os.environ.get("START_TS", str(int(time.time()))))
           mins = elapsed // 60
           status = os.environ.get("JOB_STATUS","unknown")
           out = open("final_output_name.txt").read().strip() if os.path.exists("final_output_name.txt") else "video.mp4"
@@ -259,14 +271,15 @@ jobs:
                      f"🎛 {os.environ.get('QC_SUMMARY','OK')}\n⏱ Сборка: {mins} мин\n"
                      f"📱 Shorts: {os.environ.get('SHORTS_COUNT','0')} шт.")
               link = os.environ.get("DRIVE_LINK","")
-              if link: msg += f"\n🔗 {link}"
+              if link:
+                  msg += f"\n🔗 {link}"
           else:
               msg = f"❌ Ошибка сборки!\n⚠️ Статус: {status}\n⏱ Прошло: {mins} мин"
           data = urllib.parse.urlencode({"chat_id": chat, "text": msg,
                                          "disable_web_page_preview": "true"}).encode()
           try:
               urllib.request.urlopen(urllib.request.Request(
-                  f"https://api.telegram.org/bot{token}/sendMessage", data=data), timeout=15)
+                  f"https://api.telegram.org/bot{token}/sendMessage", data=data), timeout=20)
           except Exception as e:
               print("Telegram warning:", e)
           EOF
