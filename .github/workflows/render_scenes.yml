@@ -172,9 +172,23 @@ jobs:
           python3 - << 'EOF'
           import json
           import os
+          import re
           import subprocess
           import sys
           from pathlib import Path
+
+          def build_name_variants(filename: str) -> list[str]:
+              base = Path(filename).name
+              variants = [filename, base]
+              m = re.match(r"^(.*?)(\d+)([^\d]*)$", base)
+              if m:
+                  prefix, digits, suffix = m.groups()
+                  num = int(digits)
+                  for pad in (2, 3, 1):
+                      cand = f"{prefix}{num:0{pad}d}{suffix}"
+                      if cand not in variants:
+                          variants.append(cand)
+              return variants
 
           manifest_path = Path(os.getenv("MANIFEST_PATH", "manifest.json"))
           if not manifest_path.is_file():
@@ -233,11 +247,9 @@ jobs:
                   missing.append(f"Сцена #{idx}: не указано имя видеофайла (file_name / assets.video_file)")
                   continue
 
-              v_exists = (
-                  Path(v_file).is_file()
-                  or (Path("assets") / v_file).is_file()
-                  or (v_file in remote_files)
-                  or (Path(v_file).name in remote_files)
+              v_exists = any(
+                  Path(c).is_file() or (Path("assets") / c).is_file() or (c in remote_files)
+                  for c in build_name_variants(v_file)
               )
               if v_exists:
                   verified_video += 1
@@ -245,11 +257,9 @@ jobs:
                   missing.append(f"Сцена #{idx}: видеофайл не найден -> {v_file}")
 
               if a_file:
-                  a_exists = (
-                      Path(a_file).is_file()
-                      or (Path("assets") / a_file).is_file()
-                      or (a_file in remote_files)
-                      or (Path(a_file).name in remote_files)
+                  a_exists = any(
+                      Path(c).is_file() or (Path("assets") / c).is_file() or (c in remote_files)
+                      for c in build_name_variants(a_file)
                   )
                   if a_exists:
                       verified_audio += 1
@@ -458,75 +468,4 @@ jobs:
                       )
                       vf_chain += (
                           f",drawtext=fontfile={font_path}:text='{safe_text}':"
-                          f"fontcolor=white:fontsize=54:line_spacing=10:"
-                          f"x=(w-text_w)/2:y=240:"
-                          f"box=1:boxcolor=black@0.68:boxborderw=24:"
-                          f"shadowcolor=black@0.85:shadowx=3:shadowy=3"
-                      )
-
-                  subprocess.run(
-                      [
-                          "ffmpeg", "-y",
-                          "-ss", f"{start_t:.2f}",
-                          "-t", f"{clip_len:.2f}",
-                          "-i", str(main_video),
-                          "-vf", vf_chain,
-                          "-c:v", "libx264", "-crf", "20", "-preset", "fast", "-pix_fmt", "yuv420p",
-                          "-c:a", "aac", "-b:a", "192k",
-                          str(short_out),
-                      ],
-                      check=True,
-                  )
-              print(f"✅ Generated {shorts_count} Shorts in output/shorts/")
-          else:
-              print("⏭️ Shorts Factory disabled by manifest settings — skipped.")
-
-          # 6. Lightweight 720p review copy (~60-80 MB)
-          preview_720p = out_dir / f"{project_name}_720p_preview.mp4"
-          subprocess.run(
-              [
-                  "ffmpeg", "-y",
-                  "-i", str(main_video),
-                  "-vf", "scale=1280:720",
-                  "-c:v", "libx264", "-crf", "24", "-preset", "veryfast", "-pix_fmt", "yuv420p",
-                  "-c:a", "aac", "-b:a", "128k",
-                  str(preview_720p),
-              ],
-              check=True,
-          )
-          preview_mb = preview_720p.stat().st_size / (1024 * 1024)
-          print(f"✅ All enabled artifacts and 720p preview ({preview_mb:.1f} MB) generated!")
-          EOF
-
-      - name: Upload Output Video, Shorts & Metadata to Google Drive
-        env:
-          GDRIVE_FOLDER_ID: ${{ env.EFFECTIVE_FOLDER_ID || secrets.GDRIVE_FOLDER_ID }}
-        run: |
-          if [ -z "$GDRIVE_FOLDER_ID" ]; then
-            echo "❌ GDRIVE_FOLDER_ID не задан для выгрузки!" >&2
-            exit 1
-          fi
-          rclone copy output/ "${GDRIVE_REMOTE}:_RENDER_OUTPUT_${PROJECT_NAME}/" \
-            --drive-root-folder-id "$GDRIVE_FOLDER_ID" \
-            --progress
-          echo "✅ Выгрузка в Google Drive завершена: _RENDER_OUTPUT_${PROJECT_NAME}"
-
-      - name: Send Telegram Notification
-        if: always()
-        env:
-          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          JOB_STATUS: ${{ job.status }}
-        run: |
-          if [ -z "$TG_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
-            echo "ℹ️ Telegram secrets не заданы, пропускаем уведомление."
-            exit 0
-          fi
-          if [ "$JOB_STATUS" = "success" ]; then
-            MSG="✅ AetherFlow Render завершён: ${PROJECT_NAME:-output} (4K + 720p Preview + выбранные артефакты загружены на Google Drive)"
-          else
-            MSG="❌ AetherFlow Render упал (статус: ${JOB_STATUS}) для проекта ${PROJECT_NAME:-output}. Проверьте логи GitHub Actions."
-          fi
-          curl -sS --max-time 20 -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
-            -d "chat_id=${TG_CHAT_ID}" \
-            --data-urlencode "text=${MSG}" || echo "⚠️ Telegram API timeout (игнорируем, чтобы не ронять джобу)"
+                          f"fontcolor
