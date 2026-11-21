@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -61,30 +62,44 @@ def resolve_asset(filename: str | None, work_dir: Path, folder_id: str | None) -
         return None
 
     base_name = Path(filename).name
-    candidates = [
-        work_dir / base_name,
-        work_dir / filename,
-        Path("assets") / filename,
-        Path("assets") / base_name,
-        Path("input") / filename,
-        Path(filename),
-    ]
-    for path in candidates:
-        if path.is_file():
-            return path
+    name_variants = [base_name]
+    m = re.match(r"^(.*?)(\d+)([^\d]*)$", base_name)
+    if m:
+        prefix, digits, suffix = m.groups()
+        num = int(digits)
+        for pad in (2, 3, 1):
+            cand = f"{prefix}{num:0{pad}d}{suffix}"
+            if cand not in name_variants:
+                name_variants.append(cand)
+
+    for variant in name_variants:
+        for path in (
+            work_dir / variant,
+            Path("assets") / variant,
+            Path("input") / variant,
+            Path(variant),
+        ):
+            if path.is_file():
+                return path
 
     if folder_id:
         remote = os.getenv("GDRIVE_REMOTE", "gdrive")
-        dest = work_dir / base_name
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        run_cmd([
-            "rclone", "copyto",
-            f"{remote}:{filename}",
-            str(dest),
-            "--drive-root-folder-id", folder_id,
-        ])
-        if dest.is_file():
-            return dest
+        for variant in name_variants:
+            dest = work_dir / variant
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            res = subprocess.run(
+                [
+                    "rclone", "copyto",
+                    f"{remote}:{variant}",
+                    str(dest),
+                    "--drive-root-folder-id", folder_id,
+                ],
+                capture_output=True,
+                text=True,
+            )
+            if res.returncode == 0 and dest.is_file():
+                print(f"📥 Скачан файл: {variant}")
+                return dest
 
     return None
 
@@ -189,7 +204,6 @@ def build_lower_third_filters(
             tag_h = int(round(52 * scale_k))
             tag_y = main_y - tag_h
             tag_w = min(main_w, max(int(round(260 * scale_k)), int(round((len(date_up) * 21 + 64) * scale_k))))
-            # Тёплый оранжевый тег даты сверху
             filters.append(
                 f"drawbox=x={box_x}:y={tag_y}:w={tag_w}:h={tag_h}:color=0xd97706@0.96:t=fill:enable='{enable_expr}'"
             )
@@ -200,7 +214,6 @@ def build_lower_third_filters(
                 f"alpha='{alpha_expr}':enable='{enable_expr}'"
             )
 
-        # Тёмно-синяя плашка + янтарно-оранжевая левая полоса
         filters.append(
             f"drawbox=x={box_x}:y={main_y}:w={main_w}:h={main_h}:color=0x0f172a@0.90:t=fill:enable='{enable_expr}'"
         )
@@ -227,15 +240,12 @@ def build_lower_third_filters(
         longest = max(len(top_line) * 25, len(sub_line) * 19)
         total_w = min(max_bar_w, max(int(round(680 * scale_k)), red_w + int(round((longest + 90) * scale_k))))
 
-        # Стеклянная графитовая основа
         filters.append(
             f"drawbox=x={box_x}:y={box_y}:w={total_w}:h={box_h}:color=0x1e293b@0.82:t=fill:enable='{enable_expr}'"
         )
-        # Ярко-красный акцентный блок слева
         filters.append(
             f"drawbox=x={box_x}:y={box_y}:w={red_w}:h={box_h}:color=0xe11d48@0.95:t=fill:enable='{enable_expr}'"
         )
-        # Тонкая светлая верхняя кромка стекла
         filters.append(
             f"drawbox=x={box_x + red_w}:y={box_y}:w={total_w - red_w}:h={max(2, int(round(4 * scale_k)))}:"
             f"color=white@0.35:t=fill:enable='{enable_expr}'"
@@ -275,15 +285,12 @@ def build_lower_third_filters(
             if red_w + blue_w > max_bar_w:
                 blue_w = max(int(round(360 * scale_k)), max_bar_w - red_w)
 
-            # Красный блок даты слева
             filters.append(
                 f"drawbox=x={box_x}:y={box_y}:w={red_w}:h={box_h}:color=0xdc2626@0.95:t=fill:enable='{enable_expr}'"
             )
-            # Синий основной блок локации справа
             filters.append(
                 f"drawbox=x={box_x + red_w}:y={box_y}:w={blue_w}:h={box_h}:color=0x1e3a8a@0.92:t=fill:enable='{enable_expr}'"
             )
-            # Ярко-синяя нижняя полоса акцента
             filters.append(
                 f"drawbox=x={box_x + red_w}:y={box_y + box_h - stripe_h}:w={blue_w}:h={stripe_h}:"
                 f"color=0x3b82f6@0.95:t=fill:enable='{enable_expr}'"
@@ -819,20 +826,3 @@ def main() -> None:
             in_cf_dur = chunk[0][2]
             in_trans = chunk[0][3]
             chunk_for_merge = [(chunk[0][0], chunk[0][1], 0.0, "cut")] + chunk[1:]
-            batch_out = batches_dir / f"batch_{b_idx:02d}.mkv"
-            batch_dur = merge_segment_group(
-                chunk_for_merge, batch_out, fps=fps, crf=15, preset="superfast"
-            )
-            batch_segments.append((batch_out, batch_dur, in_cf_dur, in_trans))
-            print(f"✅ Batch {b_idx + 1} merged ({len(chunk)} scenes, {batch_dur:.3f}s)")
-
-        total_dur = merge_segment_group(
-            batch_segments, raw_master, fps=fps, crf=crf, preset="faster"
-        )
-
-    finalize_audio_and_container(raw_master, final_video, audio_bitrate, loudnorm)
-    print(f"✅ Render complete: {final_video} ({total_dur:.3f}s)")
-
-
-if __name__ == "__main__":
-    main()
