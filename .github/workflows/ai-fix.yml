@@ -1,0 +1,61 @@
+name: AI Fix (Gemini)
+on:
+  workflow_dispatch:
+    inputs:
+      task_file:
+        description: 'Файл с задачей в репозитории (например tasks/p1.md)'
+        required: true
+        type: string
+      branch_name:
+        description: 'Имя ветки для PR'
+        required: false
+        default: 'ai/fix'
+permissions:
+  contents: write
+  pull-requests: write
+concurrency:
+  group: ai-fix-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg fonts-dejavu-core
+          python -m pip install pillow pyyaml
+          npm i -g @google/gemini-cli
+      - name: Verify task file exists
+        run: test -f "${{ inputs.task_file }}"
+      - name: Run agent
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          gemini -p "Прочитай ${{ inputs.task_file }} и выполни все требования к этому репозиторию. Меняй только то, что требует задача. Не трогай секреты и не добавляй ключи в код. После правок запусти python -m compileall -q . и python -m unittest discover -s tests -p 'test_*.py'." --yolo
+      - name: Re-run checks after agent
+        run: |
+          python -m compileall -q .
+          python -m unittest discover -s tests -p "test_*.py" -v
+      - name: Open Pull Request
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: ${{ inputs.branch_name }}
+          title: 'fix: automated changes from ${{ inputs.task_file }}'
+          commit-message: 'fix: automated changes by Gemini agent'
+          body: |
+            Автоматические правки по `${{ inputs.task_file }}`.
+            Проверки `compileall` и `unittest` прогнаны в job.
+            Ревью diff перед мержем обязательно.
+          delete-branch: true
