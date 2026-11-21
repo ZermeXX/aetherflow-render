@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-assemble_pipeline.py — P0 rewrite (aetherflow-render).
-Бесшовный луп (loop-baker) + честные 90с кроссфейды актов + concat -c copy.
+assemble_pipeline.py — многочасовой луп (loop-baker + честные кроссфейды актов + concat -c copy).
 Совместимость: manifest.json (timeline_slots), ./input_clips, ./output,
 final_output_name.txt, final_chapters_name.txt, qc_report.json, shorts_factory.py.
-Секреты — только из окружения/GitHub Secrets, никогда из манифеста.
+Секреты — только из окружения / GitHub Secrets, никогда из манифеста.
+Запуск: python3 assemble_pipeline.py manifest.json [--stream | --local] [--preflight] [--selftest]
 """
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -19,8 +20,6 @@ FPS = 24
 TAIL_BLACK = 2.0
 FADE_OUT = 1.5
 RES = {"720p": (1280, 720), "1080p": (1920, 1080), "2k": (2560, 1440), "4k": (3840, 2160)}
-SECRET_KEYS = {"bot_token", "chat_id", "service_account", "sa_json", "pat", "github_token",
-               "access_token", "refresh_token", "client_secret", "api_key", "token"}
 
 
 def run(cmd, capture=False):
@@ -78,6 +77,21 @@ def guard_slots(slots):
     if empty:
         raise SystemExit(f"[P0-GUARD] Пустые file_name в слотах {empty}. "
                          f"Рендер запрещён до заполнения (никаких -i \"\").")
+
+
+def slot_duration_sec(slot, idx=0):
+    """Каноническое поле — slot_duration_sec (manifest.json / build_timeline.py / render_loop.yml).
+    duration_sec оставлен только как legacy-fallback."""
+    raw = slot.get("slot_duration_sec")
+    if raw in (None, "", 0, "0"):
+        raw = slot.get("duration_sec")
+    if raw in (None, "", 0, "0"):
+        print(f"[WARN] Слот {idx + 1}: slot_duration_sec отсутствует — fallback 1800s.", flush=True)
+        raw = 1800
+    val = float(raw)
+    if val <= 0:
+        raise SystemExit(f"[P0-GUARD] Слот {idx + 1}: некорректная длительность {val}s.")
+    return val
 
 
 def md5_of(path):
@@ -193,7 +207,7 @@ def plan_pieces(durs, C):
         tailc = C if i < n - 1 else 0.0
         b = d - head - tailc
         if b <= 5:
-            raise SystemExit(f"[P0-GUARD] Слот {i+1}: duration {d}s слишком мал для двух "
+            raise SystemExit(f"[P0-GUARD] Слот {i + 1}: duration {d}s слишком мал для двух "
                              f"кроссфейдов по {C}s. Увеличьте слот или уменьшите crossfade.")
         starts.append(pos)
         pieces.append({"kind": "body", "idx": i, "skip": head, "dur": b})
@@ -215,14 +229,18 @@ def selftest():
     assert fmt_duration(64) == "1:04"
     p1, s1, t1 = plan_pieces([10800], 90.0)
     assert abs(t1 - 10802.0) < 1e-6 and s1 == [0.0]
-    print("[SELFTEST] OK: pieces/chapters/formatter")
+    assert slot_duration_sec({"slot_duration_sec": 1890}) == 1890.0
+    assert slot_duration_sec({"duration_sec": 1290}) == 1290.0
+    assert slot_duration_sec({"slot_duration_sec": 2490, "duration_sec": 1800}) == 2490.0
+    print("[SELFTEST] OK: pieces/chapters/formatter/slot_duration")
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("manifest", nargs="?", default="manifest.json")
     ap.add_argument("--preflight", action="store_true")
-    ap.add_argument("--stream", action="store_true", help="final mux -> rclone rcat (no local final)")
+    ap.add_argument("--stream", action="store_true", help="final mux -> rclone rcat (без локальной копии)")
+    ap.add_argument("--local", action="store_true", help="принудительно локальный финал (игнорировать disk-guard)")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
     if args.selftest:
@@ -234,8 +252,6 @@ def main():
     export = manifest.get("export_settings", {}) or {}
     slots = manifest.get("timeline_slots", []) or []
     guard_slots(slots)
-    if not slots and manifest.get("scenes"):
-        raise SystemExit("[P0-GUARD] Это narrative-манифест: используйте assemble_scenes.py.")
     codec = export.get("video_codec", "libx264")
     preset = export.get("preset", "veryfast" if codec == "libx264" else "medium")
     crf = export.get("crf", 20 if codec == "libx264" else 22)
@@ -246,9 +262,9 @@ def main():
     input_dir, temp_dir, out_dir = "./input_clips", "./temp_render", "./output"
     for d in (input_dir, temp_dir, out_dir, f"{temp_dir}/baked", f"{temp_dir}/pieces"):
         os.makedirs(d, exist_ok=True)
-    durs = [float(s.get("duration_sec", 1800)) for s in slots]
+    durs = [slot_duration_sec(s, i) for i, s in enumerate(slots)]
     pieces, starts, total = plan_pieces(durs, C)
-    print(f"=== P0 loop pipeline: {len(slots)} слотов, crossfade {C}s, seam {seam}s, "
+    print(f"=== Loop pipeline: {len(slots)} слотов, crossfade {C}s, seam {seam}s, "
           f"{w}x{h}, master {fmt_duration(total)} ===", flush=True)
     sources = [resolve_file(input_dir, (s.get("base_content") or {}).get("file_name")
                             or s.get("file_name")) for s in slots]
@@ -261,24 +277,25 @@ def main():
         return
     baked = [bake_loop(src, seam, f"{temp_dir}/baked", w, h) for src in sources]
     enc = enc_args(codec, preset, crf)
-    est_mbps = 3.0 if str(manifest.get("content_profile", "ambience")).lower() == "ambience" else 18.0
+    est_mbps = 3.0 if str(manifest.get("content_profile", "")).lower() == "ambience" else 18.0
     est_bytes = total * est_mbps * 1e6 / 8
     free = shutil.disk_usage(temp_dir).free
-    stream = args.stream or est_bytes > free * 0.7
-    if stream and not args.stream:
-        print(f"[DISK-GUARD] оценка {est_bytes/1e9:.1f} ГБ > 70% свободных "
-              f"{free/1e9:.1f} ГБ → включаю stream-upload.", flush=True)
+    need_local = est_bytes * 2.0
+    force_stream = args.stream or os.environ.get("AETHER_FORCE_STREAM", "") == "1"
+    stream = force_stream or (not args.local and need_local > free * 0.85)
+    print(f"[DISK] свободно {free / 1e9:.1f} ГБ • мастер ~{est_bytes / 1e9:.1f} ГБ • "
+          f"локально нужно ~{need_local / 1e9:.1f} ГБ → {'STREAM' if stream else 'LOCAL'}", flush=True)
     concat_list = f"{temp_dir}/slots_concat.txt"
     files = []
     for p in pieces:
         i = p["idx"]
         if p["kind"] == "body":
-            out = f"{temp_dir}/pieces/slot_{i+1}_body.mp4"
+            out = f"{temp_dir}/pieces/slot_{i + 1}_body.mp4"
             render_body(baked[i][0], p["skip"], p["dur"], out, enc, codec,
                         fade=(i == len(slots) - 1))
         elif p["kind"] == "trans":
-            out = f"{temp_dir}/pieces/trans_{i+1}.mp4"
-            render_transition(baked[i][0], p["skip"], baked[i+1][0], p["dur"], out, enc, codec)
+            out = f"{temp_dir}/pieces/trans_{i + 1}.mp4"
+            render_transition(baked[i][0], p["skip"], baked[i + 1][0], p["dur"], out, enc, codec)
         else:
             out = f"{temp_dir}/pieces/tail_black.mp4"
             render_tail(out, enc, codec, w, h)
@@ -321,12 +338,17 @@ def main():
     else:
         run(base + ["-movflags", "+faststart", final_local])
         size_gb = os.path.getsize(final_local) / (1024 ** 3)
+        for fp in files:
+            try:
+                os.remove(fp)
+            except OSError:
+                pass
         print(f"[ГОТОВО] {final_local} ({size_gb:.2f} ГБ)", flush=True)
     base_name = os.path.splitext(out_name)[0]
     ch_name = f"{base_name}_chapters.txt"
     with open(ch_name, "w", encoding="utf-8") as f:
         for i, st in enumerate(starts):
-            label = slots[i].get("title") or slots[i].get("name") or f"Act {i+1}"
+            label = slots[i].get("title") or slots[i].get("name") or f"Act {i + 1}"
             f.write(f"{fmt_duration(st)} {label}\n")
     with open("final_output_name.txt", "w", encoding="utf-8") as f:
         f.write(out_name + "\n")
