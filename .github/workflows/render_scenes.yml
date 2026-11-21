@@ -179,13 +179,15 @@ jobs:
 
           def build_name_variants(filename: str) -> list[str]:
               base = Path(filename).name
+              stem = Path(base).stem
+              ext = Path(base).suffix
               variants = [filename, base]
-              m = re.match(r"^(.*?)(\d+)([^\d]*)$", base)
+              m = re.match(r"^(.*?)(\d+)([^\d]*)$", stem)
               if m:
                   prefix, digits, suffix = m.groups()
                   num = int(digits)
                   for pad in (2, 3, 1):
-                      cand = f"{prefix}{num:0{pad}d}{suffix}"
+                      cand = f"{prefix}{num:0{pad}d}{suffix}{ext}"
                       if cand not in variants:
                           variants.append(cand)
               return variants
@@ -270,7 +272,7 @@ jobs:
 
           if missing:
               print("❌ Ошибка проверки ассетов перед рендером:", file=sys.stderr)
-              print(f"📂 Файлы, найденные в папке Google Drive ({folder_id}): {sorted(remote_list)[:50]}", file=sys.stderr)
+              print(f"📂 Файлы, найденные в папке Google Drive ({folder_id}): {sorted(remote_list)[:60]}", file=sys.stderr)
               for err in missing:
                   print(f"  - {err}", file=sys.stderr)
               sys.exit(1)
