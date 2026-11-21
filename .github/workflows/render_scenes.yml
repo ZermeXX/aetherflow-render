@@ -1,547 +1,285 @@
-name: AetherFlow 4K Render Pipeline
-
+name: Render Loop Pipeline
 on:
   workflow_dispatch:
     inputs:
-      manifest_json:
-        description: 'Compact JSON manifest from AETHER COMBINE studio'
+      target_hours:
+        description: 'Target hours'
         required: false
-        type: string
-        default: ''
+        default: '3'
       manifest_payload:
-        description: 'Alternative manifest payload key'
+        description: 'JSON or Base64 payload from Web Studio'
         required: false
-        type: string
-        default: ''
-      manifest:
-        description: 'Legacy manifest key'
+        default: '{}'
+      preflight_only:
+        description: 'Check assets on Google Drive without rendering'
         required: false
-        type: string
-        default: ''
-      gdrive_folder_id:
-        description: 'Google Drive folder ID with scene assets'
-        required: false
-        type: string
-        default: ''
-      folder_id:
-        description: 'Alternative Google Drive folder ID key'
-        required: false
-        type: string
-        default: ''
-      project_name:
-        description: 'Optional project name override'
-        required: false
-        type: string
-        default: ''
-
-env:
-  GDRIVE_REMOTE: gdrive
-  MANIFEST_PATH: manifest.json
-
+        default: 'false'
+permissions:
+  contents: read
+concurrency:
+  group: render-loop-${{ github.ref }}
+  cancel-in-progress: false
 jobs:
-  render:
+  render_and_upload:
     runs-on: ubuntu-latest
     timeout-minutes: 360
-
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
-
-      - name: Install FFmpeg, Fonts & Rclone
+      - name: Record Start Time
+        run: echo "START_TS=$(date +%s)" >> $GITHUB_ENV
+      - name: Free Disk Space on Runner
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg curl unzip fonts-dejavu-core
-          if ! command -v rclone &> /dev/null; then
-            curl -fsSL https://rclone.org/install.sh | sudo bash
-          fi
-          ffmpeg -version | head -n 1
-          rclone version | head -n 1
-
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache /usr/local/share/boost
+          sudo docker image prune --all --force || true
+          sudo apt-get clean
+          df -h
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg curl jq python3 python3-pil fonts-dejavu-core numfmt || sudo apt-get install -y ffmpeg curl jq python3 python3-pil fonts-dejavu-core
+          curl https://rclone.org/install.sh | sudo bash
       - name: Setup Personal Rclone Config
         env:
-          RCLONE_CONF_B64: ${{ secrets.RCLONE_CONFIG_BASE64 }}
-          RCLONE_CONF_RAW: ${{ secrets.RCLONE_CONFIG }}
+          RCLONE_CONF_DATA: ${{ secrets.RCLONE_CONFIG }}
+          CUSTOM_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
+          CUSTOM_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
         run: |
           mkdir -p ~/.config/rclone
-          if [ -n "$RCLONE_CONF_B64" ]; then
-            echo "$RCLONE_CONF_B64" | base64 -d > ~/.config/rclone/rclone.conf
-          elif [ -n "$RCLONE_CONF_RAW" ]; then
-            printf "%s\n" "$RCLONE_CONF_RAW" > ~/.config/rclone/rclone.conf
-          else
-            echo "❌ Не найден секрет RCLONE_CONFIG_BASE64 или RCLONE_CONFIG!" >&2
-            exit 1
+          printf "%s\n" "$RCLONE_CONF_DATA" > ~/.config/rclone/rclone.conf
+          if [ -n "$CUSTOM_CLIENT_ID" ] && [ -n "$CUSTOM_CLIENT_SECRET" ]; then
+            echo "RCLONE_DRIVE_CLIENT_ID=$CUSTOM_CLIENT_ID" >> $GITHUB_ENV
+            echo "RCLONE_DRIVE_CLIENT_SECRET=$CUSTOM_CLIENT_SECRET" >> $GITHUB_ENV
           fi
           chmod 600 ~/.config/rclone/rclone.conf
           rclone listremotes
-
-      - name: Parse Studio Manifest Payload
+      - name: Parse and Sanitize Studio Manifest Payload
         env:
-          INPUTS_JSON: ${{ toJson(github.event.inputs) }}
-          SECRET_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+          RAW_PAYLOAD: ${{ github.event.inputs.manifest_payload }}
         run: |
           python3 - << 'EOF'
-          import base64
-          import gzip
-          import json
-          import os
-          import subprocess
-          from pathlib import Path
-
-          inputs = json.loads(os.environ.get("INPUTS_JSON") or "{}")
-          print("📥 Полученные ключи inputs:", list(inputs.keys()))
-
-          raw_candidate = ""
-          for key in ("manifest_json", "manifest_payload", "manifest", "manifest_b64", "payload"):
-              val = inputs.get(key)
-              if isinstance(val, str) and val.strip():
-                  raw_candidate = val.strip()
-                  print(f"✅ Найден payload в поле inputs.{key} (длина: {len(raw_candidate)} симв.)")
-                  break
-
-          if not raw_candidate:
-              for key, val in inputs.items():
-                  if isinstance(val, str) and (val.strip().startswith("{") or val.strip().startswith("gz:") or len(val.strip()) > 200):
-                      raw_candidate = val.strip()
-                      print(f"✅ Найден payload в поле inputs.{key}")
-                      break
-
-          manifest_data = None
-
-          if raw_candidate:
-              decoded = raw_candidate
-              if decoded.startswith("gz:"):
-                  decoded = gzip.decompress(base64.b64decode(decoded[3:])).decode("utf-8")
-              elif not decoded.startswith("{"):
+          import os, base64, json, shutil, subprocess
+          SECRET_KEYS = {"bot_token","chat_id","service_account","sa_json","pat","github_token",
+                         "access_token","refresh_token","client_secret","api_key","token"}
+          def scrub(o):
+              if isinstance(o, dict):
+                  return {k: scrub(v) for k, v in o.items() if k.lower() not in SECRET_KEYS}
+              if isinstance(o, list):
+                  return [scrub(v) for v in o]
+              return o
+          raw = os.environ.get("RAW_PAYLOAD", "").strip()
+          data = None
+          if raw and raw != "{}":
+              try:
+                  data = json.loads(raw)
+                  print("Received direct JSON from Web Studio.")
+              except Exception:
                   try:
-                      decoded = base64.b64decode(decoded).decode("utf-8")
+                      data = json.loads(base64.b64decode(raw).decode("utf-8"))
+                      print("Received Base64 manifest from Web Studio.")
                   except Exception:
-                      pass
-              manifest_data = json.loads(decoded)
-
-          folder_id = (
-              (inputs.get("gdrive_folder_id") or "").strip()
-              or (inputs.get("folder_id") or "").strip()
-              or (manifest_data or {}).get("gdrive_folder_id", "")
-              or (manifest_data or {}).get("folder_id", "")
-              or os.environ.get("SECRET_FOLDER_ID", "").strip()
-          )
-
-          if not manifest_data and folder_id:
-              remote = os.environ.get("GDRIVE_REMOTE", "gdrive")
-              print("🔍 Ищем *manifest*.json на Google Drive...")
-              res = subprocess.run(
-                  ["rclone", "lsf", f"{remote}:", "--files-only", "--include", "*manifest*.json", "--drive-root-folder-id", folder_id],
-                  capture_output=True,
-                  text=True,
-                  check=True,
-              )
-              files = sorted([line.strip() for line in res.stdout.splitlines() if line.strip()])
-              if files:
-                  subprocess.run(
-                      ["rclone", "copyto", f"{remote}:{files[-1]}", "manifest.json", "--drive-root-folder-id", folder_id],
-                      check=True,
-                  )
-                  manifest_data = json.loads(Path("manifest.json").read_text(encoding="utf-8"))
-                  print(f"✅ Скачан манифест с Google Drive: {files[-1]}")
-
-          if not manifest_data or not isinstance(manifest_data, dict):
-              raise RuntimeError("Failed to obtain non-empty manifest.json for scene assembly!")
-
-          if folder_id and not manifest_data.get("gdrive_folder_id"):
-              manifest_data["gdrive_folder_id"] = folder_id
-
-          project_override = (inputs.get("project_name") or "").strip()
-          if project_override:
-              manifest_data["project_name"] = project_override
-
-          Path("manifest.json").write_text(json.dumps(manifest_data, ensure_ascii=False, indent=2), encoding="utf-8")
-          scenes = manifest_data.get("timeline") or manifest_data.get("scenes") or []
-          print(f"✅ manifest.json сохранён ({len(scenes)} сцен)")
-
-          github_env = os.environ.get("GITHUB_ENV")
-          if github_env:
-              with open(github_env, "a", encoding="utf-8") as env_f:
-                  env_f.write(f"EFFECTIVE_FOLDER_ID={folder_id}\n")
-                  env_f.write(f"PROJECT_NAME={manifest_data.get('project_name', 'output')}\n")
+                      data = None
+          if data is None:
+              if os.path.exists("assembly_manifest_metel_3h.json"):
+                  shutil.copy("assembly_manifest_metel_3h.json", "manifest.json")
+                  data = json.load(open("manifest.json", encoding="utf-8"))
+                  print("Used local assembly_manifest_metel_3h.json.")
+              else:
+                  print("Payload empty — downloading *manifest*.json from Google Drive...")
+                  subprocess.run(["rclone","copy","gdrive:",".","--drive-root-folder-id",
+                                  "1OuuxKa85KAR-zz9TFXv6Ccg99fZ6JpuK","--include","*manifest*.json","-v"],
+                                 check=False)
+                  for fn in os.listdir("."):
+                      if "manifest" in fn and fn.endswith(".json") and fn != "manifest.json":
+                          data = json.load(open(fn, encoding="utf-8"))
+                          print(f"Attached manifest: {fn}")
+                          break
+          if not data:
+              raise RuntimeError("Failed to obtain non-empty manifest.json!")
+          data = scrub(data)
+          with open("manifest.json", "w", encoding="utf-8") as f:
+              json.dump(data, f, ensure_ascii=False, indent=2)
+          print("Manifest saved and sanitized (client-supplied secrets stripped).")
           EOF
-
+          ls -lh manifest.json
       - name: Preflight Asset Check
-        env:
-          SECRET_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
         run: |
           python3 - << 'EOF'
-          import json
-          import os
-          import re
-          import subprocess
-          import sys
-          from pathlib import Path
-
-          def build_name_variants(filename: str) -> list[str]:
-              base = Path(filename).name
-              stem = Path(base).stem
-              ext = Path(base).suffix
-              variants = [filename, base]
-              m = re.match(r"^(.*?)(\d+)([^\d]*)$", stem)
-              if m:
-                  prefix, digits, suffix = m.groups()
-                  num = int(digits)
-                  for pad in (2, 3, 1):
-                      cand = f"{prefix}{num:0{pad}d}{suffix}{ext}"
-                      if cand not in variants:
-                          variants.append(cand)
-              return variants
-
-          manifest_path = Path(os.getenv("MANIFEST_PATH", "manifest.json"))
-          if not manifest_path.is_file():
-              print(f"❌ Манифест не найден: {manifest_path}", file=sys.stderr)
-              sys.exit(1)
-
-          with manifest_path.open("r", encoding="utf-8") as f:
-              manifest = json.load(f)
-
-          scenes = manifest.get("timeline") or manifest.get("scenes") or []
-          if not scenes:
-              print("❌ В манифесте не найдено ни одной сцены (timeline / scenes пуст)!", file=sys.stderr)
-              sys.exit(1)
-
-          folder_id = (
-              os.getenv("EFFECTIVE_FOLDER_ID", "").strip()
-              or manifest.get("gdrive_folder_id", "").strip()
-              or manifest.get("folder_id", "").strip()
-              or os.getenv("SECRET_FOLDER_ID", "").strip()
-          )
-          remote = os.getenv("GDRIVE_REMOTE", "gdrive")
-
-          remote_files = set()
-          remote_list = []
-          if folder_id:
-              res = subprocess.run(
-                  ["rclone", "lsf", f"{remote}:", "--recursive", "--files-only", "--drive-root-folder-id", folder_id],
-                  capture_output=True,
-                  text=True,
-                  check=True,
-              )
-              for line in res.stdout.splitlines():
-                  clean = line.strip()
-                  if clean:
-                      remote_list.append(clean)
-                      remote_files.add(clean)
-                      remote_files.add(Path(clean).name)
-
-          missing = []
-          verified_video = 0
-          verified_audio = 0
-
-          for idx, sc in enumerate(scenes, 1):
-              assets = sc.get("assets") or {}
-              v_file = (
-                  sc.get("file_name")
-                  or sc.get("video_file")
-                  or assets.get("video_file")
-                  or assets.get("image_reference")
-              )
-              a_file = (
-                  sc.get("voiceover_file")
-                  or sc.get("audio_file")
-                  or assets.get("voiceover_file")
-              )
-
-              if not v_file:
-                  missing.append(f"Сцена #{idx}: не указано имя видеофайла (file_name / assets.video_file)")
-                  continue
-
-              v_exists = any(
-                  Path(c).is_file() or (Path("assets") / c).is_file() or (c in remote_files)
-                  for c in build_name_variants(v_file)
-              )
-              if v_exists:
-                  verified_video += 1
-              else:
-                  missing.append(f"Сцена #{idx}: видеофайл не найден -> {v_file}")
-
-              if a_file:
-                  a_exists = any(
-                      Path(c).is_file() or (Path("assets") / c).is_file() or (c in remote_files)
-                      for c in build_name_variants(a_file)
-                  )
-                  if a_exists:
-                      verified_audio += 1
-                  else:
-                      missing.append(f"Сцена #{idx}: аудиофайл не найден -> {a_file}")
-
+          import json, subprocess
+          m = json.load(open("manifest.json", encoding="utf-8"))
+          folder_id = (m.get("cloud_export") or {}).get("target_folder_id", "1OuuxKa85KAR-zz9TFXv6Ccg99fZ6JpuK")
+          slots = m.get("timeline_slots") or []
+          if not slots:
+              raise SystemExit("P0-GUARD: timeline_slots пуст — рендер запрещён.")
+          needed, empty = set(), []
+          for i, s in enumerate(slots, 1):
+              name = ((s.get("base_content") or {}).get("file_name") or s.get("file_name") or "").strip()
+              if not name:
+                  empty.append(i); continue
+              needed.add(name)
+              for ins in s.get("inserts") or []:
+                  if (ins.get("file_name") or "").strip():
+                      needed.add(ins["file_name"].strip())
+          if empty:
+              raise SystemExit(f"P0-GUARD: пустые file_name в слотах {empty}. Заполните их в Studio.")
+          out = subprocess.check_output(["rclone","lsf","gdrive:","--drive-root-folder-id",folder_id]).decode().splitlines()
+          existing = {x.strip().lower() for x in out if x.strip()}
+          missing = sorted(n for n in needed if n.lower() not in existing)
           if missing:
-              print("❌ Ошибка проверки ассетов перед рендером:", file=sys.stderr)
-              print(f"📂 Файлы, найденные в папке Google Drive ({folder_id}): {sorted(remote_list)[:60]}", file=sys.stderr)
-              for err in missing:
-                  print(f"  - {err}", file=sys.stderr)
-              sys.exit(1)
-
-          print(f"✅ Verified {len(scenes)} scenes ({verified_video} video, {verified_audio} audio files) on Google Drive!")
+              raise FileNotFoundError(f"Missing assets on Google Drive: {', '.join(missing)}")
+          with open("needed_assets.txt","w",encoding="utf-8") as f:
+              for n in sorted(needed):
+                  f.write("/" + n + "\n")
+          print(f"✅ All {len(needed)} source clips and inserts verified on Google Drive!")
           EOF
-
-      - name: Assemble Scenes with FFmpeg
-        env:
-          GDRIVE_FOLDER_ID: ${{ env.EFFECTIVE_FOLDER_ID || secrets.GDRIVE_FOLDER_ID }}
+      - name: Download Source Clips (only needed files)
+        run: |
+          FOLDER_ID=$(jq -r '.cloud_export.target_folder_id // "1OuuxKa85KAR-zz9TFXv6Ccg99fZ6JpuK"' manifest.json)
+          mkdir -p input_clips
+          rclone copy gdrive: ./input_clips --drive-root-folder-id "$FOLDER_ID" \
+            --include-from needed_assets.txt --ignore-case --transfers 4 --tpslimit 4 -v
+          ls -lh input_clips
+      - name: Preflight Probe (local sources)
+        if: github.event.inputs.preflight_only == 'true'
+        run: |
+          python3 - << 'EOF'
+          import json, os, subprocess
+          m = json.load(open("manifest.json", encoding="utf-8"))
+          for i, s in enumerate(m.get("timeline_slots") or [], 1):
+              name = ((s.get("base_content") or {}).get("file_name") or s.get("file_name") or "").strip()
+              p = os.path.join("input_clips", name)
+              if not os.path.exists(p):
+                  cands = [f for f in os.listdir("input_clips") if f.lower() == name.lower()]
+                  p = os.path.join("input_clips", cands[0]) if cands else p
+              d = subprocess.check_output(["ffprobe","-v","error","-show_entries","format=duration",
+                                           "-of","default=noprint_wrappers=1:nokey=1", p]).decode().strip()
+              print(f"[PREFLIGHT] slot {i}: {name} = {float(d):.2f}s (slot target {s.get('slot_duration_sec')}s)")
+          print("[PREFLIGHT] OK")
+          EOF
+      - name: Build and Run FFmpeg Pipeline
+        if: github.event.inputs.preflight_only != 'true'
         run: |
           set -e
-          python3 assemble_scenes.py manifest.json
-
-      - name: Run Auto-QC, Shorts Factory & Release Card
+          python3 build_timeline.py
+      - name: Generate Vertical Shorts & Release Card
+        if: github.event.inputs.preflight_only != 'true'
         run: |
+          [ -f "shorts_factory.py" ] && python3 shorts_factory.py || true
           python3 - << 'EOF'
-          import json
-          import subprocess
-          from pathlib import Path
-
-          def to_bool(val, default=True):
-              if isinstance(val, bool):
-                  return val
-              if isinstance(val, (int, float)):
-                  return bool(val)
-              if isinstance(val, str):
-                  v = val.strip().lower()
-                  if v in {"false", "0", "no", "off", "disabled", ""}:
-                      return False
-                  if v in {"true", "1", "yes", "on", "enabled"}:
-                      return True
-              return default
-
-          def fmt_chapter_time(sec: float) -> str:
-              total_s = max(0, int(round(sec)))
-              h, rem = divmod(total_s, 3600)
-              m, s = divmod(rem, 60)
-              return f"{h:02d}:{m:02d}:{s:02d}" if h > 0 else f"{m:02d}:{s:02d}"
-
-          manifest = json.loads(Path("manifest.json").read_text(encoding="utf-8"))
-          project_name = manifest.get("project_name", "output")
-          video_title = manifest.get("video_title", project_name)
-          out_dir = Path("output")
-          out_dir.mkdir(parents=True, exist_ok=True)
-          main_video = out_dir / f"{project_name}.mp4"
-
-          if not main_video.is_file() or main_video.stat().st_size < 10000:
-              raise RuntimeError(f"Auto-QC failed: итоговый видеофайл отсутствует или повреждён ({main_video})")
-
-          # 1. Auto-QC via ffprobe
-          probe = subprocess.run(
-              ["ffprobe", "-v", "error", "-show_entries", "format=duration,size:stream=codec_name,width,height,r_frame_rate", "-of", "json", str(main_video)],
-              capture_output=True,
-              text=True,
-              check=True,
-          )
-          qc_info = json.loads(probe.stdout)
-          duration_sec = float(qc_info["format"]["duration"])
-          size_mb = int(qc_info["format"]["size"]) / (1024 * 1024)
-          print(f"✅ Auto-QC passed: {main_video.name} | {duration_sec:.2f}s | {size_mb:.1f} MB")
-
-          timings_path = Path("build/actual_timings.json")
-          actual_timings = json.loads(timings_path.read_text(encoding="utf-8")) if timings_path.is_file() else []
-
-          ui_montage = (manifest.get("studio_ui_presets") or {}).get("tab_1_montage") or {}
-          render_cfg = manifest.get("render_settings") or {}
-
-          # 2. Export sidecar SRT subtitles synced to actual voiceover timings
-          sub_cfg = (
-              manifest.get("subtitles_export")
-              or manifest.get("subtitles_settings")
-              or ui_montage.get("subtitles_export")
-              or render_cfg.get("subtitles")
-              or {}
-          )
-          raw_sub_flag = (
-              sub_cfg.get("enabled")
-              if isinstance(sub_cfg, dict) and "enabled" in sub_cfg
-              else manifest.get("export_subtitles", ui_montage.get("export_subtitles", render_cfg.get("export_subtitles", True)))
-          )
-          subtitles_enabled = to_bool(raw_sub_flag, default=True)
-
-          selected_langs = (
-              (sub_cfg.get("languages") if isinstance(sub_cfg, dict) else None)
-              or manifest.get("subtitle_languages")
-              or ui_montage.get("subtitle_languages")
-              or ["en", "ru", "fr", "de", "es"]
-          )
-          langs = [str(l).strip().lower() for l in selected_langs if str(l).strip()]
-
-          if subtitles_enabled and langs:
-              def fmt_srt_time(sec: float) -> str:
-                  ms = int(round(sec * 1000))
-                  h, rem = divmod(ms, 3600000)
-                  m, rem = divmod(rem, 60000)
-                  s, ms = divmod(rem, 1000)
-                  return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-
-              scenes = manifest.get("timeline") or manifest.get("scenes") or []
-              created_srts = []
-              for lang in langs:
-                  srt_lines = []
-                  cur_t = 0.0
-                  idx_sub = 1
-                  for idx_sc, sc in enumerate(scenes):
-                      if idx_sc < len(actual_timings):
-                          st = float(actual_timings[idx_sc]["voice_start"])
-                          en = float(actual_timings[idx_sc]["scene_end"])
-                      else:
-                          dur = float(sc.get("duration_sec") or sc.get("duration") or 10.0)
-                          st, en = cur_t, cur_t + dur
-                          cur_t = en
-
-                      subs = sc.get("subtitles") or {}
-                      text = (subs.get(lang) or "").strip()
-                      if text:
-                          srt_lines.append(f"{idx_sub}\n{fmt_srt_time(st)} --> {fmt_srt_time(en)}\n{text}\n")
-                          idx_sub += 1
-                  if srt_lines:
-                      srt_file = out_dir / f"{project_name}_{lang.upper()}.srt"
-                      srt_file.write_text("\n".join(srt_lines), encoding="utf-8")
-                      created_srts.append(srt_file.name)
-              print(f"✅ SRT subtitles exported: {', '.join(created_srts) if created_srts else 'none'}")
-          else:
-              print("⏭️ SRT subtitles export disabled by manifest settings — skipped.")
-
-          # 3. Export output_chapters.txt (English-only YouTube chapters synced to actual timings if scene_index present)
-          chapters = manifest.get("chapters_youtube") or []
-          chapters_lines = []
-          for ch in chapters:
-              sc_idx = ch.get("scene_index")
-              if isinstance(sc_idx, int) and 1 <= sc_idx <= len(actual_timings):
-                  tc = fmt_chapter_time(float(actual_timings[sc_idx - 1]["scene_start"]))
-              else:
-                  tc = ch.get("timecode", "00:00")
-              chapters_lines.append(f"{tc} {ch.get('title', 'Chapter')}")
-          (out_dir / "output_chapters.txt").write_text("\n".join(chapters_lines) + "\n", encoding="utf-8")
-
-          # 4. Export RELEASE_CARD.md (English release metadata)
-          release_md = [
-              f"# Release Card: {video_title}",
-              "",
-              f"- **Project:** `{project_name}`",
-              f"- **Channel:** `{manifest.get('channel', '@Histoviva')}`",
-              f"- **Duration:** `{duration_sec:.2f}s` (`{fmt_chapter_time(duration_sec)}`)",
-              f"- **File Size:** `{size_mb:.1f} MB`",
-              f"- **Resolution / FPS:** `3840x2160 @ 24fps`",
-              "",
-              "## YouTube Chapters",
-              "",
-              *chapters_lines,
-              "",
+          import json, os, re
+          def clean_en(text, fallback=""):
+              if not text:
+                  return fallback
+              res = re.sub(r"[А-Яа-яЁё]+", "", str(text)).strip(" -–—|:;,.")
+              res = re.sub(r"\s{2,}", " ", res).strip()
+              return res if res else fallback
+          m = json.load(open("manifest.json", encoding="utf-8"))
+          out_file = open("final_output_name.txt", encoding="utf-8").read().strip()
+          qc = json.load(open("qc_report.json", encoding="utf-8")) if os.path.exists("qc_report.json") else {}
+          chapters = ""
+          ch_file = f"{os.path.splitext(out_file)[0]}_chapters.txt"
+          if os.path.exists(ch_file):
+              chapters = open(ch_file, encoding="utf-8").read()
+          seo = m.get("youtube_seo", {}) or {}
+          title_en = clean_en(seo.get("title_en") or seo.get("title"), out_file)
+          desc_en = clean_en(seo.get("description_en") or seo.get("description"),
+              "4K Ultra HD Atmospheric Ambience & Cinematic Soundscape for Deep Focus, Relaxation, and Sleep.")
+          tags_en = [clean_en(t) for t in seo.get("tags", []) if clean_en(t)]
+          if not tags_en:
+              tags_en = ["4K Ambience","Atmospheric Soundscape","Deep Focus","Sleep Sounds","Cinematic 4K"]
+          card = [
+              f"# RELEASE CARD: {title_en}", "",
+              f"- **Master File:** `{out_file}`",
+              f"- **Duration:** {qc.get('duration_formatted','N/A')}",
+              f"- **Integrated Loudness (EBU R128):** {qc.get('integrated_lufs','N/A')} LUFS",
+              "", "## YouTube Description", desc_en,
+              "", "## Timestamps (Chapters)", "```text", chapters.strip(), "```",
+              "", "## Tags", ", ".join(tags_en),
           ]
-          (out_dir / "RELEASE_CARD.md").write_text("\n".join(release_md), encoding="utf-8")
-
-          # 5. Shorts Factory ONLY if enabled in manifest
-          shorts_cfg = manifest.get("shorts_factory") or ui_montage.get("shorts_factory") or {}
-          raw_shorts_flag = (
-              shorts_cfg.get("enabled")
-              if isinstance(shorts_cfg, dict) and "enabled" in shorts_cfg
-              else manifest.get("generate_shorts", ui_montage.get("generate_shorts", render_cfg.get("generate_shorts", False)))
-          )
-          shorts_enabled = to_bool(raw_shorts_flag, default=False)
-
-          if shorts_enabled:
-              shorts_dir = out_dir / "shorts"
-              shorts_dir.mkdir(parents=True, exist_ok=True)
-
-              raw_hooks = shorts_cfg.get("hook_texts") or ui_montage.get("hook_texts") or []
-              fallback_hook = (
-                  shorts_cfg.get("hook_text")
-                  or ui_montage.get("hook_text")
-                  or "WAIT FOR THE 14TH SECOND..."
-              )
-              shorts_count = int(shorts_cfg.get("shorts_count") or ui_montage.get("shorts_count") or len(raw_hooks) or 3)
-              shorts_count = max(1, min(3, shorts_count))
-
-              offsets = [0.0, max(0.0, duration_sec * 0.35)] if shorts_count == 2 else [
-                  0.0,
-                  max(0.0, duration_sec * 0.35),
-                  max(0.0, duration_sec * 0.70),
-              ]
-              font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-
-              for i, start_t in enumerate(offsets[:shorts_count], 1):
-                  clip_len = min(30.0, max(5.0, duration_sec - start_t))
-                  short_out = shorts_dir / f"{project_name}_Short_0{i}.mp4"
-                  hook_str = (raw_hooks[i - 1] if i - 1 < len(raw_hooks) else fallback_hook).strip()
-
-                  vf_chain = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1"
-                  if hook_str:
-                      safe_text = (
-                          hook_str.replace("\\", "\\\\")
-                          .replace(":", "\\:")
-                          .replace("'", "\u2019")
-                          .replace("%", "\\%")
-                      )
-                      vf_chain += (
-                          f",drawtext=fontfile={font_path}:text='{safe_text}':"
-                          f"fontcolor=white:fontsize=54:line_spacing=10:"
-                          f"x=(w-text_w)/2:y=240:"
-                          f"box=1:boxcolor=black@0.68:boxborderw=24:"
-                          f"shadowcolor=black@0.85:shadowx=3:shadowy=3"
-                      )
-
-                  subprocess.run(
-                      [
-                          "ffmpeg", "-y",
-                          "-ss", f"{start_t:.2f}",
-                          "-t", f"{clip_len:.2f}",
-                          "-i", str(main_video),
-                          "-vf", vf_chain,
-                          "-c:v", "libx264", "-crf", "20", "-preset", "fast", "-pix_fmt", "yuv420p",
-                          "-c:a", "aac", "-b:a", "192k",
-                          str(short_out),
-                      ],
-                      check=True,
-                  )
-              print(f"✅ Generated {shorts_count} Shorts in output/shorts/")
-          else:
-              print("⏭️ Shorts Factory disabled by manifest settings — skipped.")
-
-          # 6. Lightweight 720p review copy (~60-80 MB)
-          preview_720p = out_dir / f"{project_name}_720p_preview.mp4"
-          subprocess.run(
-              [
-                  "ffmpeg", "-y",
-                  "-i", str(main_video),
-                  "-vf", "scale=1280:720",
-                  "-c:v", "libx264", "-crf", "24", "-preset", "veryfast", "-pix_fmt", "yuv420p",
-                  "-c:a", "aac", "-b:a", "128k",
-                  str(preview_720p),
-              ],
-              check=True,
-          )
-          preview_mb = preview_720p.stat().st_size / (1024 * 1024)
-          print(f"✅ All enabled artifacts and 720p preview ({preview_mb:.1f} MB) generated!")
+          open("RELEASE_CARD.md","w",encoding="utf-8").write("\n".join(card) + "\n")
           EOF
-
       - name: Upload Output Video, Shorts & Metadata to Google Drive
-        env:
-          GDRIVE_FOLDER_ID: ${{ env.EFFECTIVE_FOLDER_ID || secrets.GDRIVE_FOLDER_ID }}
+        if: github.event.inputs.preflight_only != 'true'
         run: |
-          if [ -z "$GDRIVE_FOLDER_ID" ]; then
-            echo "❌ GDRIVE_FOLDER_ID не задан для выгрузки!" >&2
-            exit 1
+          OUT_FILE=$(cat final_output_name.txt)
+          CHAPTERS_FILE=$(cat final_chapters_name.txt 2>/dev/null || echo "")
+          FOLDER_ID=$(jq -r '.cloud_export.target_folder_id // .gdriveFolderId // empty' manifest.json 2>/dev/null || true)
+          RCLONE_FLAGS=(--drive-chunk-size 128M --drive-upload-cutoff 128M --transfers 1 --checkers 2
+                        --tpslimit 2 --tpslimit-burst 4 --timeout 15m --contimeout 60s
+                        --retries 3 --low-level-retries 5 --stats 30s -v)
+          ROOT=(); DEST="gdrive:AetherFlow_Output/"
+          if [ -n "$FOLDER_ID" ]; then ROOT=(--drive-root-folder-id "$FOLDER_ID"); DEST="gdrive:"; fi
+          if [ -f "./$OUT_FILE" ]; then
+            echo "=== Uploading local master $OUT_FILE ==="
+            rclone copy "./$OUT_FILE" "$DEST" "${ROOT[@]}" "${RCLONE_FLAGS[@]}"
+            FILE_SIZE=$(du -h "./$OUT_FILE" | cut -f1)
+          elif [ -f "./output/$OUT_FILE" ]; then
+            rclone copy "./output/$OUT_FILE" "$DEST" "${ROOT[@]}" "${RCLONE_FLAGS[@]}"
+            FILE_SIZE=$(du -h "./output/$OUT_FILE" | cut -f1)
+          else
+            echo "Master was stream-uploaded by pipeline (rclone rcat) — skipping video upload."
+            SIZE_BYTES=$(rclone size "gdrive:$OUT_FILE" "${ROOT[@]}" --json 2>/dev/null | jq -r '.bytes // 0')
+            FILE_SIZE=$(numfmt --to=iec --suffix=B "$SIZE_BYTES" 2>/dev/null || echo "n/a")
           fi
-          rclone copy output/ "${GDRIVE_REMOTE}:_RENDER_OUTPUT_${PROJECT_NAME}/" \
-            --drive-root-folder-id "$GDRIVE_FOLDER_ID" \
-            --progress
-          echo "✅ Выгрузка в Google Drive завершена: _RENDER_OUTPUT_${PROJECT_NAME}"
-
+          [ -f "./$CHAPTERS_FILE" ] && rclone copy "./$CHAPTERS_FILE" "$DEST" "${ROOT[@]}" --tpslimit 2 -v
+          [ -f "RELEASE_CARD.md" ] && rclone copy "./RELEASE_CARD.md" "$DEST" "${ROOT[@]}" --tpslimit 2 -v
+          [ -f "qc_report.json" ] && rclone copy "./qc_report.json" "$DEST" "${ROOT[@]}" --tpslimit 2 -v
+          if [ -d "shorts_out" ] && [ "$(ls -A shorts_out 2>/dev/null)" ]; then
+            rclone copy "./shorts_out/" "${DEST}Shorts/" "${ROOT[@]}" --transfers 1 --tpslimit 2 -v
+          fi
+          DRIVE_LINK=$(rclone link "gdrive:$OUT_FILE" "${ROOT[@]}" 2>/dev/null || echo "")
+          QC_SUMMARY=$(jq -r '"\(.duration_formatted) • \(.integrated_lufs) LUFS"' qc_report.json 2>/dev/null || echo "OK")
+          SHORTS_COUNT=$(ls -1 shorts_out/*.mp4 2>/dev/null | wc -l | tr -d ' ')
+          echo "DRIVE_LINK=$DRIVE_LINK" >> $GITHUB_ENV
+          echo "FILE_SIZE=$FILE_SIZE" >> $GITHUB_ENV
+          echo "QC_SUMMARY=$QC_SUMMARY" >> $GITHUB_ENV
+          echo "SHORTS_COUNT=$SHORTS_COUNT" >> $GITHUB_ENV
+      - name: Upload QC artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: render-metadata
+          path: |
+            qc_report.json
+            RELEASE_CARD.md
+            *_chapters.txt
+            generated_shorts.txt
+          if-no-files-found: ignore
       - name: Send Telegram Notification
         if: always()
         env:
-          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           JOB_STATUS: ${{ job.status }}
+          PREFLIGHT: ${{ github.event.inputs.preflight_only }}
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          if [ -z "$TG_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
-            echo "ℹ️ Telegram secrets не заданы, пропускаем уведомление."
-            exit 0
-          fi
-          if [ "$JOB_STATUS" = "success" ]; then
-            MSG="✅ AetherFlow Render завершён: ${PROJECT_NAME:-output} (4K + 720p Preview + выбранные артефакты загружены на Google Drive)"
-          else
-            MSG="❌ AetherFlow Render упал (статус: ${JOB_STATUS}) для проекта ${PROJECT_NAME:-output}. Проверьте логи GitHub Actions."
-          fi
-          curl -sS --max-time 20 -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
-            -d "chat_id=${TG_CHAT_ID}" \
-            --data-urlencode "text=${MSG}" || echo "⚠️ Telegram API timeout (игнорируем, чтобы не ронять джобу)"
+          python3 - << 'EOF'
+          import os, time, urllib.request, urllib.parse
+          token = os.environ.get("TG_TOKEN","").strip()
+          chat = os.environ.get("TG_CHAT","").strip()
+          if not token or not chat:
+              print("Telegram secrets not set — skipping notification.")
+              raise SystemExit(0)
+          elapsed = int(time.time()) - int(os.environ.get("START_TS", str(int(time.time()))))
+          mins = elapsed // 60
+          status = os.environ.get("JOB_STATUS","unknown")
+          out = open("final_output_name.txt").read().strip() if os.path.exists("final_output_name.txt") else "video.mp4"
+          if os.environ.get("PREFLIGHT") == "true" and status == "success":
+              msg = f"🔍 Preflight пройден!\n✅ Все клипы и врезки найдены на Google Диске.\n⏱ {mins} мин"
+          elif status == "success":
+              msg = (f"✅ Мастер готов и прошёл Auto-QC!\n📁 {out} ({os.environ.get('FILE_SIZE','n/a')})\n"
+                     f"🎛 {os.environ.get('QC_SUMMARY','OK')}\n⏱ Сборка: {mins} мин\n"
+                     f"📱 Shorts: {os.environ.get('SHORTS_COUNT','0')} шт.")
+              link = os.environ.get("DRIVE_LINK","")
+              if link:
+                  msg += f"\n🔗 {link}"
+          else:
+              msg = f"❌ Ошибка сборки!\n⚠️ Статус: {status}\n⏱ Прошло: {mins} мин"
+          data = urllib.parse.urlencode({"chat_id": chat, "text": msg,
+                                         "disable_web_page_preview": "true"}).encode()
+          try:
+              urllib.request.urlopen(urllib.request.Request(
+                  f"https://api.telegram.org/bot{token}/sendMessage", data=data), timeout=20)
+          except Exception as e:
+              print("Telegram warning:", e)
+          EOF
