@@ -62,13 +62,15 @@ def resolve_asset(filename: str | None, work_dir: Path, folder_id: str | None) -
         return None
 
     base_name = Path(filename).name
+    stem = Path(base_name).stem
+    ext = Path(base_name).suffix
     name_variants = [base_name]
-    m = re.match(r"^(.*?)(\d+)([^\d]*)$", base_name)
+    m = re.match(r"^(.*?)(\d+)([^\d]*)$", stem)
     if m:
         prefix, digits, suffix = m.groups()
         num = int(digits)
         for pad in (2, 3, 1):
-            cand = f"{prefix}{num:0{pad}d}{suffix}"
+            cand = f"{prefix}{num:0{pad}d}{suffix}{ext}"
             if cand not in name_variants:
                 name_variants.append(cand)
 
@@ -190,7 +192,6 @@ def build_lower_third_filters(
     filters: list[str] = []
 
     if style == "ictv":
-        # Стиль #17 Факти ICTV: оранжевый верхний тег даты + тёмно-синяя металлическая основная плашка локации
         box_x = int(round(140 * scale_k))
         main_y = height - int(round(250 * scale_k))
         main_h = int(round(104 * scale_k))
@@ -228,7 +229,6 @@ def build_lower_third_filters(
         )
 
     elif style == "sky_news":
-        # Стиль #4 Sky News UK: матовая стеклянная графитовая лента + яркий красный квадратный акцент слева
         box_x = int(round(140 * scale_k))
         box_y = height - int(round(265 * scale_k))
         box_h = int(round(122 * scale_k))
@@ -273,7 +273,6 @@ def build_lower_third_filters(
             )
 
     else:
-        # Стиль #7 Россия 24 (по умолчанию): красный прямоугольный тег даты слева + синий основной блок локации справа
         box_x = int(round(140 * scale_k))
         box_y = height - int(round(255 * scale_k))
         box_h = int(round(108 * scale_k))
@@ -505,7 +504,6 @@ def prepare_scene(
                 "setpts=PTS-STARTPTS",
             ]
 
-    # --- КИНЕМАТОГРАФИЧНЫЕ ОВЕРЛЕИ ---
     if "warm_glow" in overlays:
         v_filters.append(
             "eq=gamma=1.03:contrast=1.03:saturation=1.10,"
@@ -826,3 +824,20 @@ def main() -> None:
             in_cf_dur = chunk[0][2]
             in_trans = chunk[0][3]
             chunk_for_merge = [(chunk[0][0], chunk[0][1], 0.0, "cut")] + chunk[1:]
+            batch_out = batches_dir / f"batch_{b_idx:02d}.mkv"
+            batch_dur = merge_segment_group(
+                chunk_for_merge, batch_out, fps=fps, crf=15, preset="superfast"
+            )
+            batch_segments.append((batch_out, batch_dur, in_cf_dur, in_trans))
+            print(f"✅ Batch {b_idx + 1} merged ({len(chunk)} scenes, {batch_dur:.3f}s)")
+
+        total_dur = merge_segment_group(
+            batch_segments, raw_master, fps=fps, crf=crf, preset="faster"
+        )
+
+    finalize_audio_and_container(raw_master, final_video, audio_bitrate, loudnorm)
+    print(f"✅ Render complete: {final_video} ({total_dur:.3f}s)")
+
+
+if __name__ == "__main__":
+    main()
