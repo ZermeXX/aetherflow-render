@@ -1,842 +1,502 @@
+import argparse
 import json
+import math
 import os
-import re
+from pathlib import Path
 import shutil
 import subprocess
-import sys
-from pathlib import Path
-
-BATCH_SIZE = 6
-BREATH_PAUSE_SEC = 0.35  # Пауза дыхания диктора после фразы (сек)
-
-VALID_XFADE_TRANSITIONS = {
-    "fade", "wipeleft", "wiperight", "wipeup", "wipedown",
-    "slideleft", "slideright", "slideup", "slidedown",
-    "circlecrop", "rectcrop", "distance", "fadeblack", "fadewhite",
-    "radial", "smoothleft", "smoothright", "smoothup", "smoothdown",
-    "circleopen", "circleclose", "vertopen", "vertclose",
-    "horzopen", "horzclose", "dissolve", "pixelize",
-    "diagtl", "diagtr", "diagbl", "diagbr",
-    "hlslice", "hrslice", "vuslice", "vdslice",
-    "hblur", "fadegrays", "wipetl", "wipetr", "wipebl", "wipebr",
-    "squeezeh", "squeezev", "zoomin",
-}
+from PIL import Image, ImageDraw, ImageFont
 
 
-def run_cmd(cmd: list[str]) -> None:
-    print("▶", " ".join(cmd))
+def _ease_out_cubic(t: float) -> float:
+    t = max(0.0, min(1.0, t))
+    return 1.0 - (1.0 - t) ** 3
+
+
+def _ease_in_cubic(t: float) -> float:
+    t = max(0.0, min(1.0, t))
+    return t ** 3
+
+
+def _load_font(size: int, bold: bool = True):
+    candidates = [
+        "/usr/share/fonts/truetype/montserrat/Montserrat-Bold.ttf" if bold else "/usr/share/fonts/truetype/montserrat/Montserrat-SemiBold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "C:/Windows/Fonts/Montserrat-Bold.ttf" if bold else "C:/Windows/Fonts/Montserrat-SemiBold.ttf",
+        "C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return ImageFont.truetype(path, size=size)
+    return ImageFont.load_default()
+
+
+def _parse_text_overlay(raw_text: str) -> tuple[str, str]:
+    if not raw_text:
+        return "", ""
+    parts = [p.strip() for p in raw_text.split("•") if p.strip()]
+    if len(parts) >= 3:
+        main_line = f"{parts[0]} • {parts[1]}".upper()
+        sub_line = " • ".join(parts[2:]).upper()
+        return main_line, sub_line
+    if len(parts) == 2:
+        return parts[0].upper(), parts[1].upper()
+    return raw_text.upper(), ""
+
+
+def _make_vertical_gradient(
+    width: int,
+    height: int,
+    top_rgb: tuple[int, int, int],
+    bot_rgb: tuple[int, int, int],
+    alpha: int = 255,
+) -> Image.Image:
+    grad = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    px = grad.load()
+    for y in range(height):
+        ratio = y / max(1, height - 1)
+        r = int(top_rgb[0] + (bot_rgb[0] - top_rgb[0]) * ratio)
+        g = int(top_rgb[1] + (bot_rgb[1] - top_rgb[1]) * ratio)
+        b = int(top_rgb[2] + (bot_rgb[2] - top_rgb[2]) * ratio)
+        for x in range(width):
+            px[x, y] = (r, g, b, alpha)
+    return grad
+
+
+def render_lower_third_frame(
+    frame_w: int,
+    frame_h: int,
+    local_t: float,
+    main_text: str,
+    sub_text: str,
+    emblem_path: str = "aether_art_150x150.png",
+    show_start: float = 0.5,
+    show_end: float = 5.5,
+    anim_dur: float = 0.55,
+) -> Image.Image:
+    canvas = Image.new("RGBA", (frame_w, frame_h), (0, 0, 0, 0))
+    if not main_text or local_t < show_start or local_t > show_end:
+        return canvas
+
+    scale = frame_h / 2160.0
+    margin_x = int(round(120 * scale))
+    margin_bottom = int(round(96 * scale))
+    bar_w = frame_w - 2 * margin_x
+
+    top_h = int(round(92 * scale))
+    sub_h = int(round(52 * scale))
+    total_h = top_h + sub_h
+    badge_size = total_h
+
+    base_x = margin_x
+    base_y = frame_h - margin_bottom - total_h
+
+    appear_end = show_start + anim_dur
+    disappear_start = show_end - anim_dur
+
+    if local_t < appear_end:
+        p = _ease_out_cubic((local_t - show_start) / anim_dur)
+        wipe_p = _ease_out_cubic(max(0.0, (local_t - (show_start + 0.12)) / max(0.05, anim_dur - 0.12)))
+        badge_y_offset = int(round((1.0 - p) * 38 * scale))
+        badge_alpha = int(round(255 * p))
+        text_x_offset = int(round((1.0 - wipe_p) * 28 * scale))
+        text_alpha = int(round(255 * wipe_p))
+        sheen_pos = None
+    elif local_t <= disappear_start:
+        p = 1.0
+        wipe_p = 1.0
+        badge_y_offset = 0
+        badge_alpha = 255
+        text_x_offset = 0
+        text_alpha = 255
+        hold_elapsed = local_t - appear_end
+        sheen_pos = (hold_elapsed / 1.4) if hold_elapsed <= 1.4 else None
+    else:
+        out_p = _ease_in_cubic((local_t - disappear_start) / anim_dur)
+        p = 1.0 - out_p
+        wipe_p = 1.0 - _ease_in_cubic(min(1.0, out_p * 1.15))
+        badge_y_offset = int(round(out_p * 28 * scale))
+        badge_alpha = int(round(255 * p))
+        text_x_offset = int(round(out_p * 20 * scale))
+        text_alpha = int(round(255 * max(0.0, 1.0 - out_p * 1.4)))
+        sheen_pos = None
+
+    panel_x0 = base_x + badge_size
+    panel_full_w = max(1, bar_w - badge_size)
+    panel_cur_w = max(0, int(round(panel_full_w * wipe_p)))
+
+    if panel_cur_w > 2:
+        panel_layer = Image.new("RGBA", (panel_full_w, total_h), (0, 0, 0, 0))
+        p_draw = ImageDraw.Draw(panel_layer, "RGBA")
+
+        p_draw.rectangle([0, 0, panel_full_w, top_h], fill=(10, 14, 18, 218))
+        p_draw.rectangle([0, top_h, panel_full_w, total_h], fill=(7, 10, 14, 236))
+        p_draw.rectangle([0, top_h - 1, panel_full_w, top_h + 1], fill=(255, 255, 255, 42))
+
+        border_w = max(2, int(round(2 * scale)))
+        p_draw.rectangle([0, 0, panel_full_w, border_w], fill=(245, 158, 11, 160))
+        p_draw.rectangle([0, total_h - border_w, panel_full_w, total_h], fill=(153, 27, 27, 200))
+
+        amber_w = max(8, int(round(14 * scale)))
+        p_draw.rectangle([panel_full_w - amber_w, 0, panel_full_w, total_h], fill=(245, 158, 11, 235))
+
+        if sheen_pos is not None:
+            sweep_w = int(round(220 * scale))
+            sweep_x = int(round(-sweep_w + sheen_pos * (panel_full_w + sweep_w * 2)))
+            sheen = Image.new("RGBA", (sweep_w, total_h), (0, 0, 0, 0))
+            s_draw = ImageDraw.Draw(sheen, "RGBA")
+            for i in range(sweep_w):
+                dist = abs(i - sweep_w / 2) / (sweep_w / 2)
+                a = int(round(36 * max(0.0, 1.0 - dist) ** 2))
+                s_draw.line([(i, 0), (i, total_h)], fill=(255, 255, 255, a))
+            panel_layer.alpha_composite(sheen, (sweep_x, 0))
+
+        font_main = _load_font(int(round(46 * scale)), bold=True)
+        font_sub = _load_font(int(round(25 * scale)), bold=True)
+        txt_layer = Image.new("RGBA", (panel_full_w, total_h), (0, 0, 0, 0))
+        t_draw = ImageDraw.Draw(txt_layer, "RGBA")
+
+        pad_x = int(round(34 * scale)) + text_x_offset
+        main_y = int(round((top_h - 46 * scale) / 2)) - int(round(2 * scale))
+        t_draw.text((pad_x, main_y), main_text, font=font_main, fill=(255, 255, 255, text_alpha))
+
+        if sub_text:
+            sub_y = top_h + int(round((sub_h - 25 * scale) / 2)) - int(round(2 * scale))
+            t_draw.text((pad_x, sub_y), sub_text, font=font_sub, fill=(245, 158, 11, text_alpha))
+
+        panel_layer.alpha_composite(txt_layer, (0, 0))
+        cropped_panel = panel_layer.crop((0, 0, panel_cur_w, total_h))
+        canvas.alpha_composite(cropped_panel, (panel_x0, base_y + badge_y_offset))
+
+    if badge_alpha > 0:
+        badge_layer = _make_vertical_gradient(
+            badge_size,
+            badge_size,
+            top_rgb=(153, 27, 27),
+            bot_rgb=(127, 29, 29),
+            alpha=badge_alpha,
+        )
+        b_draw = ImageDraw.Draw(badge_layer, "RGBA")
+        b_border = max(2, int(round(3 * scale)))
+        b_draw.rectangle(
+            [0, 0, badge_size - 1, badge_size - 1],
+            outline=(245, 158, 11, int(round(190 * (badge_alpha / 255.0)))),
+            width=b_border,
+        )
+
+        if emblem_path and os.path.exists(emblem_path):
+            emblem = Image.open(emblem_path).convert("RGBA")
+            ew, eh = emblem.size
+            if eh > ew * 1.15:
+                emblem = emblem.crop((0, 0, ew, ew))
+            target_icon_sz = int(round(badge_size * 0.78))
+            emblem = emblem.resize((target_icon_sz, target_icon_sz), Image.Resampling.LANCZOS)
+            if badge_alpha < 255:
+                r, g, b, a = emblem.split()
+                a = a.point(lambda v: int(round(v * (badge_alpha / 255.0))))
+                emblem = Image.merge("RGBA", (r, g, b, a))
+            ix = (badge_size - target_icon_sz) // 2
+            iy = (badge_size - target_icon_sz) // 2
+            badge_layer.alpha_composite(emblem, (ix, iy))
+
+        canvas.alpha_composite(badge_layer, (base_x, base_y + badge_y_offset))
+
+    return canvas
+
+
+def apply_lower_third_to_clip(
+    input_video_path: str,
+    output_video_path: str,
+    text_overlay: str,
+    fps: int = 24,
+    emblem_path: str = "aether_art_150x150.png",
+    show_start: float = 0.5,
+    show_end: float = 5.5,
+    anim_dur: float = 0.55,
+    work_dir: str = "./_overlay_tmp",
+) -> str:
+    main_line, sub_line = _parse_text_overlay(text_overlay)
+    if not main_line:
+        return input_video_path
+
+    probe_cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height",
+        "-of",
+        "csv=p=0:s=x",
+        input_video_path,
+    ]
+    res_str = subprocess.check_output(probe_cmd, text=True).strip()
+    w, h = map(int, res_str.split("x"))
+
+    Path(work_dir).mkdir(parents=True, exist_ok=True)
+    start_frame = max(0, int(math.floor(show_start * fps)))
+    end_frame = int(math.ceil(show_end * fps))
+
+    png_pattern = os.path.join(work_dir, "lt_%05d.png")
+    for idx, f_idx in enumerate(range(start_frame, end_frame + 1)):
+        t_sec = f_idx / float(fps)
+        img = render_lower_third_frame(
+            frame_w=w,
+            frame_h=h,
+            local_t=t_sec,
+            main_text=main_line,
+            sub_text=sub_line,
+            emblem_path=emblem_path,
+            show_start=show_start,
+            show_end=show_end,
+            anim_dur=anim_dur,
+        )
+        img.save(os.path.join(work_dir, f"lt_{idx:05d}.png"))
+
+    first_frame_sec = start_frame / float(fps)
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        input_video_path,
+        "-framerate",
+        str(fps),
+        "-start_number",
+        "0",
+        "-i",
+        png_pattern,
+        "-filter_complex",
+        f"[1:v]setpts=PTS-STARTPTS+{first_frame_sec}/TB[ovr];[0:v][ovr]overlay=0:0:eof_action=pass[vout]",
+        "-map",
+        "[vout]",
+        "-map",
+        "0:a?",
+        "-c:v",
+        "libx264",
+        "-crf",
+        "18",
+        "-preset",
+        "veryfast",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "copy",
+        output_video_path,
+    ]
     subprocess.run(cmd, check=True)
+    return output_video_path
 
 
-def get_media_duration(media_path: Path) -> float:
-    cmd = [
-        "ffprobe",
-        "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        str(media_path),
-    ]
-    res = subprocess.run(cmd, capture_output=True, text=True)
-    try:
-        val = float(res.stdout.strip())
-        return val if val > 0.05 else 0.0
-    except ValueError:
-        return 0.0
-
-
-def has_audio_stream(media_path: Path) -> bool:
-    cmd = [
-        "ffprobe",
-        "-v", "error",
-        "-select_streams", "a",
-        "-show_entries", "stream=index",
-        "-of", "csv=p=0",
-        str(media_path),
-    ]
-    res = subprocess.run(cmd, capture_output=True, text=True)
-    return bool(res.stdout.strip())
-
-
-def resolve_asset(filename: str | None, work_dir: Path, folder_id: str | None) -> Path | None:
+def _resolve_media_path(filename: str, assets_dir: Path) -> Path | None:
     if not filename:
         return None
-
-    base_name = Path(filename).name
-    stem = Path(base_name).stem
-    ext = Path(base_name).suffix
-    name_variants = [base_name]
-    m = re.match(r"^(.*?)(\d+)([^\d]*)$", stem)
-    if m:
-        prefix, digits, suffix = m.groups()
-        num = int(digits)
-        for pad in (2, 3, 1):
-            cand = f"{prefix}{num:0{pad}d}{suffix}{ext}"
-            if cand not in name_variants:
-                name_variants.append(cand)
-
-    for variant in name_variants:
-        for path in (
-            work_dir / variant,
-            Path("assets") / variant,
-            Path("input") / variant,
-            Path(variant),
-        ):
-            if path.is_file():
-                return path
-
-    if folder_id:
-        remote = os.getenv("GDRIVE_REMOTE", "gdrive")
-        for variant in name_variants:
-            dest = work_dir / variant
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            res = subprocess.run(
-                [
-                    "rclone", "copyto",
-                    f"{remote}:{variant}",
-                    str(dest),
-                    "--drive-root-folder-id", folder_id,
-                ],
-                capture_output=True,
-                text=True,
-            )
-            if res.returncode == 0 and dest.is_file():
-                print(f"📥 Скачан файл: {variant}")
-                return dest
-
+    direct = assets_dir / filename
+    if direct.exists():
+        return direct
+    fallback = Path.cwd() / filename
+    if fallback.exists():
+        return fallback
     return None
 
 
-def parse_overlay_config(manifest: dict) -> tuple[set[str], str]:
-    """Возвращает (набор активных оверлеев, выбранный стиль плашки lower_thirds)."""
-    ui_montage = (manifest.get("studio_ui_presets") or {}).get("tab_1_montage") or {}
-    raw_overlays = manifest.get("overlays")
-    if raw_overlays is None:
-        raw_overlays = ui_montage.get("overlays") or []
-
-    enabled: set[str] = set()
-    raw_style = str(
-        manifest.get("lower_third_style")
-        or ui_montage.get("lower_third_style")
-        or "rossiya24"
-    ).strip().lower()
-
-    def register_key(raw_key: str) -> None:
-        k = raw_key.strip().lower()
-        if any(w in k for w in ("grain", "35mm", "film", "vignette", "зерн", "пленк", "плёнк")):
-            enabled.add("film_grain")
-        if any(w in k for w in ("glow", "halation", "bloom", "warm", "свечен")):
-            enabled.add("warm_glow")
-        if any(w in k for w in ("particle", "snow", "spark", "dust", "частиц", "искр", "снег")):
-            enabled.add("particles")
-        if any(w in k for w in ("lower", "third", "date", "location", "титр", "дат", "локац")):
-            enabled.add("lower_thirds")
-
-    if isinstance(raw_overlays, dict):
-        for k, v in raw_overlays.items():
-            if bool(v):
-                register_key(str(k))
-    elif isinstance(raw_overlays, list):
-        for item in raw_overlays:
-            if isinstance(item, str):
-                register_key(item)
-            elif isinstance(item, dict):
-                if item.get("enabled", True):
-                    ident = item.get("id") or item.get("type") or item.get("name") or ""
-                    register_key(str(ident))
-                    if item.get("style"):
-                        raw_style = str(item["style"]).strip().lower()
-
-    if "ictv" in raw_style or "факт" in raw_style:
-        lt_style = "ictv"
-    elif "sky" in raw_style:
-        lt_style = "sky_news"
-    else:
-        lt_style = "rossiya24"
-
-    return enabled, lt_style
+def _get_media_duration_sec(media_path: Path) -> float:
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(media_path),
+    ]
+    out = subprocess.check_output(cmd, text=True).strip()
+    return float(out)
 
 
-def escape_drawtext(text: str) -> str:
-    return (
-        text.replace("\\", "\\\\")
-        .replace(":", "\\:")
-        .replace("'", "\u2019")
-        .replace("%", "\\%")
-        .replace(",", "\\,")
-    )
-
-
-def build_lower_third_filters(
-    hist_date: str,
-    hist_loc: str,
-    style: str,
-    width: int,
-    height: int,
-    lt_start: float,
-    lt_end: float,
-) -> list[str]:
-    """Строит фильтры FFmpeg для новостных плашек: rossiya24, ictv, sky_news."""
-    font_bold = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-    font_reg = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-    scale_k = width / 3840.0
-    max_bar_w = width - int(round(280 * scale_k))
-
-    alpha_expr = (
-        f"if(lt(t-{lt_start:.3f}\\,0.35)\\,(t-{lt_start:.3f})/0.35\\,"
-        f"if(gt(t\\,{lt_end:.3f}-0.35)\\,({lt_end:.3f}-t)/0.35\\,1))"
-    )
-    enable_expr = f"between(t,{lt_start:.3f},{lt_end:.3f})"
-
-    date_up = hist_date.upper()
-    loc_up = hist_loc.upper()
-    filters: list[str] = []
-
-    if style == "ictv":
-        box_x = int(round(140 * scale_k))
-        main_y = height - int(round(250 * scale_k))
-        main_h = int(round(104 * scale_k))
-        accent_w = max(6, int(round(16 * scale_k)))
-        text_x = box_x + accent_w + int(round(32 * scale_k))
-
-        main_text = loc_up if loc_up else date_up
-        main_w = min(max_bar_w, max(int(round(620 * scale_k)), int(round((len(main_text) * 26 + 110) * scale_k))))
-
-        if date_up and loc_up:
-            tag_h = int(round(52 * scale_k))
-            tag_y = main_y - tag_h
-            tag_w = min(main_w, max(int(round(260 * scale_k)), int(round((len(date_up) * 21 + 64) * scale_k))))
-            filters.append(
-                f"drawbox=x={box_x}:y={tag_y}:w={tag_w}:h={tag_h}:color=0xd97706@0.96:t=fill:enable='{enable_expr}'"
-            )
-            filters.append(
-                f"drawtext=fontfile={font_bold}:text='{escape_drawtext(date_up)}':"
-                f"fontcolor=white:fontsize={max(16, int(round(30 * scale_k)))}:"
-                f"x={box_x + int(round(28 * scale_k))}:y={tag_y + int(round(11 * scale_k))}:"
-                f"alpha='{alpha_expr}':enable='{enable_expr}'"
-            )
-
-        filters.append(
-            f"drawbox=x={box_x}:y={main_y}:w={main_w}:h={main_h}:color=0x0f172a@0.90:t=fill:enable='{enable_expr}'"
-        )
-        filters.append(
-            f"drawbox=x={box_x}:y={main_y}:w={accent_w}:h={main_h}:color=0xf59e0b@0.98:t=fill:enable='{enable_expr}'"
-        )
-        filters.append(
-            f"drawtext=fontfile={font_bold}:text='{escape_drawtext(main_text)}':"
-            f"fontcolor=white:fontsize={max(20, int(round(44 * scale_k)))}:"
-            f"x={text_x}:y={main_y + int(round(30 * scale_k))}:"
-            f"alpha='{alpha_expr}':enable='{enable_expr}'"
-        )
-
-    elif style == "sky_news":
-        box_x = int(round(140 * scale_k))
-        box_y = height - int(round(265 * scale_k))
-        box_h = int(round(122 * scale_k))
-        red_w = int(round(112 * scale_k))
-        text_x = box_x + red_w + int(round(34 * scale_k))
-
-        top_line = date_up if date_up else loc_up
-        sub_line = hist_loc if (date_up and hist_loc) else ""
-        longest = max(len(top_line) * 25, len(sub_line) * 19)
-        total_w = min(max_bar_w, max(int(round(680 * scale_k)), red_w + int(round((longest + 90) * scale_k))))
-
-        filters.append(
-            f"drawbox=x={box_x}:y={box_y}:w={total_w}:h={box_h}:color=0x1e293b@0.82:t=fill:enable='{enable_expr}'"
-        )
-        filters.append(
-            f"drawbox=x={box_x}:y={box_y}:w={red_w}:h={box_h}:color=0xe11d48@0.95:t=fill:enable='{enable_expr}'"
-        )
-        filters.append(
-            f"drawbox=x={box_x + red_w}:y={box_y}:w={total_w - red_w}:h={max(2, int(round(4 * scale_k)))}:"
-            f"color=white@0.35:t=fill:enable='{enable_expr}'"
-        )
-
-        if sub_line:
-            filters.append(
-                f"drawtext=fontfile={font_bold}:text='{escape_drawtext(top_line)}':"
-                f"fontcolor=white:fontsize={max(18, int(round(42 * scale_k)))}:"
-                f"x={text_x}:y={box_y + int(round(22 * scale_k))}:"
-                f"alpha='{alpha_expr}':enable='{enable_expr}'"
-            )
-            filters.append(
-                f"drawtext=fontfile={font_reg}:text='{escape_drawtext(sub_line)}':"
-                f"fontcolor=0xe2e8f0:fontsize={max(15, int(round(32 * scale_k)))}:"
-                f"x={text_x}:y={box_y + int(round(72 * scale_k))}:"
-                f"alpha='{alpha_expr}':enable='{enable_expr}'"
-            )
-        else:
-            filters.append(
-                f"drawtext=fontfile={font_bold}:text='{escape_drawtext(top_line)}':"
-                f"fontcolor=white:fontsize={max(20, int(round(44 * scale_k)))}:"
-                f"x={text_x}:y={box_y + int(round(38 * scale_k))}:"
-                f"alpha='{alpha_expr}':enable='{enable_expr}'"
-            )
-
-    else:
-        box_x = int(round(140 * scale_k))
-        box_y = height - int(round(255 * scale_k))
-        box_h = int(round(108 * scale_k))
-        stripe_h = max(4, int(round(8 * scale_k)))
-
-        if date_up and loc_up:
-            red_w = max(int(round(260 * scale_k)), int(round((len(date_up) * 25 + 68) * scale_k)))
-            blue_w = max(int(round(520 * scale_k)), int(round((len(loc_up) * 26 + 84) * scale_k)))
-            if red_w + blue_w > max_bar_w:
-                blue_w = max(int(round(360 * scale_k)), max_bar_w - red_w)
-
-            filters.append(
-                f"drawbox=x={box_x}:y={box_y}:w={red_w}:h={box_h}:color=0xdc2626@0.95:t=fill:enable='{enable_expr}'"
-            )
-            filters.append(
-                f"drawbox=x={box_x + red_w}:y={box_y}:w={blue_w}:h={box_h}:color=0x1e3a8a@0.92:t=fill:enable='{enable_expr}'"
-            )
-            filters.append(
-                f"drawbox=x={box_x + red_w}:y={box_y + box_h - stripe_h}:w={blue_w}:h={stripe_h}:"
-                f"color=0x3b82f6@0.95:t=fill:enable='{enable_expr}'"
-            )
-            filters.append(
-                f"drawtext=fontfile={font_bold}:text='{escape_drawtext(date_up)}':"
-                f"fontcolor=white:fontsize={max(18, int(round(40 * scale_k)))}:"
-                f"x={box_x + int(round(32 * scale_k))}:y={box_y + int(round(34 * scale_k))}:"
-                f"alpha='{alpha_expr}':enable='{enable_expr}'"
-            )
-            filters.append(
-                f"drawtext=fontfile={font_bold}:text='{escape_drawtext(loc_up)}':"
-                f"fontcolor=white:fontsize={max(18, int(round(42 * scale_k)))}:"
-                f"x={box_x + red_w + int(round(36 * scale_k))}:y={box_y + int(round(33 * scale_k))}:"
-                f"alpha='{alpha_expr}':enable='{enable_expr}'"
-            )
-        else:
-            single_text = date_up if date_up else loc_up
-            red_w = max(8, int(round(22 * scale_k)))
-            blue_w = min(max_bar_w - red_w, max(int(round(520 * scale_k)), int(round((len(single_text) * 26 + 84) * scale_k))))
-            filters.append(
-                f"drawbox=x={box_x}:y={box_y}:w={red_w}:h={box_h}:color=0xdc2626@0.95:t=fill:enable='{enable_expr}'"
-            )
-            filters.append(
-                f"drawbox=x={box_x + red_w}:y={box_y}:w={blue_w}:h={box_h}:color=0x1e3a8a@0.92:t=fill:enable='{enable_expr}'"
-            )
-            filters.append(
-                f"drawbox=x={box_x + red_w}:y={box_y + box_h - stripe_h}:w={blue_w}:h={stripe_h}:"
-                f"color=0x3b82f6@0.95:t=fill:enable='{enable_expr}'"
-            )
-            filters.append(
-                f"drawtext=fontfile={font_bold}:text='{escape_drawtext(single_text)}':"
-                f"fontcolor=white:fontsize={max(18, int(round(42 * scale_k)))}:"
-                f"x={box_x + red_w + int(round(34 * scale_k))}:y={box_y + int(round(33 * scale_k))}:"
-                f"alpha='{alpha_expr}':enable='{enable_expr}'"
-            )
-
-    return filters
-
-
-def get_normalized_scenes(manifest: dict) -> list[dict]:
-    raw_scenes = (
-        manifest.get("timeline")
-        or manifest.get("scenes")
-        or manifest.get("timeline_slots")
-        or []
-    )
-    normalized = []
-
-    for item in raw_scenes:
-        scene = dict(item)
-        assets = scene.get("assets") or {}
-        vid_proc = scene.get("video_processing") or {}
-        aud_proc = scene.get("audio_processing") or {}
-        trans_in = vid_proc.get("transition_in") or {}
-        trans_out = vid_proc.get("transition_out") or {}
-
-        video_file = (
-            scene.get("file_name")
-            or scene.get("video_file")
-            or assets.get("video_file")
-            or assets.get("image_reference")
-        )
-        voice_file = (
-            scene.get("voiceover_file")
-            or scene.get("audio_file")
-            or assets.get("voiceover_file")
-        )
-
-        scene["file_name"] = video_file
-        scene["video_file"] = video_file
-        if voice_file:
-            scene["voiceover_file"] = voice_file
-            scene["audio_file"] = voice_file
-
-        if "transition" not in scene and trans_in:
-            scene["transition"] = trans_in.get("type", "cut")
-            scene["transition_duration"] = float(trans_in.get("duration_sec", 0.0))
-
-        if "transition_out_type" not in scene and trans_out:
-            scene["transition_out_type"] = trans_out.get("type", "none")
-            scene["transition_out_duration"] = float(trans_out.get("duration_sec", 0.0))
-
-        if "mute_audio" not in scene and "video_ambient_mute" in aud_proc:
-            scene["mute_audio"] = bool(aud_proc["video_ambient_mute"])
-        if "ambient_gain_db" not in scene and "video_ambient_gain_db" in aud_proc:
-            scene["ambient_gain_db"] = float(aud_proc["video_ambient_gain_db"])
-        if "voiceover_gain_db" not in scene and "voiceover_gain_db" in aud_proc:
-            scene["voiceover_gain_db"] = float(aud_proc["voiceover_gain_db"])
-
-        normalized.append(scene)
-
-    return normalized
-
-
-def prepare_scene(
-    scene: dict,
-    idx: int,
-    width: int,
-    height: int,
+def _prepare_segment(
+    entry: dict,
+    assets_dir: Path,
+    temp_dir: Path,
+    out_w: int,
+    out_h: int,
     fps: int,
-    folder_id: str | None,
-    overlays: set[str],
-    lt_style: str,
-) -> tuple[Path, float, float, float]:
-    assets = scene.get("assets") or {}
-    video_name = (
-        scene.get("file_name")
-        or scene.get("video_file")
-        or assets.get("video_file")
-        or assets.get("image_reference")
-    )
-    if not video_name:
-        raise KeyError(f"В сцене #{idx + 1} не указано имя видеофайла")
+    lt_cfg: dict,
+) -> Path:
+    idx = int(entry.get("scene_index", 0))
+    raw_vid_name = entry.get("video_file") or entry.get("file_name") or ""
+    raw_voice_name = entry.get("voiceover_file") or entry.get("audio_file") or ""
+    vid_path = _resolve_media_path(raw_vid_name, assets_dir)
+    if vid_path is None:
+        raise FileNotFoundError(f"Video file not found for scene {idx}: {raw_vid_name}")
 
-    voice_name = (
-        scene.get("voiceover_file")
-        or scene.get("audio_file")
-        or assets.get("voiceover_file")
-    )
+    voice_path = _resolve_media_path(raw_voice_name, assets_dir)
+    target_dur = float(entry.get("duration") or _get_media_duration_sec(vid_path))
+    if voice_path is not None and entry.get("voiceover_file"):
+        v_dur = _get_media_duration_sec(voice_path)
+        pad = float(entry.get("voice_start", 0.2)) + 0.35
+        target_dur = max(target_dur, v_dur + pad)
 
-    trans_type = str(scene.get("transition") or "cut").strip().lower()
-    cf_dur = float(scene.get("transition_duration") or 0.0)
-    if trans_type == "cut" or cf_dur <= 0.0:
-        cf_dur = 0.0
+    base_clip = temp_dir / f"seg_{idx:02d}_base.mp4"
+    ambient_gain_db = float(entry.get("ambient_gain_db", -18.0))
+    mute_video_audio = bool(entry.get("mute_audio", False))
 
-    cf_frames = int(round(cf_dur * fps)) if (idx > 0 and cf_dur > 0.0) else 0
-    cf_dur = cf_frames / float(fps)
-    lead_in_ms = int(round(cf_dur * 1000))
+    vf_chain = f"scale={out_w}:{out_h}:force_original_aspect_ratio=decrease,pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2,fps={fps},setsar=1"
 
-    work_dir = Path("build/scenes")
-    work_dir.mkdir(parents=True, exist_ok=True)
-
-    src_video = resolve_asset(video_name, work_dir, folder_id)
-    if not src_video or not src_video.is_file():
-        raise FileNotFoundError(f"Не найден видеофайл для сцены #{idx + 1}: {video_name}")
-
-    src_voice = resolve_asset(voice_name, work_dir, folder_id) if voice_name else None
-    is_image = src_video.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}
-
-    manifest_dur = float(scene.get("duration_sec") or scene.get("duration") or 8.0)
-    real_voice_dur = get_media_duration(src_voice) if (src_voice and src_voice.is_file()) else 0.0
-
-    if real_voice_dur > 0.0:
-        raw_target_dur = cf_dur + real_voice_dur + BREATH_PAUSE_SEC
-    else:
-        raw_target_dur = max(manifest_dur, cf_dur + 1.0)
-
-    exact_frames = max(fps, int(round(raw_target_dur * fps)))
-    target_dur = exact_frames / float(fps)
-
-    real_video_dur = target_dur if is_image else get_media_duration(src_video)
-    if real_video_dur <= 0.05:
-        real_video_dur = target_dur
-
-    out_path = work_dir / f"norm_{idx + 1:03d}.mkv"
-
-    cmd = ["ffmpeg", "-y"]
-    speed_factor = 1.0
-
-    if is_image:
-        cmd += ["-loop", "1", "-t", f"{target_dur:.6f}", "-i", str(src_video)]
-        v_filters = [
-            "setpts=PTS-STARTPTS",
-            f"scale={width}:{height}:force_original_aspect_ratio=decrease",
-            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black",
-            f"fps={fps}",
-            "setsar=1",
-            "format=yuv420p",
+    if voice_path is not None and not mute_video_audio:
+        filter_complex = (
+            f"[0:v]{vf_chain},trim=duration={target_dur:.3f},setpts=PTS-STARTPTS[v];"
+            f"[0:a]volume={ambient_gain_db}dB,apad,atrim=0:{target_dur:.3f},asetpts=PTS-STARTPTS[amb];"
+            f"[1:a]volume=1.0,adelay=200|200,apad,atrim=0:{target_dur:.3f},asetpts=PTS-STARTPTS[vox];"
+            f"[amb][vox]amix=inputs=2:duration=first:dropout_transition=0.2[aout]"
+        )
+        cmd = [
+            "ffmpeg", "-y",
+            "-stream_loop", "-1", "-i", str(vid_path),
+            "-i", str(voice_path),
+            "-filter_complex", filter_complex,
+            "-map", "[v]", "-map", "[aout]",
+            "-c:v", "libx264", "-crf", "18", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "320k", "-ar", "48000", "-ac", "2",
+            str(base_clip),
+        ]
+    elif voice_path is not None:
+        filter_complex = (
+            f"[0:v]{vf_chain},trim=duration={target_dur:.3f},setpts=PTS-STARTPTS[v];"
+            f"[1:a]volume=1.0,adelay=200|200,apad,atrim=0:{target_dur:.3f},asetpts=PTS-STARTPTS[aout]"
+        )
+        cmd = [
+            "ffmpeg", "-y",
+            "-stream_loop", "-1", "-i", str(vid_path),
+            "-i", str(voice_path),
+            "-filter_complex", filter_complex,
+            "-map", "[v]", "-map", "[aout]",
+            "-c:v", "libx264", "-crf", "18", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "320k", "-ar", "48000", "-ac", "2",
+            str(base_clip),
         ]
     else:
-        cmd += ["-i", str(src_video)]
-        if real_video_dur <= target_dur <= real_video_dur + 2.5:
-            speed_factor = 1.0
-            hold_dur = max(0.0, target_dur - real_video_dur + 0.25)
-            v_filters = [
-                "setpts=PTS-STARTPTS",
-                f"scale={width}:{height}:force_original_aspect_ratio=decrease",
-                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black",
-                f"fps={fps}",
-                "setsar=1",
-                "format=yuv420p",
-                f"tpad=stop_mode=clone:stop_duration={hold_dur:.6f}",
-                f"trim=0:{target_dur:.6f}",
-                "setpts=PTS-STARTPTS",
-            ]
-        elif target_dur <= real_video_dur * 1.65:
-            speed_factor = target_dur / real_video_dur
-            v_filters = [
-                f"setpts={speed_factor:.6f}*(PTS-STARTPTS)",
-                f"scale={width}:{height}:force_original_aspect_ratio=decrease",
-                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black",
-                f"fps={fps}",
-                "setsar=1",
-                "format=yuv420p",
-                f"trim=0:{target_dur:.6f}",
-                "setpts=PTS-STARTPTS",
-            ]
-        else:
-            speed_factor = 1.65
-            stretched_dur = real_video_dur * speed_factor
-            hold_dur = max(0.0, target_dur - stretched_dur + 0.25)
-            v_filters = [
-                f"setpts={speed_factor:.6f}*(PTS-STARTPTS)",
-                f"scale={width}:{height}:force_original_aspect_ratio=decrease",
-                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black",
-                f"fps={fps}",
-                "setsar=1",
-                "format=yuv420p",
-                f"tpad=stop_mode=clone:stop_duration={hold_dur:.6f}",
-                f"trim=0:{target_dur:.6f}",
-                "setpts=PTS-STARTPTS",
-            ]
-
-    if "warm_glow" in overlays:
-        v_filters.append(
-            "eq=gamma=1.03:contrast=1.03:saturation=1.10,"
-            "colorbalance=rs=0.045:gs=0.015:bs=-0.035:rm=0.03:gm=0.01:bm=-0.02"
+        filter_complex = (
+            f"[0:v]{vf_chain},trim=duration={target_dur:.3f},setpts=PTS-STARTPTS[v];"
+            f"[0:a]volume={ambient_gain_db}dB,apad,atrim=0:{target_dur:.3f},asetpts=PTS-STARTPTS[aout]"
         )
-
-    if "film_grain" in overlays:
-        v_filters.append("noise=alls=7:allf=t+u,vignette=PI/5")
-
-    lt_obj = scene.get("lower_third") if isinstance(scene.get("lower_third"), dict) else {}
-    hist_date = str(
-        scene.get("historical_date")
-        or scene.get("date")
-        or scene.get("year")
-        or lt_obj.get("date")
-        or lt_obj.get("title")
-        or ""
-    ).strip()
-    hist_loc = str(
-        scene.get("historical_location")
-        or scene.get("location")
-        or lt_obj.get("location")
-        or lt_obj.get("subtitle")
-        or ""
-    ).strip()
-    scene_lt_style = str(scene.get("lower_third_style") or lt_obj.get("style") or lt_style).strip().lower()
-    if "ictv" in scene_lt_style or "факт" in scene_lt_style:
-        scene_lt_style = "ictv"
-    elif "sky" in scene_lt_style:
-        scene_lt_style = "sky_news"
-    else:
-        scene_lt_style = "rossiya24"
-
-    if "lower_thirds" in overlays and (hist_date or hist_loc):
-        lt_start = round(cf_dur + 0.35, 3)
-        lt_end = round(max(lt_start + 2.5, min(target_dur - 0.35, lt_start + 5.5)), 3)
-        if lt_end > lt_start + 0.8:
-            v_filters.extend(
-                build_lower_third_filters(hist_date, hist_loc, scene_lt_style, width, height, lt_start, lt_end)
-            )
-
-    if idx == 0 and cf_dur > 0.0 and trans_type in {"fade", "fadeblack"}:
-        v_filters.append(f"fade=t=in:st=0:d={cf_dur:.6f}")
-        cf_dur = 0.0
-
-    out_trans = str(scene.get("transition_out_type") or "none").strip().lower()
-    out_trans_dur = float(scene.get("transition_out_duration") or 0.0)
-    if out_trans in {"fade_to_black", "fadeblack", "fade"} and out_trans_dur > 0.0:
-        fade_start = max(0.0, target_dur - out_trans_dur)
-        v_filters.append(f"fade=t=out:st={fade_start:.6f}:d={out_trans_dur:.6f}")
-
-    if "particles" in overlays:
-        filter_parts = [
-            f"[0:v]{','.join(v_filters)}[vbase]",
-            f"color=c=black:s=480x270:r={fps}:d={target_dur:.6f},"
-            f"noise=alls=45:allf=t,"
-            f"lutyuv=y='if(gt(val,244),255,0)':u=128:v=128,"
-            f"boxblur=1:1,"
-            f"scale={width}:{height}:flags=bilinear[vpart]",
-            "[vbase][vpart]blend=all_mode=screen:all_opacity=0.22[vout]",
+        cmd = [
+            "ffmpeg", "-y",
+            "-stream_loop", "-1", "-i", str(vid_path),
+            "-filter_complex", filter_complex,
+            "-map", "[v]", "-map", "[aout]",
+            "-c:v", "libx264", "-crf", "18", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "320k", "-ar", "48000", "-ac", "2",
+            str(base_clip),
         ]
-    else:
-        filter_parts = [f"[0:v]{','.join(v_filters)}[vout]"]
 
-    has_voice = bool(src_voice and src_voice.is_file() and real_voice_dur > 0.0)
-    mute_ambient = bool(scene.get("mute_audio", True if has_voice else False))
-    ambient_gain = float(scene.get("ambient_gain_db", -18.0))
-    voice_gain = float(scene.get("voiceover_gain_db", 0.0))
-    video_has_audio = (not is_image) and has_audio_stream(src_video)
+    subprocess.run(cmd, check=True)
 
-    print(
-        f"🎬 Сцена #{idx + 1:02d}: xfade={cf_dur:.2f}s | голос={real_voice_dur:.2f}s "
-        f"| видео={real_video_dur:.2f}s (x{speed_factor:.2f}) | итог={target_dur:.3f}s"
-        + (f" | плашка [{scene_lt_style}]: {hist_date} • {hist_loc}" if ("lower_thirds" in overlays and (hist_date or hist_loc)) else "")
-    )
+    text_overlay = (entry.get("text_overlay") or "").strip()
+    if lt_cfg.get("enabled", True) and text_overlay:
+        show_sec = lt_cfg.get("show_sec", [0.5, 5.5])
+        anim_sec = float(lt_cfg.get("anim_sec", 0.55))
+        emblem_raw = lt_cfg.get("emblem_path", "aether_art_150x150.png")
+        emblem_resolved = _resolve_media_path(emblem_raw, assets_dir)
+        emblem_str = str(emblem_resolved) if emblem_resolved else emblem_raw
 
-    fade_out_st = max(0.0, target_dur - 0.02)
-    delay_filter = f"adelay={lead_in_ms}|{lead_in_ms}," if lead_in_ms > 0 else ""
-
-    amb_tempo = 1.0 / speed_factor
-    amb_tempo_filter = f"atempo={amb_tempo:.6f}," if abs(amb_tempo - 1.0) > 0.002 else ""
-
-    if has_voice:
-        cmd += ["-i", str(src_voice)]
-        filter_parts.append(
-            f"[1:a]aresample=48000,aformat=sample_fmts=s16:channel_layouts=stereo,"
-            f"volume={voice_gain}dB,{delay_filter}apad,atrim=0:{target_dur:.6f},"
-            f"afade=t=in:st=0:d=0.015,afade=t=out:st={fade_out_st:.6f}:d=0.020,asetpts=PTS-STARTPTS[avo]"
+        ov_clip = temp_dir / f"seg_{idx:02d}_ov.mp4"
+        apply_lower_third_to_clip(
+            input_video_path=str(base_clip),
+            output_video_path=str(ov_clip),
+            text_overlay=text_overlay,
+            fps=fps,
+            emblem_path=emblem_str,
+            show_start=float(show_sec[0]),
+            show_end=float(show_sec[1]),
+            anim_dur=anim_sec,
+            work_dir=str(temp_dir / f"lt_frames_{idx:02d}"),
         )
-        if video_has_audio and not mute_ambient and ambient_gain > -90.0:
-            filter_parts.append(
-                f"[0:a]aresample=48000,aformat=sample_fmts=s16:channel_layouts=stereo,"
-                f"{amb_tempo_filter}volume={ambient_gain}dB,{delay_filter}apad,atrim=0:{target_dur:.6f},"
-                f"asetpts=PTS-STARTPTS[aamb]"
-            )
-            filter_parts.append("[avo][aamb]amix=inputs=2:duration=first:normalize=0[aout]")
-        else:
-            filter_parts.append("[avo]acopy[aout]")
-    elif video_has_audio and not mute_ambient and ambient_gain > -90.0:
-        filter_parts.append(
-            f"[0:a]aresample=48000,aformat=sample_fmts=s16:channel_layouts=stereo,"
-            f"{amb_tempo_filter}volume={ambient_gain}dB,{delay_filter}apad,atrim=0:{target_dur:.6f},"
-            f"afade=t=in:st=0:d=0.015,afade=t=out:st={fade_out_st:.6f}:d=0.020,asetpts=PTS-STARTPTS[aout]"
-        )
-    else:
-        filter_parts.append(f"anullsrc=r=48000:cl=stereo:d={target_dur:.6f}[aout]")
+        return ov_clip
 
-    cmd += [
-        "-filter_complex", ";".join(filter_parts),
-        "-map", "[vout]",
-        "-map", "[aout]",
-        "-frames:v", str(exact_frames),
-        "-r", str(fps),
-        "-vsync", "cfr",
-        "-c:v", "libx264",
-        "-crf", "14",
-        "-preset", "superfast",
-        "-rc-lookahead", "10",
-        "-pix_fmt", "yuv420p",
-        "-c:a", "pcm_s16le",
-        "-ar", "48000",
-        "-ac", "2",
-        str(out_path),
-    ]
-    run_cmd(cmd)
-    return out_path, target_dur, cf_dur, cf_dur
+    return base_clip
 
 
-def merge_segment_group(
-    segments: list[tuple[Path, float, float, str]],
-    out_path: Path,
-    fps: int,
-    crf: int,
-    preset: str,
-) -> float:
-    if len(segments) == 1:
-        shutil.copy2(segments[0][0], out_path)
-        return segments[0][1]
-
-    cmd = ["ffmpeg", "-y"]
-    for seg_path, _, _, _ in segments:
-        cmd += ["-i", str(seg_path)]
-
-    filters = []
-    for idx in range(len(segments)):
-        filters.append(f"[{idx}:v]fps={fps},settb=1/24000,format=yuv420p,setpts=PTS-STARTPTS[iv{idx}]")
-        filters.append(f"[{idx}:a]aresample=48000,aformat=sample_fmts=s16:channel_layouts=stereo,asetpts=PTS-STARTPTS[ia{idx}]")
-
-    cur_v = "[iv0]"
-    cur_a = "[ia0]"
-    total_dur = segments[0][1]
-
-    for idx in range(1, len(segments)):
-        _, dur_i, cf_dur_i, trans_type = segments[idx]
-        next_v = f"[v{idx}]"
-        next_a = f"[a{idx}]"
-
-        if cf_dur_i > 0.0 and trans_type != "cut":
-            offset = max(0.0, total_dur - cf_dur_i)
-            trim_prev_a = max(0.05, total_dur - cf_dur_i)
-            filters.append(
-                f"{cur_v}[iv{idx}]xfade=transition={trans_type}:duration={cf_dur_i:.6f}:offset={offset:.6f},settb=1/24000{next_v}"
-            )
-            filters.append(
-                f"{cur_a}atrim=0:{trim_prev_a:.6f},asetpts=PTS-STARTPTS[a_prev_trim{idx}];"
-                f"[a_prev_trim{idx}][ia{idx}]concat=n=2:v=0:a=1{next_a}"
-            )
-            total_dur = offset + dur_i
-        else:
-            filters.append(f"{cur_v}[iv{idx}]concat=n=2:v=1:a=0,settb=1/24000{next_v}")
-            filters.append(f"{cur_a}[ia{idx}]concat=n=2:v=0:a=1{next_a}")
-            total_dur += dur_i
-
-        cur_v = next_v
-        cur_a = next_a
-
-    exact_frames = max(fps, int(round(total_dur * fps)))
-    exact_dur = exact_frames / float(fps)
-
-    cmd += [
-        "-filter_complex", ";".join(filters),
-        "-map", cur_v,
-        "-map", cur_a,
-        "-frames:v", str(exact_frames),
-        "-r", str(fps),
-        "-vsync", "cfr",
-        "-c:v", "libx264",
-        "-profile:v", "high",
-        "-level", "5.1",
-        "-crf", str(crf),
-        "-preset", preset,
-        "-rc-lookahead", "12",
-        "-pix_fmt", "yuv420p",
-        "-c:a", "pcm_s16le",
-        "-ar", "48000",
-        "-ac", "2",
-        str(out_path),
-    ]
-    run_cmd(cmd)
-    return exact_dur
-
-
-def finalize_audio_and_container(
-    raw_video: Path,
-    final_video: Path,
-    audio_bitrate: str,
-    loudnorm_cfg: dict,
-) -> None:
-    if loudnorm_cfg.get("enabled", True):
-        lufs = float(loudnorm_cfg.get("target_lufs", -14.0))
-        tp = float(loudnorm_cfg.get("true_peak_db", -1.0))
-        lra = float(loudnorm_cfg.get("lra", 7.0))
-        run_cmd([
-            "ffmpeg", "-y",
-            "-i", str(raw_video),
-            "-c:v", "copy",
-            "-af", f"loudnorm=I={lufs}:TP={tp}:LRA={lra}",
-            "-c:a", "aac",
-            "-b:a", audio_bitrate,
-            "-ar", "48000",
-            "-ac", "2",
-            "-movflags", "+faststart",
-            str(final_video),
-        ])
-    else:
-        run_cmd([
-            "ffmpeg", "-y",
-            "-i", str(raw_video),
-            "-c:v", "copy",
-            "-c:a", "aac",
-            "-b:a", audio_bitrate,
-            "-ar", "48000",
-            "-ac", "2",
-            "-movflags", "+faststart",
-            str(final_video),
-        ])
-
-
-def main() -> None:
-    manifest_path = Path(
-        sys.argv[1] if len(sys.argv) > 1 else os.getenv("MANIFEST_PATH", "manifest.json")
-    )
-    if not manifest_path.is_file():
-        raise FileNotFoundError(f"Манифест не найден: {manifest_path}")
-
-    with manifest_path.open("r", encoding="utf-8") as f:
+def assemble_from_manifest(manifest_path: str, assets_dir: str, output_path: str | None = None) -> Path:
+    with open(manifest_path, "r", encoding="utf-8") as f:
         manifest = json.load(f)
 
-    scenes = get_normalized_scenes(manifest)
-    if not scenes:
-        raise ValueError("В манифесте не найден список сцен!")
-
-    overlays, lt_style = parse_overlay_config(manifest)
-    print(f"✨ Активные оверлеи: {sorted(overlays) if overlays else 'нет'} | Стиль плашки: {lt_style}")
-
-    render_cfg = manifest.get("render_settings") or {}
-    res_str = str(render_cfg.get("resolution", "3840x2160")).split()[0]
-    width, height = (int(x) for x in res_str.lower().split("x"))
-    fps = int(render_cfg.get("fps", 24))
-    crf = min(int(render_cfg.get("crf", 18)), 17)
-    audio_bitrate = str(render_cfg.get("audio_bitrate", "320k"))
-    folder_id = (
-        os.getenv("GDRIVE_FOLDER_ID")
-        or os.getenv("EFFECTIVE_FOLDER_ID")
-        or manifest.get("gdrive_folder_id")
-        or manifest.get("folder_id")
-    )
-
-    prepared: list[tuple[Path, float, float, str]] = []
-    actual_timings: list[dict] = []
-    cursor_t = 0.0
-
-    for idx, scene in enumerate(scenes):
-        sc_path, dur, cf_dur, lead_in_sec = prepare_scene(
-            scene, idx, width, height, fps, folder_id, overlays, lt_style
-        )
-        trans_type = str(scene.get("transition") or "cut").strip().lower()
-        if trans_type not in VALID_XFADE_TRANSITIONS and trans_type != "cut":
-            trans_type = "fade"
-        prepared.append((sc_path, dur, cf_dur, trans_type))
-
-        overlap = cf_dur if (idx > 0 and trans_type != "cut" and cf_dur > 0.0) else 0.0
-        scene_start = max(0.0, cursor_t - overlap)
-        voice_start = scene_start + lead_in_sec
-        scene_end = scene_start + dur
-        actual_timings.append({
-            "scene_index": idx + 1,
-            "scene_start": round(scene_start, 3),
-            "voice_start": round(voice_start, 3),
-            "scene_end": round(scene_end, 3),
-            "duration": round(scene_end - scene_start, 3),
-        })
-        cursor_t = scene_end
-
-    Path("build").mkdir(parents=True, exist_ok=True)
-    Path("build/actual_timings.json").write_text(
-        json.dumps(actual_timings, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-
-    project_name = manifest.get("project_name", "output")
-    out_dir = Path("output")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    raw_master = Path("build/raw_master.mkv")
-    final_video = out_dir / f"{project_name}.mp4"
-    loudnorm = render_cfg.get("loudness_normalization") or {}
-
-    if len(prepared) <= BATCH_SIZE:
-        total_dur = merge_segment_group(
-            prepared, raw_master, fps=fps, crf=crf, preset="faster"
-        )
+    export_cfg = manifest.get("export_settings", {})
+    res_mode = str(export_cfg.get("resolution", "4k")).lower()
+    if res_mode == "4k":
+        out_w, out_h = 3840, 2160
+    elif res_mode in ("1080p", "fhd"):
+        out_w, out_h = 1920, 1080
+    elif res_mode in ("720p", "hd"):
+        out_w, out_h = 1280, 720
     else:
-        batches_dir = Path("build/batches")
-        batches_dir.mkdir(parents=True, exist_ok=True)
-        batch_segments: list[tuple[Path, float, float, str]] = []
+        out_w, out_h = 3840, 2160
 
-        for b_idx, start in enumerate(range(0, len(prepared), BATCH_SIZE)):
-            chunk = prepared[start : start + BATCH_SIZE]
-            in_cf_dur = chunk[0][2]
-            in_trans = chunk[0][3]
-            chunk_for_merge = [(chunk[0][0], chunk[0][1], 0.0, "cut")] + chunk[1:]
-            batch_out = batches_dir / f"batch_{b_idx:02d}.mkv"
-            batch_dur = merge_segment_group(
-                chunk_for_merge, batch_out, fps=fps, crf=15, preset="superfast"
+    fps = int(export_cfg.get("fps", 24))
+    lt_cfg = export_cfg.get("lower_third_config", {})
+    items = manifest.get("timeline") or manifest.get("scenes") or []
+    if not items:
+        raise ValueError("Manifest contains no scenes or timeline entries.")
+
+    out_name = output_path or manifest.get("project_name") or "Histoviva_EP02_Amazon_4K.mp4"
+    final_out = Path(out_name)
+    if final_out.suffix == "":
+        final_out = final_out.with_suffix(".mp4")
+
+    assets_root = Path(assets_dir)
+    temp_dir = final_out.parent / f"_build_{final_out.stem}"
+    if temp_dir.exists():
+        shutil.rmtree(temp_dir)
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        prepared_clips = []
+        for entry in items:
+            seg_path = _prepare_segment(
+                entry=entry,
+                assets_dir=assets_root,
+                temp_dir=temp_dir,
+                out_w=out_w,
+                out_h=out_h,
+                fps=fps,
+                lt_cfg=lt_cfg,
             )
-            batch_segments.append((batch_out, batch_dur, in_cf_dur, in_trans))
-            print(f"✅ Batch {b_idx + 1} merged ({len(chunk)} scenes, {batch_dur:.3f}s)")
+            prepared_clips.append(seg_path)
 
-        total_dur = merge_segment_group(
-            batch_segments, raw_master, fps=fps, crf=crf, preset="faster"
-        )
+        concat_list = temp_dir / "concat.txt"
+        with open(concat_list, "w", encoding="utf-8") as cf:
+            for p in prepared_clips:
+                cf.write(f"file '{p.resolve().as_posix()}'
+")
 
-    finalize_audio_and_container(raw_master, final_video, audio_bitrate, loudnorm)
-    print(f"✅ Render complete: {final_video} ({total_dur:.3f}s)")
+        final_out.parent.mkdir(parents=True, exist_ok=True)
+        concat_cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat", "-safe", "0",
+            "-i", str(concat_list),
+            "-c:v", "libx264", "-profile:v", "high", "-crf", str(export_cfg.get("crf", 18)),
+            "-preset", str(export_cfg.get("preset", "veryfast")),
+            "-pix_fmt", "yuv420p", "-r", str(fps),
+            "-c:a", "aac", "-b:a", f"{export_cfg.get('audio_bitrate_kbps', 320)}k",
+            "-ar", "48000", "-ac", "2",
+            str(final_out),
+        ]
+        subprocess.run(concat_cmd, check=True)
+        return final_out
+    finally:
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Assemble Histoviva documentary from manifest.json")
+    parser.add_argument("--manifest", default="manifest.json", help="Path to manifest.json")
+    parser.add_argument("--assets-dir", default=".", help="Directory containing scene videos, voices, bumper, and emblem")
+    parser.add_argument("--output", default=None, help="Output video path")
+    args = parser.parse_args()
+    result = assemble_from_manifest(args.manifest, args.assets_dir, args.output)
+    print(f"Assembled video: {result}")
 
 
 if __name__ == "__main__":
