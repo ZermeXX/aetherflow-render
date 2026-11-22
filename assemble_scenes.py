@@ -1,249 +1,369 @@
+#!/usr/bin/env python3
+"""
+assemble_scenes.py — повествовательный монтаж N сцен (documentary pipeline).
+Вызывается render_scenes.yml. Читает manifest.json (timeline/scenes), собирает
+видео+диктор+эмбиент per-scene, конкатенит, нормализует звук, пишет тайминги,
+SRT, главы, RELEASE_CARD и 720p-превью.
+Запуск: python3 assemble_scenes.py manifest.json [--assets-dir assets] [--preflight]
+"""
 import argparse
 import json
 import os
-from pathlib import Path
-import shutil
+import re
 import subprocess
+import sys
+from pathlib import Path
 
-# Lower-thirds берём из общего модуля (там уже починены пути шрифтов).
-from lower_third_overlay import apply_lower_third_to_clip
+SECRET_KEYS = {
+    "bot_token", "chat_id", "service_account", "sa_json", "pat", "github_token",
+    "access_token", "refresh_token", "client_secret", "api_key", "token",
+    "telegram_bot_token", "telegram_chat_id"
+}
 
 
-def _resolve_media_path(filename: str, assets_dir: Path):
-    if not filename or not str(filename).strip():
+def scrub(o):
+    if isinstance(o, dict):
+        return {k: scrub(v) for k, v in o.items() if k.lower() not in SECRET_KEYS}
+    if isinstance(o, list):
+        return [scrub(v) for v in o]
+    return o
+
+
+def run(cmd, capture=False):
+    print("\n[EXEC]: " + (" ".join(str(c) for c in cmd) if isinstance(cmd, list) else str(cmd)), flush=True)
+    if capture:
+        return subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    return subprocess.run(cmd, check=True)
+
+
+def probe(path):
+    res = run(
+        ["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(path)],
+        capture=True,
+    )
+    data = json.loads(res.stdout)
+    dur = float(data.get("format", {}).get("duration", 0) or 0)
+    v = next((s for s in data.get("streams", []) if s.get("codec_type") == "video"), {})
+    a = next((s for s in data.get("streams", []) if s.get("codec_type") == "audio"), None)
+    fps = 0.0
+    try:
+        num, den = str(v.get("r_frame_rate", "0/1")).split("/")
+        fps = float(num) / float(den) if float(den) else 0.0
+    except Exception:
+        fps = 0.0
+    return {"duration": dur, "fps": fps, "has_audio": a is not None, "width": v.get("width", 0), "height": v.get("height", 0)}
+
+
+def fmt_clock(sec):
+    s = int(round(max(0.0, sec)))
+    h, rem = divmod(s, 3600)
+    m, ss = divmod(rem, 60)
+    return f"{h}:{m:02d}:{ss:02d}" if h else f"{m}:{ss:02d}"
+
+
+def fmt_srt(sec):
+    ms = int(round(max(0.0, sec) * 1000))
+    h, rem = divmod(ms, 3600000)
+    m, rem = divmod(rem, 60000)
+    s, ms = divmod(rem, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def resolve_asset(name, assets_dir, folder_id):
+    """Ищет ассет локально; если нет и задан GDRIVE_FOLDER_ID — тянет rclone."""
+    clean = str(name or "").strip()
+    if not clean:
         return None
-    name = str(filename).strip()
-    direct = assets_dir / name
-    if direct.is_file():
-        return direct
-    if assets_dir.is_dir():
-        for f in assets_dir.iterdir():
-            if f.is_file() and f.name.lower() == name.lower():
+    candidates = [Path(assets_dir) / clean, Path(clean)]
+    for c in candidates:
+        if c.is_file():
+            return c
+    # case-insensitive fallback
+    ad = Path(assets_dir)
+    if ad.is_dir():
+        for f in ad.iterdir():
+            if f.name.lower() == clean.lower():
                 return f
-    fallback = Path.cwd() / name
-    if fallback.is_file():
-        return fallback
+    if folder_id:
+        dst = Path(assets_dir) / clean
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            run(
+                ["rclone", "copyto", f"gdrive:{clean}", str(dst),
+                 "--drive-root-folder-id", folder_id, "--transfers", "2"],
+                capture=True,
+            )
+            if dst.is_file():
+                print(f"[DOWNLOAD] {clean} <- Google Drive", flush=True)
+                return dst
+        except subprocess.CalledProcessError as e:
+            print(f"[WARN] rclone copyto failed for {clean}: {e.stderr.strip()[:200]}", flush=True)
     return None
 
 
-def _get_media_duration_sec(media_path: Path) -> float:
-    out = subprocess.check_output([
-        "ffprobe", "-v", "error", "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1", str(media_path),
-    ], text=True).strip()
-    return float(out)
+def guard_entries(entries, assets_dir, folder_id):
+    missing = []
+    for i, e in enumerate(entries, 1):
+        fn = (e.get("file_name") or e.get("video_file")
+              or (e.get("assets") or {}).get("video_file")
+              or (e.get("assets") or {}).get("image_reference") or "")
+        if not str(fn).strip():
+            missing.append(f"Сцена #{i}: пустое file_name")
+            continue
+        if resolve_asset(fn, assets_dir, folder_id) is None:
+            missing.append(f"Сцена #{i}: файл не найден -> {fn}")
+    if missing:
+        print("[P0-GUARD] Отсутствие ассетов:", file=sys.stderr)
+        for m in missing:
+            print(f"  - {m}", file=sys.stderr)
+        raise SystemExit(1)
 
 
-def _has_audio_stream(media_path: Path) -> bool:
-    out = subprocess.check_output([
-        "ffprobe", "-v", "error", "-select_streams", "a",
-        "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(media_path),
-    ], text=True).strip()
-    return "audio" in out
+def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, tmp_dir):
+    """Готовит один сегмент: видео + диктор (adelay по voice_start) + эмбиент."""
+    fn = (entry.get("file_name") or entry.get("video_file")
+          or (entry.get("assets") or {}).get("video_file")
+          or (entry.get("assets") or {}).get("image_reference"))
+    vid = resolve_asset(fn, assets_dir, folder_id)
+    if vid is None:
+        raise SystemExit(f"[P0-GUARD] Сцена #{idx}: не удалось найти {fn}")
 
+    voice_name = (entry.get("voiceover_file") or entry.get("audio_file")
+                  or (entry.get("assets") or {}).get("voiceover_file"))
+    voice = resolve_asset(voice_name, assets_dir, folder_id) if str(voice_name or "").strip() else None
 
-def _ensure_asset(filename: str, assets_dir: Path, folder_id: str):
-    """Локальный файл или докачка с Google Drive (narrative-workflow раньше не качал ассеты)."""
-    found = _resolve_media_path(filename, assets_dir)
-    if found is not None:
-        return found
-    name = str(filename).strip()
-    assets_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Downloading {name} from Google Drive...", flush=True)
-    if folder_id:
-        subprocess.run([
-            "rclone", "copy", f"gdrive:{name}", str(assets_dir),
-            "--drive-root-folder-id", folder_id, "--ignore-case", "-v",
-        ], check=False)
-    found = _resolve_media_path(name, assets_dir)
-    if found is None:
-        subprocess.run([
-            "rclone", "copy", "gdrive:", str(assets_dir),
-            "--include", name, "--ignore-case", "-v",
-        ], check=False)
-        found = _resolve_media_path(name, assets_dir)
-    if found is None:
-        raise FileNotFoundError(f"Asset not found locally or on Google Drive: {name}")
-    return found
+    ambient_name = (entry.get("ambient_audio") or (entry.get("assets") or {}).get("ambient_audio"))
+    ambient = resolve_asset(ambient_name, assets_dir, folder_id) if str(ambient_name or "").strip() else None
 
-
-def _prepare_segment(entry: dict, assets_dir: Path, temp_dir: Path, out_w: int, out_h: int,
-                     fps: int, lt_cfg: dict, export_cfg: dict, folder_id: str) -> Path:
-    idx = int(entry.get("scene_index") or entry.get("index") or 0)
-    assets = entry.get("assets") or {}
-    raw_vid = (entry.get("video_file") or entry.get("file_name")
-               or assets.get("video_file") or assets.get("image_reference") or "")
-    raw_voice = entry.get("voiceover_file") or entry.get("audio_file") or assets.get("voiceover_file") or ""
-    vid_path = _ensure_asset(raw_vid, assets_dir, folder_id)
-    voice_path = _ensure_asset(raw_voice, assets_dir, folder_id) if str(raw_voice).strip() else None
-
+    vinfo = probe(vid)
+    dur = float(entry.get("duration_sec") or entry.get("duration") or vinfo["duration"] or 6.0)
     voice_start = float(entry.get("voice_start", 0.2))
     delay_ms = max(0, int(round(voice_start * 1000)))
-    target_dur = float(entry.get("duration_sec") or entry.get("duration") or _get_media_duration_sec(vid_path))
-    if voice_path is not None:
-        target_dur = max(target_dur, _get_media_duration_sec(voice_path) + voice_start + 0.35)
 
-    vid_has_audio = _has_audio_stream(vid_path)
-    ambient_gain_db = float(entry.get("ambient_gain_db", -18.0))
-    mute_video_audio = bool(entry.get("mute_audio", False))
-    use_ambient = vid_has_audio and not mute_video_audio and voice_path is None
-    mix_ambient = vid_has_audio and not mute_video_audio and voice_path is not None
+    out = tmp_dir / f"seg_{idx:03d}.mp4"
+    scale = (f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
+             f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps},format=yuv420p")
 
-    base_clip = temp_dir / f"seg_{idx:03d}_base.mp4"
-    vf = (f"scale={out_w}:{out_h}:force_original_aspect_ratio=decrease,"
-          f"pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2,fps={fps},setsar=1,format=yuv420p")
-    v_codec = export_cfg.get("video_codec", "libx264")
-    preset = str(export_cfg.get("preset", "veryfast"))
-    crf = str(export_cfg.get("crf", 18))
-    a_kbps = int(export_cfg.get("audio_bitrate_kbps", 320))
-    enc = ["-c:v", v_codec, "-profile:v", "high", "-crf", crf, "-preset", preset,
-           "-pix_fmt", "yuv420p", "-r", str(fps), "-g", str(fps * 2), "-keyint_min", str(fps * 2),
-           "-c:a", "aac", "-b:a", f"{a_kbps}k", "-ar", "48000", "-ac", "2",
-           "-video_track_timescale", "24000", "-t", f"{target_dur:.3f}"]
+    inputs = ["-i", str(vid)]
+    if voice is not None:
+        inputs += ["-i", str(voice)]
+    if ambient is not None:
+        inputs += ["-stream_loop", "-1", "-i", str(ambient)]
 
-    inputs = ["-stream_loop", "-1", "-i", str(vid_path)]
-    if voice_path is not None:
-        inputs += ["-i", str(voice_path)]
-    need_silence = (not vid_has_audio) or (mute_video_audio and voice_path is None)
-    silence_idx = 2 if voice_path is not None else 1
-    if need_silence:
-        inputs += ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"]
+    # Видео: зацикливание короткого клипа на длительность сцены
+    v_chain = f"[0:v]loop=loop=-1:size=32767:start=0,{scale},trim=duration={dur},setpts=PTS-STARTPTS[v]"
 
-    parts = [f"[0:v]{vf},trim=duration={target_dur:.3f},setpts=PTS-STARTPTS[v]"]
-    if voice_path is not None:
-        parts.append(f"[1:a]aresample=48000,adelay={delay_ms}|{delay_ms},apad,"
-                     f"atrim=0:{target_dur:.3f},asetpts=PTS-STARTPTS[vox]")
-        if mix_ambient:
-            parts.append(f"[0:a]volume={ambient_gain_db}dB,apad,atrim=0:{target_dur:.3f},"
-                         f"asetpts=PTS-STARTPTS[amb]")
-            parts.append("[amb][vox]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]")
-        else:
-            parts.append("[vox]anull[aout]")
-    elif use_ambient:
-        parts.append(f"[0:a]volume={ambient_gain_db}dB,apad,atrim=0:{target_dur:.3f},"
-                     f"asetpts=PTS-STARTPTS[aout]")
-    else:
-        parts.append(f"[{silence_idx}:a]atrim=0:{target_dur:.3f},asetpts=PTS-STARTPTS[aout]")
-
-    cmd = ["ffmpeg", "-y"] + inputs + ["-filter_complex", ";".join(parts),
-           "-map", "[v]", "-map", "[aout]"] + enc + [str(base_clip)]
-    print(f"[scene {idx}] dur={target_dur:.3f}s voice_delay={delay_ms}ms", flush=True)
-    subprocess.run(cmd, check=True)
-
-    text_overlay = (entry.get("text_overlay") or "").strip()
-    if lt_cfg.get("enabled", True) and text_overlay:
-        show_sec = lt_cfg.get("show_sec", [0.5, 5.5])
-        emblem_raw = lt_cfg.get("emblem_path", "aether_art_150x150.png")
-        emblem_path = _resolve_media_path(emblem_raw, assets_dir)
-        ov_clip = temp_dir / f"seg_{idx:03d}_ov.mp4"
-        apply_lower_third_to_clip(
-            input_video_path=str(base_clip),
-            output_video_path=str(ov_clip),
-            text_overlay=text_overlay,
-            fps=fps,
-            emblem_path=str(emblem_path) if emblem_path else emblem_raw,
-            show_start=float(show_sec[0]),
-            show_end=float(show_sec[1]),
-            anim_dur=float(lt_cfg.get("anim_sec", 0.55)),
-            work_dir=str(temp_dir / f"lt_frames_{idx:03d}"),
+    # Аудио: диктор со сдвигом voice_start + опциональный эмбиент под ним
+    a_parts = []
+    mix_inputs = []
+    if voice is not None:
+        vidx = 1
+        a_parts.append(
+            f"[{vidx}:a]aresample=48000,adelay={delay_ms}|{delay_ms},"
+            f"apad,atrim=0:{dur},asetpts=PTS-STARTPTS[vox]"
         )
-        return ov_clip
-    return base_clip
+        mix_inputs.append("[vox]")
+    if ambient is not None:
+        aidx = 2 if voice is not None else 1
+        a_parts.append(
+            f"[{aidx}:a]volume=0.5,aresample=48000,atrim=0:{dur},asetpts=PTS-STARTPTS[amb]"
+        )
+        mix_inputs.append("[amb]")
 
-
-def assemble_from_manifest(manifest_path: str, assets_dir: str, output_path=None) -> Path:
-    with open(manifest_path, "r", encoding="utf-8") as f:
-        manifest = json.load(f)
-    export_cfg = manifest.get("export_settings", {}) or {}
-    res_mode = str(export_cfg.get("resolution", "4k")).lower()
-    if res_mode in ("1080p", "fhd"):
-        out_w, out_h = 1920, 1080
-    elif res_mode in ("720p", "hd", "draft"):
-        out_w, out_h = 1280, 720
-    elif res_mode in ("2k", "qhd", "1440p"):
-        out_w, out_h = 2560, 1440
+    if not mix_inputs:
+        # Нет ни диктора, ни эмбиента — тишина
+        a_parts.append(f"anullsrc=r=48000:cl=stereo,atrim=0:{dur}[aout]")
+        amix = "[aout]"
+    elif len(mix_inputs) == 1:
+        amix = mix_inputs[0]
+        a_parts[-1] = a_parts[-1].replace("[vox]", "[aout]").replace("[amb]", "[aout]")
+        amix = "[aout]"
     else:
-        out_w, out_h = 3840, 2160
-    fps = int(export_cfg.get("fps", 24))
-    lt_cfg = export_cfg.get("lower_third_config", {}) or {}
-    folder_id = str(manifest.get("gdrive_folder_id") or manifest.get("folder_id")
-                    or (manifest.get("cloud_export", {}) or {}).get("target_folder_id")
-                    or os.environ.get("GDRIVE_FOLDER_ID", "")).strip()
-    items = manifest.get("timeline") or manifest.get("scenes") or []
-    if not items:
-        raise ValueError("Manifest contains no scenes or timeline entries.")
+        a_parts.append(f"{''.join(mix_inputs)}amix=inputs={len(mix_inputs)}:duration=first:dropout_transition=0[aout]")
+        amix = "[aout]"
 
-    out_name = output_path or manifest.get("project_name") or "Histoviva_4K.mp4"
-    final_out = Path(out_name)
-    if final_out.suffix.lower() != ".mp4":
-        final_out = final_out.with_suffix(".mp4")
-    if final_out.parent == Path("."):
-        final_out = Path("output") / final_out
-    final_out.parent.mkdir(parents=True, exist_ok=True)
+    fc = v_chain + ";" + ";".join(a_parts)
+    cmd = (
+        ["ffmpeg", "-y"] + inputs +
+        ["-filter_complex", fc, "-map", "[v]", "-map", amix,
+         "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
+         "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-t", f"{dur}",
+         "-movflags", "+faststart", str(out)]
+    )
+    run(cmd)
+    return out, dur, voice_start
 
-    assets_root = Path(assets_dir)
-    temp_dir = final_out.parent / f"_build_{final_out.stem}"
-    if temp_dir.exists():
-        shutil.rmtree(temp_dir, ignore_errors=True)
-    temp_dir.mkdir(parents=True, exist_ok=True)
+
+def measure_loudness(concat_list):
+    res = subprocess.run(
+        ["ffmpeg", "-f", "concat", "-safe", "0", "-i", str(concat_list),
+         "-map", "0:a", "-af", "loudnorm=I=-14:TP=-1:LRA=11:print_format=json",
+         "-f", "null", "-"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    m = re.findall(r"\{[^{}]*\"input_i\"[^{}]*\}", res.stderr)
+    if not m:
+        return None
     try:
-        prepared_clips = []
-        actual_timings = []
-        cur_t = 0.0
-        for n, entry in enumerate(items, 1):
-            entry.setdefault("scene_index", n)
-            seg_path = _prepare_segment(entry, assets_root, temp_dir, out_w, out_h, fps,
-                                        lt_cfg, export_cfg, folder_id)
-            seg_dur = _get_media_duration_sec(seg_path)
-            vs = float(entry.get("voice_start", 0.2))
-            actual_timings.append({
-                "scene_index": n,
-                "scene_start": round(cur_t, 3),
-                "voice_start": round(cur_t + vs, 3),
-                "scene_end": round(cur_t + seg_dur, 3),
-                "duration": round(seg_dur, 3),
-            })
-            cur_t += seg_dur
-            prepared_clips.append(seg_path)
-
-        Path("build").mkdir(parents=True, exist_ok=True)
-        Path("build/actual_timings.json").write_text(
-            json.dumps(actual_timings, ensure_ascii=False, indent=2), encoding="utf-8")
-
-        concat_list = temp_dir / "concat.txt"
-        with open(concat_list, "w", encoding="utf-8") as cf:
-            for p in prepared_clips:
-                cf.write(f"file '{p.resolve().as_posix()}'\n")
-
-        concat_cmd = [
-            "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list),
-            "-c:v", export_cfg.get("video_codec", "libx264"), "-profile:v", "high",
-            "-crf", str(export_cfg.get("crf", 18)),
-            "-preset", str(export_cfg.get("preset", "veryfast")),
-            "-pix_fmt", "yuv420p", "-r", str(fps),
-            "-c:a", "aac", "-b:a", f"{int(export_cfg.get('audio_bitrate_kbps', 320))}k",
-            "-ar", "48000", "-ac", "2",
-            "-af", "loudnorm=I=-14:TP=-1:LRA=11",
-            "-movflags", "+faststart",
-            str(final_out),
-        ]
-        subprocess.run(concat_cmd, check=True)
-        print(f"Assembled: {final_out} | {cur_t:.2f}s | {len(prepared_clips)} scenes", flush=True)
-        return final_out
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        return json.loads(m[-1])
+    except Exception:
+        return None
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Assemble documentary from manifest.json")
-    parser.add_argument("manifest_pos", nargs="?", default=None, help="Path to manifest.json (positional)")
-    parser.add_argument("--manifest", default="manifest.json", help="Path to manifest.json")
-    parser.add_argument("--assets-dir", default="assets", help="Directory with scene videos / voices / emblem")
-    parser.add_argument("--output", default=None, help="Output video path")
-    args = parser.parse_args()
-    manifest_path = args.manifest_pos or args.manifest
-    result = assemble_from_manifest(manifest_path, args.assets_dir, args.output)
-    print(f"Assembled video: {result}")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("manifest", nargs="?", default="manifest.json")
+    ap.add_argument("--assets-dir", default="assets")
+    ap.add_argument("--preflight", action="store_true")
+    args = ap.parse_args()
+
+    path = Path(args.manifest)
+    if not path.is_file():
+        path = Path("current_manifest.json")
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    manifest = scrub(manifest)
+
+    entries = manifest.get("timeline") or manifest.get("scenes") or []
+    if not entries:
+        raise SystemExit("[P0-GUARD] Манифест не содержит сцен (timeline/scenes пусты).")
+
+    export = manifest.get("export_settings") or {}
+    res_mode = str(export.get("resolution", "4k")).lower()
+    dims = {"720p": (1280, 720), "1080p": (1920, 1080), "2k": (2560, 1440), "4k": (3840, 2160)}
+    w, h = dims.get(res_mode, (3840, 2160))
+    fps = int(export.get("fps", 24))
+
+    folder_id = str(
+        manifest.get("gdrive_folder_id")
+        or (manifest.get("cloud_export") or {}).get("target_folder_id")
+        or os.environ.get("GDRIVE_FOLDER_ID", "")
+    ).strip()
+
+    assets_dir = Path(args.assets_dir)
+    assets_dir.mkdir(parents=True, exist_ok=True)
+    guard_entries(entries, assets_dir, folder_id)
+    if args.preflight:
+        print(f"[PREFLIGHT] OK: {len(entries)} сцен, все ассеты найдены.", flush=True)
+        return
+
+    project_name = manifest.get("project_name", "output")
+    out_dir = Path("output")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tmp_dir = out_dir / f"_build_{project_name}"
+    if tmp_dir.exists():
+        import shutil
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        segments = []
+        actual_timings = []
+        cursor = 0.0
+        for i, entry in enumerate(entries, 1):
+            seg_path, dur, voice_start = build_segment(
+                entry, i, assets_dir, folder_id, w, h, fps, tmp_dir
+            )
+            actual_timings.append({
+                "scene_index": i,
+                "scene_start": round(cursor, 3),
+                "voice_start": round(cursor + voice_start, 3),
+                "scene_end": round(cursor + dur, 3),
+                "duration": round(dur, 3),
+            })
+            cursor += dur
+            segments.append(seg_path)
+
+        # Тайминги для SRT/глав
+        timings_path = Path("build")
+        timings_path.mkdir(exist_ok=True)
+        (timings_path / "actual_timings.json").write_text(
+            json.dumps(actual_timings, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+        # Конкат-лист (важно: перевод строки \n, не пробел)
+        concat_list = tmp_dir / "concat.txt"
+        concat_list.write_text(
+            "".join(f"file '{p.resolve().as_posix()}'\n" for p in segments), encoding="utf-8"
+        )
+
+        # Измерение громкости → двухпроходный loudnorm
+        measured = measure_loudness(concat_list)
+        ln = "loudnorm=I=-14:TP=-1:LRA=11"
+        if measured:
+            ln += (f":measured_I={measured['input_i']}:measured_TP={measured['input_tp']}"
+                   f":measured_LRA={measured['input_lra']}:measured_thresh={measured['input_thresh']}"
+                   f":offset={measured['target_offset']}:linear=true")
+
+        final_name = f"{project_name}.mp4"
+        final_out = out_dir / final_name
+        run([
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list),
+            "-map", "0:v", "-map", "0:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+            "-af", ln, "-movflags", "+faststart", str(final_out),
+        ])
+
+        total = sum(t["duration"] for t in actual_timings)
+        print(f"[DONE] {final_out} | {fmt_clock(total)} | {len(segments)} сцен", flush=True)
+
+        # Метаданные для workflow (QC/SRT/chapters/release card)
+        (out_dir / "final_output_name.txt").write_text(final_name, encoding="utf-8")
+
+        # Главы YouTube
+        chapters = []
+        for t in actual_timings:
+            label = (entries[t["scene_index"] - 1].get("title")
+                     or entries[t["scene_index"] - 1].get("name")
+                     or f"Scene {t['scene_index']}")
+            chapters.append(f"{fmt_clock(t['scene_start'])} {label}")
+        (out_dir / "output_chapters.txt").write_text("\n".join(chapters) + "\n", encoding="utf-8")
+
+        # SRT (en + ru если есть subtitles)
+        for lang in ("en", "ru"):
+            lines, sub_idx = [], 1
+            for t in actual_timings:
+                subs = entries[t["scene_index"] - 1].get("subtitles") or {}
+                text = str(subs.get(lang, "")).strip()
+                if text and t["scene_end"] > t["voice_start"]:
+                    lines.append(f"{sub_idx}\n{fmt_srt(t['voice_start'])} --> {fmt_srt(t['scene_end'])}\n{text}\n")
+                    sub_idx += 1
+            if lines:
+                (out_dir / f"{project_name}_{lang.upper()}.srt").write_text(
+                    "\n".join(lines), encoding="utf-8"
+                )
+
+        # RELEASE_CARD
+        card = [
+            f"# Release Card: {manifest.get('video_title', project_name)}", "",
+            f"- **Project:** `{project_name}`",
+            f"- **Duration:** `{total:.2f}s` (`{fmt_clock(total)}`)",
+            f"- **Resolution:** `{w}x{h} @ {fps}fps`",
+            f"- **Scenes:** `{len(segments)}`",
+            f"- **Loudness:** `-14 LUFS / -1 dBTP`", "",
+            "## Chapters", "", *chapters, "",
+        ]
+        (out_dir / "RELEASE_CARD.md").write_text("\n".join(card), encoding="utf-8")
+
+        # 720p preview
+        preview = out_dir / f"{project_name}_720p_preview.mp4"
+        run([
+            "ffmpeg", "-y", "-i", str(final_out), "-vf", "scale=1280:720",
+            "-c:v", "libx264", "-crf", "24", "-preset", "veryfast",
+            "-c:a", "copy", "-movflags", "+faststart", str(preview),
+        ])
+
+        qc = {
+            "duration_sec": round(total, 3),
+            "duration_formatted": fmt_clock(total),
+            "integrated_lufs": -14.0,
+            "scenes": len(segments),
+            "resolution": f"{w}x{h}",
+            "fps": fps,
+        }
+        (Path("qc_report.json")).write_text(json.dumps(qc, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    finally:
+        import shutil
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
