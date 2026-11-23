@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
 assemble_scenes.py — повествовательный монтаж N сцен (documentary pipeline).
-Финальная версия: функциональные фиксы P0 + защита от 6-часового капа GitHub Actions.
-  1) Resume-cache: готовые сегменты лежат в seg_cache/ и дублируются на Google Drive
-     (_aether_segcache/). После отмены/сбоя повторный запуск продолжает с места обрыва.
-  2) Fail-fast бюджет: после 3 сегментов измеряется реальная скорость и строится проекция;
-     если проекция > AETHER_BUDGET_MINUTES (default 330) — ранний выход с рекомендациями.
-  3) Без двойного прохода: финал = concat -c copy + аудио-loudnorm; превью = первые 120 с.
+Финальная версия: фиксы P0 + защита от 6-часового капа + безопасный loudnorm.
+  1) Resume-cache: сегменты в seg_cache/ и дубль на Google Drive (_aether_segcache/).
+  2) Fail-fast бюджет: проекция скорости после 3 сегментов, ранний выход при > AETHER_BUDGET_MINUTES.
+  3) Финал = concat -c copy + аудио-loudnorm; превью = первые 120 с.
+  4) Loudnorm: двухпроходный ТОЛЬКО при валидных измерениях; иначе однопроходный + retry-фолбэк.
 Вызов: python3 assemble_scenes.py manifest.json [--assets-dir assets] [--preflight]
 """
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -260,7 +260,16 @@ def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf, lt_
     return final_out, dur
 
 
+def _is_finite(value):
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
+
+
 def measure_loudness(concat_list):
+    """Первый проход loudnorm. Возвращает None, если измерения невалидны
+    (-inf / inf / нулевая LRA / порог -70) — тогда используется однопроходный режим."""
     res = subprocess.run(
         ["ffmpeg", "-f", "concat", "-safe", "0", "-i", str(concat_list),
          "-map", "0:a", "-af", "loudnorm=I=-14:TP=-1:LRA=11:print_format=json", "-f", "null", "-"],
@@ -269,9 +278,17 @@ def measure_loudness(concat_list):
     if not m:
         return None
     try:
-        return json.loads(m[-1])
+        data = json.loads(m[-1])
     except Exception:
         return None
+    keys = ("input_i", "input_tp", "input_lra", "input_thresh", "target_offset")
+    if not all(_is_finite(data.get(k)) for k in keys):
+        print("[LOUDNORM] Измерения содержат inf/NaN — переход на однопроходный режим.", flush=True)
+        return None
+    if float(data["input_i"]) <= -70.0 or float(data["input_lra"]) <= 0.0:
+        print("[LOUDNORM] Измерения вырождены (тишина/сбой чтения) — переход на однопроходный режим.", flush=True)
+        return None
+    return data
 
 
 def main():
@@ -366,6 +383,10 @@ def main():
                         file=sys.stderr, flush=True)
                     raise SystemExit(2)
 
+        missing = [p for p in segments if not p.is_file()]
+        if missing:
+            raise SystemExit(f"[P0-GUARD] Отсутствуют сегменты для concat: {[str(p) for p in missing]}")
+
         Path("build").mkdir(exist_ok=True)
         Path("build/actual_timings.json").write_text(
             json.dumps(actual_timings, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -382,9 +403,17 @@ def main():
                    f":offset={measured['target_offset']}:linear=true")
 
         final_out = out_dir / f"{project_name}.mp4"
-        run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list),
-             "-map", "0:v", "-map", "0:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-             "-af", ln, "-movflags", "+faststart", str(final_out)])
+        final_cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list),
+                     "-map", "0:v", "-map", "0:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                     "-af", ln, "-movflags", "+faststart", str(final_out)]
+        try:
+            run(final_cmd)
+        except subprocess.CalledProcessError:
+            print("[WARN] Двухпроходный loudnorm отклонён FFmpeg — повторяю финал в однопроходном режиме.",
+                  flush=True)
+            run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list),
+                 "-map", "0:v", "-map", "0:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                 "-af", "loudnorm=I=-14:TP=-1:LRA=11", "-movflags", "+faststart", str(final_out)])
 
         total = sum(t["duration"] for t in actual_timings)
         print(f"[DONE] {final_out} | {fmt_clock(total)} | {len(segments)} сцен | "
@@ -427,6 +456,7 @@ def main():
         qc = {"duration_sec": round(total, 3), "duration_formatted": fmt_clock(total),
               "integrated_lufs": -14.0, "scenes": len(segments),
               "resolution": f"{w}x{h}", "fps": fps,
+              "loudnorm_mode": "two-pass" if measured else "single-pass",
               "encode_speed_x": round((content_done / 60.0) / max((time.monotonic() - t0) / 60.0, 0.01), 3)}
         Path("qc_report.json").write_text(json.dumps(qc, ensure_ascii=False, indent=2), encoding="utf-8")
     finally:
