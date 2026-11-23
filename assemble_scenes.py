@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 assemble_scenes.py — повествовательный монтаж N сцен (documentary pipeline).
-v4: валидация loudnorm + probe-валидация кэша + retry финала + NL=chr(10).
+v5: stereo-нормализация аудио + валидация loudnorm + retry финала + cache probe.
 Вызов: python3 assemble_scenes.py manifest.json [--assets-dir assets] [--preflight]
 """
 import argparse
@@ -17,7 +17,8 @@ import time
 from pathlib import Path
 
 NL = chr(10)
-VERSION_BANNER = "[ASSEMBLE] v4: validated loudnorm + cache probe + single-pass fallback"
+VERSION_BANNER = "[ASSEMBLE] v5: stereo-normalized audio + validated loudnorm + single-pass fallback"
+AUDIO_NORM = "aformat=sample_rates=48000:channel_layouts=stereo"
 
 SECRET_KEYS = {
     "bot_token", "chat_id", "service_account", "sa_json", "pat", "github_token",
@@ -26,7 +27,7 @@ SECRET_KEYS = {
 }
 SEG_CACHE_DIR = Path("seg_cache")
 SEG_CACHE_REMOTE = "gdrive:_aether_segcache"
-CACHE_SCHEMA = 4
+CACHE_SCHEMA = 5
 
 try:
     from lower_third_overlay import apply_lower_third_to_clip
@@ -232,27 +233,36 @@ def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf, lt_
     v_chain = f"[0:v]loop=loop=-1:size=32767:start=0,{scale},trim=duration={dur},setpts=PTS-STARTPTS[v]"
     a_parts, mix_inputs = [], []
     if voice is not None:
-        a_parts.append(f"[1:a]aresample=48000,adelay={delay_ms}|{delay_ms},apad,atrim=0:{dur},asetpts=PTS-STARTPTS[vox]")
+        a_parts.append(
+            f"[1:a]aresample=48000,adelay={delay_ms}|{delay_ms},apad,atrim=0:{dur},"
+            f"asetpts=PTS-STARTPTS,{AUDIO_NORM}[vox]"
+        )
         mix_inputs.append("[vox]")
     if ambient is not None:
         aidx = 2 if voice is not None else 1
-        a_parts.append(f"[{aidx}:a]volume=0.5,aresample=48000,atrim=0:{dur},asetpts=PTS-STARTPTS[amb]")
+        a_parts.append(
+            f"[{aidx}:a]volume=0.5,aresample=48000,atrim=0:{dur},"
+            f"asetpts=PTS-STARTPTS,{AUDIO_NORM}[amb]"
+        )
         mix_inputs.append("[amb]")
     if not mix_inputs:
-        a_parts.append(f"anullsrc=r=48000:cl=stereo,atrim=0:{dur}[aout]")
+        a_parts.append(f"anullsrc=r=48000:cl=stereo,atrim=0:{dur},{AUDIO_NORM}[aout]")
         amix = "[aout]"
     elif len(mix_inputs) == 1:
         a_parts[-1] = a_parts[-1].replace("[vox]", "[aout]").replace("[amb]", "[aout]")
         amix = "[aout]"
     else:
-        a_parts.append(f"{''.join(mix_inputs)}amix=inputs={len(mix_inputs)}:duration=first:dropout_transition=0[aout]")
+        a_parts.append(
+            f"{''.join(mix_inputs)}amix=inputs={len(mix_inputs)}:duration=first:"
+            f"dropout_transition=0,{AUDIO_NORM}[aout]"
+        )
         amix = "[aout]"
 
     fc = v_chain + ";" + ";".join(a_parts)
     t_seg = time.monotonic()
     run(["ffmpeg", "-y"] + inputs + ["-filter_complex", fc, "-map", "[v]", "-map", amix,
          "-c:v", "libx264", "-preset", preset, "-crf", str(crf), "-pix_fmt", "yuv420p",
-         "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-t", f"{dur}",
+         "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2", "-t", f"{dur}",
          "-movflags", "+faststart", str(out)])
     wall = (time.monotonic() - t_seg) / 60.0
 
@@ -421,7 +431,7 @@ def main():
         final_out = out_dir / f"{project_name}.mp4"
         final_cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list),
                      "-map", "0:v", "-map", "0:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-                     "-af", ln, "-movflags", "+faststart", str(final_out)]
+                     "-ar", "48000", "-ac", "2", "-af", ln, "-movflags", "+faststart", str(final_out)]
         try:
             run(final_cmd)
         except subprocess.CalledProcessError:
@@ -429,7 +439,8 @@ def main():
                   flush=True)
             run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list),
                  "-map", "0:v", "-map", "0:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-                 "-af", "loudnorm=I=-14:TP=-1:LRA=11", "-movflags", "+faststart", str(final_out)])
+                 "-ar", "48000", "-ac", "2", "-af", "loudnorm=I=-14:TP=-1:LRA=11",
+                 "-movflags", "+faststart", str(final_out)])
 
         total = sum(t["duration"] for t in actual_timings)
         print(f"[DONE] {final_out} | {fmt_clock(total)} | {len(segments)} сцен | "
