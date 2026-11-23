@@ -1,11 +1,7 @@
 #!/usr/bin/env python3
 """
 assemble_scenes.py — повествовательный монтаж N сцен (documentary pipeline).
-Финальная версия: фиксы P0 + защита от 6-часового капа + безопасный loudnorm.
-  1) Resume-cache: сегменты в seg_cache/ и дубль на Google Drive (_aether_segcache/).
-  2) Fail-fast бюджет: проекция скорости после 3 сегментов, ранний выход при > AETHER_BUDGET_MINUTES.
-  3) Финал = concat -c copy + аудио-loudnorm; превью = первые 120 с.
-  4) Loudnorm: двухпроходный ТОЛЬКО при валидных измерениях; иначе однопроходный + retry-фолбэк.
+v4: валидация loudnorm + probe-валидация кэша + retry финала + NL=chr(10).
 Вызов: python3 assemble_scenes.py manifest.json [--assets-dir assets] [--preflight]
 """
 import argparse
@@ -20,6 +16,9 @@ import sys
 import time
 from pathlib import Path
 
+NL = chr(10)
+VERSION_BANNER = "[ASSEMBLE] v4: validated loudnorm + cache probe + single-pass fallback"
+
 SECRET_KEYS = {
     "bot_token", "chat_id", "service_account", "sa_json", "pat", "github_token",
     "access_token", "refresh_token", "client_secret", "api_key", "token",
@@ -27,7 +26,7 @@ SECRET_KEYS = {
 }
 SEG_CACHE_DIR = Path("seg_cache")
 SEG_CACHE_REMOTE = "gdrive:_aether_segcache"
-CACHE_SCHEMA = 3
+CACHE_SCHEMA = 4
 
 try:
     from lower_third_overlay import apply_lower_third_to_clip
@@ -45,7 +44,7 @@ def scrub(o):
 
 
 def run(cmd, capture=False):
-    print("\n[EXEC]: " + (" ".join(str(c) for c in cmd) if isinstance(cmd, list) else str(cmd)), flush=True)
+    print(f"{NL}[EXEC]: " + (" ".join(str(c) for c in cmd) if isinstance(cmd, list) else str(cmd)), flush=True)
     if capture:
         return subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     return subprocess.run(cmd, check=True)
@@ -66,6 +65,14 @@ def probe(path):
     dur = float(data.get("format", {}).get("duration", 0) or 0)
     a = next((s for s in data.get("streams", []) if s.get("codec_type") == "audio"), None)
     return {"duration": dur, "has_audio": a is not None}
+
+
+def segment_is_valid(path):
+    try:
+        info = probe(path)
+        return info["duration"] > 0 and info["has_audio"]
+    except Exception:
+        return False
 
 
 def fmt_clock(sec):
@@ -155,17 +162,25 @@ def seg_cache_key(entry, vid, voice, ambient, w, h, fps, preset, crf, lt_on, dur
 def cache_get(key):
     local = SEG_CACHE_DIR / f"{key}.mp4"
     if local.is_file() and local.stat().st_size > 1024:
+        if segment_is_valid(local):
+            print(f"[CACHE HIT] seg {key[:10]} (local)", flush=True)
+            return local
+        print(f"[CACHE CORRUPT] seg {key[:10]} (local) — удалён, будет перекодирован", flush=True)
         try:
-            if probe(local)["duration"] > 0:
-                print(f"[CACHE HIT] seg {key[:10]} (local)", flush=True)
-                return local
+            local.unlink()
         except Exception:
             pass
     SEG_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     if try_run(["rclone", "copyto", f"{SEG_CACHE_REMOTE}/{key}.mp4", str(local), "--transfers", "2"]):
         if local.is_file() and local.stat().st_size > 1024:
-            print(f"[CACHE HIT] seg {key[:10]} (Google Drive)", flush=True)
-            return local
+            if segment_is_valid(local):
+                print(f"[CACHE HIT] seg {key[:10]} (Google Drive)", flush=True)
+                return local
+            print(f"[CACHE CORRUPT] seg {key[:10]} (Google Drive) — удалён, будет перекодирован", flush=True)
+            try:
+                local.unlink()
+            except Exception:
+                pass
     return None
 
 
@@ -254,6 +269,8 @@ def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf, lt_
             work_dir=str(tmp_dir / f"lt_{idx:03d}"),
         )
         final_out = ov
+    if not segment_is_valid(final_out):
+        raise SystemExit(f"[P0-GUARD] Сегмент сцены #{idx} собран невалидно (нет видео/аудио).")
     print(f"[SEG {idx}] {dur:.1f}s контента за {wall:.1f} мин wall "
           f"(speed {dur / 60.0 / max(wall, 0.01):.2f}x)", flush=True)
     cache_put(key, final_out)
@@ -268,8 +285,7 @@ def _is_finite(value):
 
 
 def measure_loudness(concat_list):
-    """Первый проход loudnorm. Возвращает None, если измерения невалидны
-    (-inf / inf / нулевая LRA / порог -70) — тогда используется однопроходный режим."""
+    """Первый проход loudnorm. Возвращает None, если измерения невалидны."""
     res = subprocess.run(
         ["ffmpeg", "-f", "concat", "-safe", "0", "-i", str(concat_list),
          "-map", "0:a", "-af", "loudnorm=I=-14:TP=-1:LRA=11:print_format=json", "-f", "null", "-"],
@@ -292,6 +308,7 @@ def measure_loudness(concat_list):
 
 
 def main():
+    print(VERSION_BANNER, flush=True)
     ap = argparse.ArgumentParser()
     ap.add_argument("manifest", nargs="?", default="manifest.json")
     ap.add_argument("--assets-dir", default="assets")
@@ -374,18 +391,17 @@ def main():
                 print(f"[BUDGET] готово {content_done / 60:.1f}/{total_content / 60:.1f} мин контента, "
                       f"speed {speed:.2f}x, проекция {projected:.0f} мин", flush=True)
                 if projected > budget_min:
-                    print(
-                        "[BUDGET-ABORT] Проекция не влезает в 6-часовой кап GitHub Actions.\n"
-                        f"  Текущая скорость: {speed:.2f}x при {w}x{h} {preset} crf{crf}.\n"
-                        "  Варианты: (а) resolution 2k/1080p; (б) preset ultrafast + crf 23;\n"
-                        "  (в) self-hosted runner / NVENC; (г) разбить манифест на два запуска.\n"
-                        "  Сегменты сохранены в кэше — после смены настроек прогресс не потеряется.",
-                        file=sys.stderr, flush=True)
+                    print(f"""[BUDGET-ABORT] Проекция не влезает в 6-часовой кап GitHub Actions.
+  Текущая скорость: {speed:.2f}x при {w}x{h} {preset} crf{crf}.
+  Варианты: (а) resolution 2k/1080p; (б) preset ultrafast + crf 23;
+  (в) self-hosted runner / NVENC; (г) разбить манифест на два запуска.
+  Сегменты сохранены в кэше — после смены настроек прогресс не потеряется.""",
+                          file=sys.stderr, flush=True)
                     raise SystemExit(2)
 
-        missing = [p for p in segments if not p.is_file()]
-        if missing:
-            raise SystemExit(f"[P0-GUARD] Отсутствуют сегменты для concat: {[str(p) for p in missing]}")
+        bad = [p for p in segments if not p.is_file() or not segment_is_valid(p)]
+        if bad:
+            raise SystemExit(f"[P0-GUARD] Невалидные сегменты для concat: {[str(p) for p in bad]}")
 
         Path("build").mkdir(exist_ok=True)
         Path("build/actual_timings.json").write_text(
@@ -393,7 +409,7 @@ def main():
 
         concat_list = tmp_dir / "concat.txt"
         concat_list.write_text(
-            "".join(f"file '{p.resolve().as_posix()}'\n" for p in segments), encoding="utf-8")
+            "".join(f"file '{p.resolve().as_posix()}'{NL}" for p in segments), encoding="utf-8")
 
         measured = measure_loudness(concat_list)
         ln = "loudnorm=I=-14:TP=-1:LRA=11"
@@ -426,7 +442,7 @@ def main():
                      or entries[t["scene_index"] - 1].get("name")
                      or f"Scene {t['scene_index']}")
             chapters.append(f"{fmt_clock(t['scene_start'])} {label}")
-        (out_dir / "output_chapters.txt").write_text("\n".join(chapters) + "\n", encoding="utf-8")
+        (out_dir / "output_chapters.txt").write_text(NL.join(chapters) + NL, encoding="utf-8")
 
         for lang in ("en", "ru"):
             lines, n = [], 1
@@ -434,10 +450,10 @@ def main():
                 subs = entries[t["scene_index"] - 1].get("subtitles") or {}
                 text = str(subs.get(lang, "")).strip()
                 if text and t["scene_end"] > t["voice_start"]:
-                    lines.append(f"{n}\n{fmt_srt(t['voice_start'])} --> {fmt_srt(t['scene_end'])}\n{text}\n")
+                    lines.append(f"{n}{NL}{fmt_srt(t['voice_start'])} --> {fmt_srt(t['scene_end'])}{NL}{text}{NL}")
                     n += 1
             if lines:
-                (out_dir / f"{project_name}_{lang.upper()}.srt").write_text("\n".join(lines), encoding="utf-8")
+                (out_dir / f"{project_name}_{lang.upper()}.srt").write_text(NL.join(lines), encoding="utf-8")
 
         card = [f"# Release Card: {manifest.get('video_title', project_name)}", "",
                 f"- **Project:** `{project_name}`",
@@ -446,7 +462,7 @@ def main():
                 f"- **Scenes:** `{len(segments)}`",
                 f"- **Loudness:** `-14 LUFS / -1 dBTP`", "",
                 "## Chapters", "", *chapters, ""]
-        (out_dir / "RELEASE_CARD.md").write_text("\n".join(card), encoding="utf-8")
+        (out_dir / "RELEASE_CARD.md").write_text(NL.join(card), encoding="utf-8")
 
         preview = out_dir / f"{project_name}_720p_preview.mp4"
         run(["ffmpeg", "-y", "-i", str(final_out), "-t", "120", "-vf", "scale=1280:720",
