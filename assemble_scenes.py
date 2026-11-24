@@ -1,13 +1,7 @@
 #!/usr/bin/env python3
 """
 assemble_scenes.py — повествовательный монтаж N сцен (documentary pipeline).
-Финальная версия: функциональные фиксы P0 + защита от 6-часового капа GitHub Actions.
-  1) Resume-cache: готовые сегменты лежат в seg_cache/ и дублируются на Google Drive
-     (_aether_segcache/). После отмены/сбоя повторный запуск продолжает с места обрыва.
-  2) Fail-fast бюджет: после 3 сегментов измеряется реальная скорость и строится проекция;
-     если проекция > AETHER_BUDGET_MINUTES (default 330) — ранний выход с рекомендациями.
-  3) Без двойного прохода: финал = concat -c copy + аудио-loudnorm (с защитой от -inf/nan);
-     превью = первые 120 с.
+v6: normalize ключей + stereo-аудио + валидация loudnorm + retry финала + cache probe.
 Вызов: python3 assemble_scenes.py manifest.json [--assets-dir assets] [--preflight]
 """
 import argparse
@@ -22,6 +16,10 @@ import sys
 import time
 from pathlib import Path
 
+NL = chr(10)
+VERSION_BANNER = "[ASSEMBLE] v6: normalized keys + stereo audio + validated loudnorm + retry"
+AUDIO_NORM = "aformat=sample_rates=48000:channel_layouts=stereo"
+
 SECRET_KEYS = {
     "bot_token", "chat_id", "service_account", "sa_json", "pat", "github_token",
     "access_token", "refresh_token", "client_secret", "api_key", "token",
@@ -29,7 +27,7 @@ SECRET_KEYS = {
 }
 SEG_CACHE_DIR = Path("seg_cache")
 SEG_CACHE_REMOTE = "gdrive:_aether_segcache"
-CACHE_SCHEMA = 3
+CACHE_SCHEMA = 6
 
 try:
     from lower_third_overlay import apply_lower_third_to_clip
@@ -57,7 +55,7 @@ def normalize(o):
 
 
 def run(cmd, capture=False):
-    print("\n[EXEC]: " + (" ".join(str(c) for c in cmd) if isinstance(cmd, list) else str(cmd)), flush=True)
+    print(f"{NL}[EXEC]: " + (" ".join(str(c) for c in cmd) if isinstance(cmd, list) else str(cmd)), flush=True)
     if capture:
         return subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     return subprocess.run(cmd, check=True)
@@ -78,6 +76,14 @@ def probe(path):
     dur = float(data.get("format", {}).get("duration", 0) or 0)
     a = next((s for s in data.get("streams", []) if s.get("codec_type") == "audio"), None)
     return {"duration": dur, "has_audio": a is not None}
+
+
+def segment_is_valid(path):
+    try:
+        info = probe(path)
+        return info["duration"] > 0 and info["has_audio"]
+    except Exception:
+        return False
 
 
 def fmt_clock(sec):
@@ -167,17 +173,25 @@ def seg_cache_key(entry, vid, voice, ambient, w, h, fps, preset, crf, lt_on, dur
 def cache_get(key):
     local = SEG_CACHE_DIR / f"{key}.mp4"
     if local.is_file() and local.stat().st_size > 1024:
+        if segment_is_valid(local):
+            print(f"[CACHE HIT] seg {key[:10]} (local)", flush=True)
+            return local
+        print(f"[CACHE CORRUPT] seg {key[:10]} (local) — удалён, будет перекодирован", flush=True)
         try:
-            if probe(local)["duration"] > 0:
-                print(f"[CACHE HIT] seg {key[:10]} (local)", flush=True)
-                return local
+            local.unlink()
         except Exception:
             pass
     SEG_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     if try_run(["rclone", "copyto", f"{SEG_CACHE_REMOTE}/{key}.mp4", str(local), "--transfers", "2"]):
         if local.is_file() and local.stat().st_size > 1024:
-            print(f"[CACHE HIT] seg {key[:10]} (Google Drive)", flush=True)
-            return local
+            if segment_is_valid(local):
+                print(f"[CACHE HIT] seg {key[:10]} (Google Drive)", flush=True)
+                return local
+            print(f"[CACHE CORRUPT] seg {key[:10]} (Google Drive) — удалён, будет перекодирован", flush=True)
+            try:
+                local.unlink()
+            except Exception:
+                pass
     return None
 
 
@@ -229,27 +243,36 @@ def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf, lt_
     v_chain = f"[0:v]loop=loop=-1:size=32767:start=0,{scale},trim=duration={dur},setpts=PTS-STARTPTS[v]"
     a_parts, mix_inputs = [], []
     if voice is not None:
-        a_parts.append(f"[1:a]aresample=48000,adelay={delay_ms}|{delay_ms},apad,atrim=0:{dur},asetpts=PTS-STARTPTS[vox]")
+        a_parts.append(
+            f"[1:a]aresample=48000,adelay={delay_ms}|{delay_ms},apad,atrim=0:{dur},"
+            f"asetpts=PTS-STARTPTS,{AUDIO_NORM}[vox]"
+        )
         mix_inputs.append("[vox]")
     if ambient is not None:
         aidx = 2 if voice is not None else 1
-        a_parts.append(f"[{aidx}:a]volume=0.5,aresample=48000,atrim=0:{dur},asetpts=PTS-STARTPTS[amb]")
+        a_parts.append(
+            f"[{aidx}:a]volume=0.5,aresample=48000,atrim=0:{dur},"
+            f"asetpts=PTS-STARTPTS,{AUDIO_NORM}[amb]"
+        )
         mix_inputs.append("[amb]")
     if not mix_inputs:
-        a_parts.append(f"anullsrc=r=48000:cl=stereo,atrim=0:{dur}[aout]")
+        a_parts.append(f"anullsrc=r=48000:cl=stereo,atrim=0:{dur},{AUDIO_NORM}[aout]")
         amix = "[aout]"
     elif len(mix_inputs) == 1:
         a_parts[-1] = a_parts[-1].replace("[vox]", "[aout]").replace("[amb]", "[aout]")
         amix = "[aout]"
     else:
-        a_parts.append(f"{''.join(mix_inputs)}amix=inputs={len(mix_inputs)}:duration=first:dropout_transition=0[aout]")
+        a_parts.append(
+            f"{''.join(mix_inputs)}amix=inputs={len(mix_inputs)}:duration=first:"
+            f"dropout_transition=0,{AUDIO_NORM}[aout]"
+        )
         amix = "[aout]"
 
     fc = v_chain + ";" + ";".join(a_parts)
     t_seg = time.monotonic()
     run(["ffmpeg", "-y"] + inputs + ["-filter_complex", fc, "-map", "[v]", "-map", amix,
          "-c:v", "libx264", "-preset", preset, "-crf", str(crf), "-pix_fmt", "yuv420p",
-         "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-t", f"{dur}",
+         "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2", "-t", f"{dur}",
          "-movflags", "+faststart", str(out)])
     wall = (time.monotonic() - t_seg) / 60.0
 
@@ -266,20 +289,23 @@ def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf, lt_
             work_dir=str(tmp_dir / f"lt_{idx:03d}"),
         )
         final_out = ov
+    if not segment_is_valid(final_out):
+        raise SystemExit(f"[P0-GUARD] Сегмент сцены #{idx} собран невалидно (нет видео/аудио).")
     print(f"[SEG {idx}] {dur:.1f}s контента за {wall:.1f} мин wall "
           f"(speed {dur / 60.0 / max(wall, 0.01):.2f}x)", flush=True)
     cache_put(key, final_out)
     return final_out, dur
 
 
-def _is_finite_num(val) -> bool:
+def _is_finite(value):
     try:
-        return math.isfinite(float(val))
+        return math.isfinite(float(value))
     except (TypeError, ValueError):
         return False
 
 
 def measure_loudness(concat_list):
+    """Первый проход loudnorm. None, если измерения невалидны или вырождены."""
     res = subprocess.run(
         ["ffmpeg", "-f", "concat", "-safe", "0", "-i", str(concat_list),
          "-map", "0:a", "-af", "loudnorm=I=-14:TP=-1:LRA=11:print_format=json", "-f", "null", "-"],
@@ -288,17 +314,21 @@ def measure_loudness(concat_list):
     if not m:
         return None
     try:
-        parsed = json.loads(m[-1])
-        required_keys = ("input_i", "input_tp", "input_lra", "input_thresh", "target_offset")
-        if not all(_is_finite_num(parsed.get(k)) for k in required_keys):
-            print(f"[WARN] Non-finite loudnorm metrics ({parsed}), falling back to single-pass.", flush=True)
-            return None
-        return parsed
+        data = json.loads(m[-1])
     except Exception:
         return None
+    keys = ("input_i", "input_tp", "input_lra", "input_thresh", "target_offset")
+    if not all(_is_finite(data.get(k)) for k in keys):
+        print("[LOUDNORM] Измерения содержат inf/NaN — переход на однопроходный режим.", flush=True)
+        return None
+    if float(data["input_i"]) <= -70.0 or float(data["input_lra"]) <= 0.0:
+        print("[LOUDNORM] Измерения вырождены (тишина/сбой чтения) — переход на однопроходный режим.", flush=True)
+        return None
+    return data
 
 
 def main():
+    print(VERSION_BANNER, flush=True)
     ap = argparse.ArgumentParser()
     ap.add_argument("manifest", nargs="?", default="manifest.json")
     ap.add_argument("--assets-dir", default="assets")
@@ -350,7 +380,7 @@ def main():
               or (e.get("assets") or {}).get("video_file")
               or (e.get("assets") or {}).get("image_reference"))
         vp = resolve_asset(fn, assets_dir, folder_id)
-        total_content += entry_duration(e, vp) if vp else float(e.get("duration_sec") or 6.0)
+        total_content += entry_duration(e, vp) if vp else float(e.get("duration_sec") or e.get("duration") or 6.0)
     print(f"[PLAN] Контента: {total_content / 60:.1f} мин • {w}x{h} {fps}fps "
           f"{preset} crf{crf} • бюджет {budget_min:.0f} мин", flush=True)
 
@@ -381,14 +411,17 @@ def main():
                 print(f"[BUDGET] готово {content_done / 60:.1f}/{total_content / 60:.1f} мин контента, "
                       f"speed {speed:.2f}x, проекция {projected:.0f} мин", flush=True)
                 if projected > budget_min:
-                    print(
-                        "[BUDGET-ABORT] Проекция не влезает в 6-часовой кап GitHub Actions.\n"
-                        f"  Текущая скорость: {speed:.2f}x при {w}x{h} {preset} crf{crf}.\n"
-                        "  Варианты: (а) resolution 2k/1080p; (б) preset ultrafast + crf 23;\n"
-                        "  (в) self-hosted runner / NVENC; (г) разбить манифест на два запуска.\n"
-                        "  Сегменты сохранены в кэше — после смены настроек прогресс не потеряется.",
-                        file=sys.stderr, flush=True)
+                    print(f"""[BUDGET-ABORT] Проекция не влезает в 6-часовой кап GitHub Actions.
+  Текущая скорость: {speed:.2f}x при {w}x{h} {preset} crf{crf}.
+  Варианты: (а) resolution 2k/1080p; (б) preset ultrafast + crf 23;
+  (в) self-hosted runner / NVENC; (г) разбить манифест на два запуска.
+  Сегменты сохранены в кэше — после смены настроек прогресс не потеряется.""",
+                          file=sys.stderr, flush=True)
                     raise SystemExit(2)
+
+        bad = [p for p in segments if not p.is_file() or not segment_is_valid(p)]
+        if bad:
+            raise SystemExit(f"[P0-GUARD] Невалидные сегменты для concat: {[str(p) for p in bad]}")
 
         Path("build").mkdir(exist_ok=True)
         Path("build/actual_timings.json").write_text(
@@ -396,7 +429,7 @@ def main():
 
         concat_list = tmp_dir / "concat.txt"
         concat_list.write_text(
-            "".join(f"file '{p.resolve().as_posix()}'\n" for p in segments), encoding="utf-8")
+            "".join(f"file '{p.resolve().as_posix()}'{NL}" for p in segments), encoding="utf-8")
 
         measured = measure_loudness(concat_list)
         ln = "loudnorm=I=-14:TP=-1:LRA=11"
@@ -406,9 +439,18 @@ def main():
                    f":offset={measured['target_offset']}:linear=true")
 
         final_out = out_dir / f"{project_name}.mp4"
-        run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list),
-             "-map", "0:v", "-map", "0:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-             "-af", ln, "-movflags", "+faststart", str(final_out)])
+        final_cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list),
+                     "-map", "0:v", "-map", "0:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                     "-ar", "48000", "-ac", "2", "-af", ln, "-movflags", "+faststart", str(final_out)]
+        try:
+            run(final_cmd)
+        except subprocess.CalledProcessError:
+            print("[WARN] Двухпроходный loudnorm отклонён FFmpeg — повторяю финал в однопроходном режиме.",
+                  flush=True)
+            run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list),
+                 "-map", "0:v", "-map", "0:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                 "-ar", "48000", "-ac", "2", "-af", "loudnorm=I=-14:TP=-1:LRA=11",
+                 "-movflags", "+faststart", str(final_out)])
 
         total = sum(t["duration"] for t in actual_timings)
         print(f"[DONE] {final_out} | {fmt_clock(total)} | {len(segments)} сцен | "
@@ -421,7 +463,7 @@ def main():
                      or entries[t["scene_index"] - 1].get("name")
                      or f"Scene {t['scene_index']}")
             chapters.append(f"{fmt_clock(t['scene_start'])} {label}")
-        (out_dir / "output_chapters.txt").write_text("\n".join(chapters) + "\n", encoding="utf-8")
+        (out_dir / "output_chapters.txt").write_text(NL.join(chapters) + NL, encoding="utf-8")
 
         for lang in ("en", "ru"):
             lines, n = [], 1
@@ -429,10 +471,10 @@ def main():
                 subs = entries[t["scene_index"] - 1].get("subtitles") or {}
                 text = str(subs.get(lang) or subs.get(lang.upper()) or "").strip()
                 if text and t["scene_end"] > t["voice_start"]:
-                    lines.append(f"{n}\n{fmt_srt(t['voice_start'])} --> {fmt_srt(t['scene_end'])}\n{text}\n")
+                    lines.append(f"{n}{NL}{fmt_srt(t['voice_start'])} --> {fmt_srt(t['scene_end'])}{NL}{text}{NL}")
                     n += 1
             if lines:
-                (out_dir / f"{project_name}_{lang.upper()}.srt").write_text("\n".join(lines), encoding="utf-8")
+                (out_dir / f"{project_name}_{lang.upper()}.srt").write_text(NL.join(lines), encoding="utf-8")
 
         card = [f"# Release Card: {manifest.get('video_title', project_name)}", "",
                 f"- **Project:** `{project_name}`",
@@ -441,7 +483,7 @@ def main():
                 f"- **Scenes:** `{len(segments)}`",
                 f"- **Loudness:** `-14 LUFS / -1 dBTP`", "",
                 "## Chapters", "", *chapters, ""]
-        (out_dir / "RELEASE_CARD.md").write_text("\n".join(card), encoding="utf-8")
+        (out_dir / "RELEASE_CARD.md").write_text(NL.join(card), encoding="utf-8")
 
         preview = out_dir / f"{project_name}_720p_preview.mp4"
         run(["ffmpeg", "-y", "-i", str(final_out), "-t", "120", "-vf", "scale=1280:720",
@@ -451,6 +493,7 @@ def main():
         qc = {"duration_sec": round(total, 3), "duration_formatted": fmt_clock(total),
               "integrated_lufs": -14.0, "scenes": len(segments),
               "resolution": f"{w}x{h}", "fps": fps,
+              "loudnorm_mode": "two-pass" if measured else "single-pass",
               "encode_speed_x": round((content_done / 60.0) / max((time.monotonic() - t0) / 60.0, 0.01), 3)}
         Path("qc_report.json").write_text(json.dumps(qc, ensure_ascii=False, indent=2), encoding="utf-8")
     finally:
