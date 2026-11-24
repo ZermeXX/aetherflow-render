@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+seg_cache/
+output/
+assets/
+temp_render/
