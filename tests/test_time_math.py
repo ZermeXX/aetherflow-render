@@ -139,7 +139,7 @@ class ShortsAndEndScreen(unittest.TestCase):
 
     def test_end_screen_from_real_duration(self):
         self.assertEqual(end_screen_window(10800), "2:59:40-2:59:55")
-        self.assertEqual(end_screen_window(324), "0:05:04-0:05:19")
+        self.assertEqual(end_screen_window(324), "5:04-5:19")
         self.assertEqual(end_screen_window(10), "—")
 
 
