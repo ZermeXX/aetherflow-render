@@ -325,8 +325,25 @@ def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf,
     if not all(math.isfinite(g) and 0 <= g <= 4 for g in (voice_gain, ambient_gain)):
         raise ValueError("Audio volume must be finite and between 0 and 4")
     dur = entry_duration(entry, vid, voice, sentence_pad)
-    text_overlay = (entry.get("text_overlay") or "").strip()
-    lt_on = HAS_LT and bool(lt_cfg.get("enabled", True)) and bool(text_overlay)
+    text_overlay = str(entry.get("text_overlay") or "").strip()
+    lower = entry.get("lower_third") or {}
+    if isinstance(lower, dict) and not text_overlay:
+        location = str(lower.get("location") or entry.get("location") or "").strip()
+        era = str(lower.get("era") or entry.get("date_era") or "").strip()
+        title = str(lower.get("title") or "").strip()
+        text_overlay = location + "\n" + " • ".join(x for x in (era, title) if x)
+        text_overlay = text_overlay.strip()
+    lt_on = bool(lt_cfg.get("enabled", True)) and bool(text_overlay)
+    if lt_on and not HAS_LT:
+        raise SystemExit("[BRANDING] lower_third_overlay unavailable")
+    lt_cfg = dict(lt_cfg)
+    if lt_on:
+        emblem = resolve_asset(lt_cfg.get("emblem_path") or "aether_art_150x150_A.png", assets_dir, folder_id)
+        if emblem is None:
+            emblem = resolve_asset("aether_art_150x150_A.png", assets_dir, folder_id)
+        if emblem is None:
+            print("[BRANDING WARN] emblem missing; rendering text panel only", flush=True)
+        lt_cfg["emblem_path"] = str(emblem) if emblem else ""
 
     key = seg_cache_key(entry, vid, voice, ambient, w, h, fps, preset, crf, lt_on, dur, maxrate_mbps, lt_cfg, bufsize_mbps)
     transition = transition_filter(incoming, outgoing, dur)
@@ -403,7 +420,8 @@ def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf,
             emblem_path=str(lt_cfg.get("emblem_path", "")) or None,
             show_start=float(show[0]), show_end=float(show[1]),
             anim_dur=float(lt_cfg.get("anim_sec", 0.55)),
-            work_dir=str(tmp_dir / f"lt_{idx:03d}"),
+            work_dir=str(tmp_dir / f"lt_{idx:03d}"), config=lt_cfg,
+            crf=crf, preset=preset, maxrate=maxrate_mbps, bufsize=bufsize_mbps,
         )
         final_out = ov
     if not segment_is_valid(final_out, expected):
