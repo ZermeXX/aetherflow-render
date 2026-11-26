@@ -1,0 +1,59 @@
+{
+  "configuration_version": "8.0",
+  "description": "Editorial synchronization preset. Merge anti_desync_locks and scene_defaults into manifest. Not automatically loaded. Boolean legacy locks are descriptive, not runtime switches.",
+  "anti_desync_locks": {
+    "voiceover_sentence_pad_sec": 0.35
+  },
+  "scene_defaults": {
+    "voice_start": 0.2
+  },
+  "renderer_contract": {
+    "hard_frame_lock": {
+      "status": "partial",
+      "description": "Target fps and duration checked per segment; exact frame-count lock not verified."
+    },
+    "apad_atrim_padding": {
+      "status": "implemented",
+      "description": "Pad and trim audio to effective scene duration."
+    },
+    "never_stretch_voiceover": {
+      "status": "implemented",
+      "description": "No voice tempo stretching in scene audio chain."
+    },
+    "voiceover_duration_protection": {
+      "status": "implemented",
+      "description": "Effective duration at least probed voice duration plus voice_start and sentence padding when probe succeeds."
+    },
+    "zero_speech_overlap": {
+      "status": "implemented_by_design",
+      "description": "Sequential segment concat, no audio crossfade; actual sync requires output QC."
+    },
+    "decoupled_video_transitions": {
+      "status": "implemented",
+      "description": "Video-only fades without timeline overlap."
+    },
+    "continuous_voice_master": {
+      "status": "unsupported"
+    },
+    "acrossfade_offset_compensation": {
+      "status": "not_applicable"
+    },
+    "voiceover_lead_in_sec": {
+      "status": "scene_field",
+      "field": "voice_start"
+    },
+    "voiceover_sentence_pad_sec": {
+      "status": "runtime_field",
+      "field": "anti_desync_locks.voiceover_sentence_pad_sec"
+    },
+    "preview_duration_check": {
+      "status": "workflow_check",
+      "tolerance_sec": 0.25,
+      "reference": "actual master duration or explicit preview limit"
+    },
+    "exact_master_duration_check": {
+      "status": "not_enforced",
+      "description": "Effective duration may exceed planned duration; exact frame and speech alignment require end-to-end verification."
+    }
+  }
+}
