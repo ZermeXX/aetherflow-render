@@ -28,7 +28,7 @@ SECRET_KEYS = {
 }
 SEG_CACHE_DIR = Path("seg_cache")
 SEG_CACHE_REMOTE = "gdrive:_aether_segcache"
-CACHE_SCHEMA = 10
+CACHE_SCHEMA = 11
 
 try:
     from lower_third_overlay import apply_lower_third_to_clip
@@ -77,14 +77,24 @@ def probe(path):
     dur = float(data.get("format", {}).get("duration", 0) or 0)
     a = next((s for s in data.get("streams", []) if s.get("codec_type") == "audio"), None)
     v = next((s for s in data.get("streams", []) if s.get("codec_type") == "video"), {})
-    return {"duration": dur, "has_audio": a is not None,
+    return {"duration": dur, "has_audio": a is not None, "has_video": bool(v),
+            "width": v.get("width"), "height": v.get("height"),
+            "fps": v.get("avg_frame_rate"),
             "bit_rate": int(v.get("bit_rate") or (data.get("format") or {}).get("bit_rate") or 0)}
 
 
-def segment_is_valid(path):
+def segment_is_valid(path, expected=None):
     try:
         info = probe(path)
-        return info["duration"] > 0 and info["has_audio"]
+        if not (info["duration"] > 0 and info["has_audio"] and info["has_video"]):
+            return False
+        if expected is None:
+            return True
+        dur, w, h, fps = expected
+        num, den = map(int, info["fps"].split("/"))
+        return (abs(info["duration"] - dur) <= max(0.12, 2 / fps)
+                and (info["width"], info["height"]) == (w, h)
+                and den > 0 and abs(num / den - fps) < 0.05)
     except Exception:
         return False
 
@@ -158,58 +168,77 @@ def entry_duration(entry, vid_path, voice_path=None, sentence_pad=0.35):
     return dur
 
 
-def seg_cache_key(entry, vid, voice, ambient, w, h, fps, preset, crf, lt_on, dur, maxrate):
+def file_fingerprint(path):
+    if not path:
+        return None
+    path = Path(path)
+    if not path.is_file():
+        return {"missing": str(path)}
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return {"size": path.stat().st_size, "sha256": digest.hexdigest()}
+
+
+def seg_cache_key(entry, vid, voice, ambient, w, h, fps, preset, crf, lt_on, dur, maxrate, lt_cfg, bufsize):
     payload = {
         "ver": CACHE_SCHEMA,
-        "vid": [vid.name, vid.stat().st_size],
-        "voice": [voice.name, voice.stat().st_size] if voice else None,
-        "ambient": [ambient.name, ambient.stat().st_size] if ambient else None,
-        "dur": round(dur, 2),
+        "renderer": file_fingerprint(__file__),
+        "vid": file_fingerprint(vid),
+        "voice": file_fingerprint(voice),
+        "ambient": file_fingerprint(ambient),
+        "dur": dur,
         "vs": entry.get("voice_start", 0.2),
         "camera_movement": entry.get("camera_movement", "static"),
         "camera_zoom": entry.get("camera_zoom", 1.12),
         "w": w, "h": h, "fps": fps, "preset": preset, "crf": crf,
-        "maxrate": maxrate,
+        "maxrate": maxrate, "bufsize": bufsize,
         "lt": bool(lt_on),
-        "overlay": (entry.get("text_overlay") or "").strip()[:80],
+        "overlay": entry.get("text_overlay"),
+        "lower_third": entry.get("lower_third"),
+        "lt_cfg": lt_cfg if lt_on else None,
+        "emblem": file_fingerprint(lt_cfg.get("emblem_path")) if lt_on else None,
+        "overlay_engine": file_fingerprint(Path(__file__).with_name("lower_third_overlay.py")) if lt_on else None,
     }
-    return hashlib.md5(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
-def cache_get(key):
+def cache_get(key, expected):
     local = SEG_CACHE_DIR / f"{key}.mp4"
-    if local.is_file() and local.stat().st_size > 1024:
-        if segment_is_valid(local):
+    SEG_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    if local.is_file():
+        if segment_is_valid(local, expected):
             print(f"[CACHE HIT] seg {key[:10]} (local)", flush=True)
             return local
-        print(f"[CACHE CORRUPT] seg {key[:10]} (local) — удалён, будет перекодирован", flush=True)
-        try:
-            local.unlink()
-        except Exception:
-            pass
-    SEG_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    if try_run(["rclone", "copyto", f"{SEG_CACHE_REMOTE}/{key}.mp4", str(local), "--transfers", "2"]):
-        if local.is_file() and local.stat().st_size > 1024:
-            if segment_is_valid(local):
+        local.unlink()
+        print(f"[CACHE INVALID] {key[:10]} (local)", flush=True)
+    partial = local.with_suffix(f".{os.getpid()}.download")
+    try:
+        if try_run(["rclone", "copyto", f"{SEG_CACHE_REMOTE}/{key}.mp4", str(partial), "--transfers", "2"]):
+            if partial.is_file() and segment_is_valid(partial, expected):
+                os.replace(partial, local)
                 print(f"[CACHE HIT] seg {key[:10]} (Google Drive)", flush=True)
                 return local
-            print(f"[CACHE CORRUPT] seg {key[:10]} (Google Drive) — удалён, будет перекодирован", flush=True)
-            try:
-                local.unlink()
-            except Exception:
-                pass
+            print(f"[CACHE INVALID] {key[:10]} (Google Drive)", flush=True)
+    finally:
+        partial.unlink(missing_ok=True)
     return None
 
 
 def cache_put(key, path):
+    dst = SEG_CACHE_DIR / f"{key}.mp4"
+    partial = dst.with_suffix(f".{os.getpid()}.tmp")
     try:
         SEG_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        dst = SEG_CACHE_DIR / f"{key}.mp4"
-        if not dst.is_file():
-            shutil.copy2(path, dst)
-        try_run(["rclone", "copyto", str(dst), f"{SEG_CACHE_REMOTE}/{key}.mp4", "--transfers", "2"])
-    except Exception:
-        pass
+        shutil.copy2(path, partial)
+        os.replace(partial, dst)
+        if not try_run(["rclone", "copyto", str(dst), f"{SEG_CACHE_REMOTE}/{key}.mp4", "--transfers", "2"]):
+            print(f"[CACHE WARN] remote upload failed: {key[:10]}", flush=True)
+    except Exception as exc:
+        print(f"[CACHE WARN] {exc}", flush=True)
+    finally:
+        partial.unlink(missing_ok=True)
 
 
 def cinematic_camera_filter(entry, w, h, fps, dur):
@@ -299,10 +328,11 @@ def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf,
     text_overlay = (entry.get("text_overlay") or "").strip()
     lt_on = HAS_LT and bool(lt_cfg.get("enabled", True)) and bool(text_overlay)
 
-    key = seg_cache_key(entry, vid, voice, ambient, w, h, fps, preset, crf, lt_on, dur, maxrate_mbps)
+    key = seg_cache_key(entry, vid, voice, ambient, w, h, fps, preset, crf, lt_on, dur, maxrate_mbps, lt_cfg, bufsize_mbps)
     transition = transition_filter(incoming, outgoing, dur)
     key = hashlib.sha256(f'{key}|{transition}|{voice_gain}|{ambient_gain}|{audio_bitrate}|{sentence_pad}'.encode()).hexdigest()
-    hit = cache_get(key)
+    expected = (dur, w, h, fps)
+    hit = cache_get(key, expected)
     if hit:
         return hit, dur
 
@@ -376,7 +406,7 @@ def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf,
             work_dir=str(tmp_dir / f"lt_{idx:03d}"),
         )
         final_out = ov
-    if not segment_is_valid(final_out):
+    if not segment_is_valid(final_out, expected):
         raise SystemExit(f"[P0-GUARD] Сегмент сцены #{idx} собран невалидно (нет видео/аудио).")
     mb = final_out.stat().st_size / (1024 * 1024)
     print(f"[SEG {idx}] {dur:.1f}s контента за {wall:.1f} мин wall • {mb:.1f} MB "
