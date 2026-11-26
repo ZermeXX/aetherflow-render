@@ -44,6 +44,17 @@ jobs:
           fi
           ffmpeg -version | head -n 2
           rclone version | head -n 2
+      - name: Validate Renderer and Dependencies
+        run: |
+          python3 -m py_compile assemble_scenes.py lower_third_overlay.py
+          python3 -c 'import PIL; import lower_third_overlay'
+          ffprobe -version > /dev/null
+          ffmpeg -hide_banner -encoders > /tmp/aether-encoders.txt
+          grep -q libx264 /tmp/aether-encoders.txt
+          ffmpeg -hide_banner -filters > /tmp/aether-filters.txt
+          for filter in zoompan overlay loudnorm alimiter fade; do
+            grep -wq "$filter" /tmp/aether-filters.txt
+          done
       - name: Setup Personal Rclone Config
         env:
           RCLONE_CONFIG_B64: ${{ secrets.RCLONE_CONFIG }}
@@ -116,7 +127,16 @@ jobs:
                   cmd += ["--drive-root-folder-id", folder_id]
               subprocess.run(cmd, check=True)
               manifest_data = json.loads(Path("manifest.json").read_text(encoding="utf-8"))
+          if not isinstance(manifest_data, dict):
+              raise SystemExit("[MANIFEST] Expected JSON object")
           clean_manifest = scrub(normalize(manifest_data))
+          import re
+          project = clean_manifest.get("project_name")
+          if not isinstance(project, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_. -]{0,159}", project):
+              raise SystemExit("[MANIFEST] Invalid project_name")
+          scenes = clean_manifest.get("timeline") or clean_manifest.get("scenes")
+          if not isinstance(scenes, list) or not scenes or not all(isinstance(e, dict) for e in scenes):
+              raise SystemExit("[MANIFEST] Expected nonempty scene list")
           if not clean_manifest.get("gdrive_folder_id"):
               cloud_id = (clean_manifest.get("cloud_export") or {}).get("target_folder_id")
               default_id = (os.environ.get("DEFAULT_FOLDER_ID") or "").strip()
@@ -175,10 +195,29 @@ jobs:
           )
           pdata = json.loads(probe_res.stdout)
           dur_sec = float((pdata.get("format") or {}).get("duration", 0) or 0)
+          streams = pdata.get("streams", [])
+          video = next((s for s in streams if s.get("codec_type") == "video"), None)
+          audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
+          if not video or not audio or dur_sec <= 0:
+              raise SystemExit("[AUTO-QC] Missing video/audio or invalid duration")
+          preview = out_dir / f"{project_name}_720p_preview.mp4"
+          if not preview.is_file():
+              raise SystemExit("[AUTO-QC] Missing preview")
+          preview_duration = float(subprocess.check_output(
+              ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+               "-of", "default=noprint_wrappers=1:nokey=1", str(preview)], text=True))
+          limit = float((manifest.get("export_settings") or {}).get("preview_duration_sec") or 0)
+          expected_preview = min(dur_sec, limit) if limit > 0 else dur_sec
+          if abs(preview_duration - expected_preview) > 0.25:
+              raise SystemExit("[AUTO-QC] Preview duration mismatch")
           size_mb = round(final_video.stat().st_size / (1024 * 1024), 2)
           qc_path = Path("qc_report.json")
           qc = json.loads(qc_path.read_text(encoding="utf-8")) if qc_path.is_file() else {}
           qc["verified_duration_sec"] = round(dur_sec, 3)
+          qc["preview_duration_sec"] = round(preview_duration, 3)
+          qc["video_resolution"] = [video.get("width"), video.get("height")]
+          qc["video_fps"] = video.get("avg_frame_rate")
+          qc["audio_codec"] = audio.get("codec_name")
           qc["file_size_mb"] = size_mb
           qc["chapters_count"] = len(chapters_lines)
           qc_path.write_text(json.dumps(qc, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -189,7 +228,7 @@ jobs:
         env:
           DEFAULT_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
         run: |
-          set -u
+          set -eu
           PROJECT_NAME=$(python3 -c 'import json; print(json.load(open("manifest.json"))["project_name"])')
           FOLDER_ID=$(python3 -c 'import json, os; m=json.load(open("manifest.json")); print((m.get("gdrive_folder_id") or (m.get("cloud_export") or {}).get("target_folder_id") or os.environ.get("DEFAULT_FOLDER_ID", "")).strip())')
           DEST_DIR="gdrive:_RENDER_OUTPUT_${PROJECT_NAME}"
@@ -203,7 +242,13 @@ jobs:
                 --stats-one-line)
           upload() {  # upload <local-file> <required:1|0>
             local src="$1" required="$2" attempt=1 max=4
-            [ -f "$src" ] || return 0
+            if [ ! -f "$src" ]; then
+              if [ "$required" = "1" ]; then
+                echo "::error::Required file missing: $src"
+                return 1
+              fi
+              return 0
+            fi
             while [ "$attempt" -le "$max" ]; do
               if rclone copy "$src" "$DEST_DIR/" "${ROOT_ARGS[@]}" "${PACE[@]}"; then
                 echo "[UPLOAD] OK: $src"
@@ -221,7 +266,7 @@ jobs:
             return 0
           }
           upload "output/${PROJECT_NAME}.mp4" 1
-          upload "output/${PROJECT_NAME}_720p_preview.mp4" 0
+          upload "output/${PROJECT_NAME}_720p_preview.mp4" 1
           upload "output/${PROJECT_NAME}_EN.srt" 0
           upload "output/${PROJECT_NAME}_RU.srt" 0
           upload "output/output_chapters.txt" 0
