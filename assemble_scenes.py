@@ -333,7 +333,7 @@ def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf,
         title = str(lower.get("title") or "").strip()
         text_overlay = location + "\n" + " • ".join(x for x in (era, title) if x)
         text_overlay = text_overlay.strip()
-    lt_on = bool(lt_cfg.get("enabled", True)) and bool(text_overlay)
+    lt_on = (bool(lt_cfg.get("enabled", True)) and bool(text_overlay)) or bool((lt_cfg.get("brand_identity") or {}).get("enabled", False))
     if lt_on and not HAS_LT:
         raise SystemExit("[BRANDING] lower_third_overlay unavailable")
     lt_cfg = dict(lt_cfg)
@@ -487,7 +487,15 @@ def main():
     fps = int(export.get("fps", 24))
     preset = str(export.get("preset", "ultrafast" if res_mode == "720p" else "veryfast"))
     crf = int(export.get("crf", 23 if preset == "ultrafast" else 20))
-    lt_cfg = export.get("lower_third_config", {}) or {}
+    lt_cfg = dict(export.get("lower_third_config") or {})
+    brand = dict(export.get("brand_identity") or lt_cfg.get("brand_identity") or {})
+    project = str(manifest.get("project_name", ""))
+    if "enabled" not in brand:
+        brand["enabled"] = project.lower().startswith("histoviva")
+    if brand["enabled"] and not brand.get("episode_label"):
+        match = re.match(r"histoviva_(EP\d+)_(.+)", project, re.I)
+        brand["episode_label"] = (match.group(1) + " | " + match.group(2).replace("_", " ")) if match else project
+    lt_cfg["brand_identity"] = brand
     audio_bitrate = int(export.get("audio_bitrate_kbps", 192))
     sentence_pad = float((manifest.get("anti_desync_locks") or {}).get("voiceover_sentence_pad_sec", 0.35))
     if not 64 <= audio_bitrate <= 320 or not math.isfinite(sentence_pad) or sentence_pad < 0:
