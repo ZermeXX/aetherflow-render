@@ -32,6 +32,9 @@ def _load_font(size: int, bold: bool = True):
 def _parse_text_overlay(raw_text: str) -> tuple[str, str]:
     if not raw_text:
         return "", ""
+    if "\n" in raw_text:
+        main, sub = raw_text.split("\n", 1)
+        return main.strip().upper(), sub.strip().upper()
     parts = [p.strip() for p in raw_text.split("•") if p.strip()]
     if len(parts) >= 3:
         return f"{parts[0]} • {parts[1]}".upper(), " • ".join(parts[2:]).upper()
@@ -111,35 +114,69 @@ def render_lower_third_frame(frame_w, frame_h, local_t, main_text, sub_text,
     return canvas
 
 
+def render_brand_identity(w, h, emblem_path, config):
+    cfg = config.get("brand_identity") or {}
+    canvas = Image.new("RGBA", (w,h))
+    px = lambda n: max(1, round(n*h/2160))
+    bw, bh = min(px(760),w-px(240)), px(150)
+    panel = Image.new("RGBA",(bw,bh))
+    d = ImageDraw.Draw(panel)
+    gold = (202,166,92,255)
+    d.rectangle((0,0,bw-1,bh-1),fill=(10,14,18,205),outline=gold,width=px(2))
+    x = px(24)
+    if emblem_path and Path(emblem_path).is_file():
+        with Image.open(emblem_path) as src:
+            emblem = src.convert("RGBA")
+        emblem.thumbnail((px(112),px(112)),Image.Resampling.LANCZOS)
+        panel.alpha_composite(emblem,(x,(bh-emblem.height)//2))
+        x += px(132)
+    name = str(cfg.get("name","HISTOVIVA")).upper()
+    subtitle = str(cfg.get("episode_label","")).upper()
+    d.text((x,px(49)),name,font=_fit_font(d,name,px(46),bw-x-px(20)),fill=gold,anchor="lm")
+    d.text((x,px(105)),subtitle,font=_fit_font(d,subtitle,px(29),bw-x-px(20)),fill="white",anchor="lm")
+    canvas.alpha_composite(panel,(w-px(120)-bw,px(96)))
+    return canvas
+
+
 def apply_lower_third_to_clip(input_video_path, output_video_path, text_overlay, fps=24,
                               emblem_path="aether_art_150x150.png", show_start=0.5,
                               show_end=5.5, anim_dur=0.55, work_dir="./_overlay_tmp", config=None, crf=18, preset="veryfast", maxrate=0, bufsize=0):
     main_line, sub_line = _parse_text_overlay(text_overlay)
-    if not main_line:
+    config = config or {}
+    brand_on = bool((config.get("brand_identity") or {}).get("enabled", False))
+    lower_on = bool(main_line) and bool(config.get("enabled", True))
+    if not lower_on and not brand_on:
         return input_video_path
     probe_cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0",
                  "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", input_video_path]
     res_str = subprocess.check_output(probe_cmd, text=True).strip()
     w, h = map(int, res_str.split("x"))
     Path(work_dir).mkdir(parents=True, exist_ok=True)
-    start_frame = max(0, int(math.floor(show_start * fps)))
-    end_frame = int(math.ceil(show_end * fps))
-    png_pattern = os.path.join(work_dir, "lt_%05d.png")
-    for idx, f_idx in enumerate(range(start_frame, end_frame + 1)):
-        t_sec = f_idx / float(fps)
-        img = render_lower_third_frame(w, h, t_sec, main_line, sub_line, emblem_path,
-                                       show_start, show_end, anim_dur, config)
-        img.save(os.path.join(work_dir, f"lt_{idx:05d}.png"))
-    first_frame_sec = start_frame / float(fps)
-    cmd = [
-        "ffmpeg", "-y", "-i", input_video_path,
-        "-framerate", str(fps), "-start_number", "0", "-i", png_pattern,
-        "-filter_complex",
-        f"[1:v]setpts=PTS-STARTPTS+{first_frame_sec}/TB[ovr];[0:v][ovr]overlay=0:0:eof_action=pass[vout]",
-        "-map", "[vout]", "-map", "0:a?",
-        "-c:v", "libx264", "-crf", str(crf), "-preset", preset, "-pix_fmt", "yuv420p",
-        "-c:a", "copy", output_video_path,
-    ]
+    inputs = ["-i", input_video_path]
+    filters = []
+    current = "[0:v]"
+    index = 1
+    if lower_on:
+        start_frame = max(0, int(math.floor(show_start * fps)))
+        end_frame = int(math.ceil(show_end * fps))
+        for idx, f_idx in enumerate(range(start_frame, end_frame + 1)):
+            img = render_lower_third_frame(w,h,f_idx/float(fps),main_line,sub_line,
+                                          emblem_path,show_start,show_end,anim_dur,config)
+            img.save(os.path.join(work_dir,f"lt_{idx:05d}.png"))
+        inputs += ["-framerate",str(fps),"-start_number","0","-i",os.path.join(work_dir,"lt_%05d.png")]
+        filters += [f"[{index}:v]setpts=PTS-STARTPTS+{start_frame/float(fps)}/TB[lt]",
+                    f"{current}[lt]overlay=0:0:eof_action=pass:repeatlast=0[lower]"]
+        current = "[lower]"
+        index += 1
+    if brand_on:
+        brand_path = os.path.join(work_dir,"brand.png")
+        render_brand_identity(w,h,emblem_path,config).save(brand_path)
+        inputs += ["-i",brand_path]
+        filters.append(f"{current}[{index}:v]overlay=0:0:eof_action=repeat[vbrand]")
+        current = "[vbrand]"
+    cmd = ["ffmpeg","-y"] + inputs + ["-filter_complex",";".join(filters),
+           "-map",current,"-map","0:a?","-c:v","libx264","-crf",str(crf),
+           "-preset",preset,"-pix_fmt","yuv420p","-c:a","copy",output_video_path]
     if maxrate > 0:
         cmd[-1:-1] = ["-maxrate", f"{maxrate}M", "-bufsize", f"{bufsize}M"]
     subprocess.run(cmd, check=True)
