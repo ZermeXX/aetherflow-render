@@ -1,0 +1,53 @@
+{
+  "configuration_version": "8.0",
+  "description": "Editorial audio preset. Copy scene_defaults into scenes and export_settings / anti_desync_locks into the manifest. Not automatically loaded.",
+  "scene_defaults": {
+    "voiceover_volume": 1,
+    "ambient_volume": 0.35,
+    "voice_start": 0.2
+  },
+  "export_settings": {
+    "audio_bitrate_kbps": 320
+  },
+  "anti_desync_locks": {
+    "voiceover_sentence_pad_sec": 0.35
+  },
+  "editorial_presets": {
+    "narration_only": {
+      "voiceover_volume": 1,
+      "ambient_volume": 0
+    },
+    "standard": {
+      "voiceover_volume": 1,
+      "ambient_volume": 0.35
+    },
+    "quiet_background": {
+      "voiceover_volume": 1,
+      "ambient_volume": 0.15
+    }
+  },
+  "renderer_contract": {
+    "codec": "aac",
+    "sample_rate_hz": 48000,
+    "channels": 2,
+    "loudnorm": {
+      "integrated_lufs": -14,
+      "true_peak_dbtp": -1,
+      "loudness_range_lu": 11,
+      "mode": "two-pass when valid, single-pass fallback",
+      "targets_not_guaranteed": true
+    },
+    "mix_limiter": {
+      "limit": 0.95,
+      "scope": "multiple audio inputs"
+    },
+    "voice_padding": "extend scene when necessary; delay, pad and trim",
+    "ambient_volume_precedence": "ambient_audio.volume overrides scene ambient_volume",
+    "unsupported": [
+      "continuous master audio",
+      "global music bed",
+      "automatic ducking",
+      "original clip audio mixing"
+    ]
+  }
+}
