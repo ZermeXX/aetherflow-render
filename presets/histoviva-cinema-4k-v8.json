@@ -1,0 +1,36 @@
+{
+  "configuration_version": "8.0",
+  "description": "Cinema export preset. Merge export_settings into manifest; not automatically loaded.",
+  "export_settings": {
+    "resolution": "4k",
+    "aspect_ratio": "16:9",
+    "video_codec": "libx264",
+    "profile": "high",
+    "pix_fmt": "yuv420p",
+    "cfr": true,
+    "preset": "veryfast",
+    "draft_mode": false,
+    "fps": 24,
+    "crf": 18,
+    "bitrate_mbps": 35,
+    "bitrate_cap": "on",
+    "audio_bitrate_kbps": 320,
+    "preview_duration_sec": 0
+  },
+  "renderer_contract": {
+    "master_dimensions": [
+      3840,
+      2160
+    ],
+    "declared_bitrate_mbps": 35,
+    "maxrate_mbps": 46,
+    "bufsize_mbps": 92,
+    "rate_control": "CRF with VBV ceiling; declared bitrate multiplied by 1.3 and rounded",
+    "audio_codec": "aac",
+    "audio_sample_rate_hz": 48000,
+    "audio_channels": 2,
+    "preview_duration": "full master duration",
+    "profile_note": "High is requested metadata; actual encoder profile must be verified by ffprobe",
+    "draft_mode_note": "false is metadata; not a separate renderer switch"
+  }
+}
