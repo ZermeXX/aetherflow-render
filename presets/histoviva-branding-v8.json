@@ -1,0 +1,68 @@
+{
+  "configuration_version": "8.0",
+  "description": "Editorial branding preset. Merge export_settings into the manifest; replace episode_label per episode. Not automatically loaded.",
+  "export_settings": {
+    "lower_third_config": {
+      "enabled": true,
+      "style": "histoviva_broadcast_en",
+      "emblem_path": "aether_art_150x150_A.png",
+      "reference_margin_x_4k": 185,
+      "reference_margin_bottom_4k": 155,
+      "bar_bg_rgba": [
+        10,
+        14,
+        18,
+        214
+      ],
+      "show_sec": [
+        0.5,
+        5.5
+      ],
+      "anim_sec": 0.55
+    },
+    "brand_identity": {
+      "enabled": true,
+      "name": "HISTOVIVA",
+      "episode_label": ""
+    }
+  },
+  "renderer_reference": {
+    "canvas": [
+      3840,
+      2160
+    ],
+    "lower_third": {
+      "width_px": 3470,
+      "height_px": 390,
+      "emblem_px": 320,
+      "title_font_max_px": 155,
+      "subtitle_font_max_px": 96
+    },
+    "brand": {
+      "width_px": 675,
+      "height_px": 235,
+      "emblem_px": 170,
+      "right_margin_px": 185,
+      "top_margin_px": 115,
+      "title_font_max_px": 78,
+      "subtitle_font_max_px": 44
+    },
+    "palette": {
+      "gold": "#CAA65C",
+      "amber": "#F59E0B",
+      "badge_top": "#AF2D19",
+      "badge_bottom": "#641218",
+      "brand_background_rgba": [
+        38,
+        43,
+        43,
+        155
+      ]
+    },
+    "animation": "cubic ease-out opacity and vertical offset; duration clamped to half display window",
+    "notes": "Reference dimensions and palette are descriptive, not runtime overrides. Shared emblem path is configured in lower_third_config. Empty episode_label triggers automatic project-derived label."
+  },
+  "scene_example": {
+    "text_overlay": "UPANO VALLEY\n500 BC – 600 AD"
+  }
+}
