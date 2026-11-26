@@ -1,0 +1,59 @@
+{
+  "configuration_version": "8.0",
+  "description": "Editorial transition presets. Copy transition and transition_duration into the outgoing scene. This file is not loaded automatically by the renderer.",
+  "defaults": {
+    "transition": "fade",
+    "transition_duration": 0.5
+  },
+  "presets": {
+    "continuity": {
+      "transition": "cut",
+      "transition_duration": 0
+    },
+    "standard": {
+      "transition": "fade",
+      "transition_duration": 0.5
+    },
+    "chapter_boundary": {
+      "transition": "dip_to_black",
+      "transition_duration": 1
+    },
+    "revelation": {
+      "transition": "dip_to_white",
+      "transition_duration": 0.4
+    },
+    "uninterrupted": {
+      "transition": "none",
+      "transition_duration": 0
+    }
+  },
+  "editorial_guidance": {
+    "recommended_duration_sec": [
+      0.3,
+      0.8
+    ],
+    "chapter_boundary_duration_sec": 1,
+    "short_scene_under_sec": 3,
+    "short_scene_recommendation": "continuity",
+    "last_scene_recommendation": "uninterrupted",
+    "avoid_repeated_white_dips": true
+  },
+  "renderer_contract": {
+    "field_owner": "outgoing scene",
+    "first_scene_incoming": "none",
+    "last_scene_outgoing": "ignored",
+    "fade_and_dip_to_black_equivalent": true,
+    "half_duration": "min(transition_duration / 2, effective_scene_duration / 2) independently on each side",
+    "timeline_overlap_sec": 0,
+    "audio_crossfade": false,
+    "audio_processing": "unchanged by transition filter",
+    "true_cross_dissolve_supported": false,
+    "allowed_modes": [
+      "fade",
+      "dip_to_black",
+      "dip_to_white",
+      "cut",
+      "none"
+    ]
+  }
+}
