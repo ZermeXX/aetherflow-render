@@ -38,7 +38,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg fonts-dejavu-core fonts-liberation unzip curl
-          python3 -m pip install --quiet --upgrade pip pillow
+          python3 -m pip install --quiet --upgrade pip pillow jsonschema==4.23.0
           if ! command -v rclone >/dev/null 2>&1; then
             curl -fsSL https://rclone.org/install.sh | sudo bash
           fi
@@ -149,6 +149,44 @@ jobs:
               json.dumps(clean_manifest, ensure_ascii=False, indent=2), encoding="utf-8")
           scenes = clean_manifest.get("timeline") or clean_manifest.get("scenes") or []
           print(f"[MANIFEST] Project={clean_manifest.get('project_name')} | Scenes={len(scenes)}")
+          PY
+      - name: Validate Manifest V8
+        run: |
+          python3 - << 'PY'
+          import json
+          from pathlib import Path
+          from jsonschema import Draft202012Validator
+          m = json.loads(Path("manifest.json").read_text(encoding="utf-8"))
+          schema = json.loads(Path("schemas/histoviva-manifest-v8.schema.json").read_text(encoding="utf-8"))
+          if str(m.get("manifest_version")) != "8.0":
+              print("[V8] Legacy manifest: strict V8 validation skipped")
+              raise SystemExit(0)
+          Draft202012Validator.check_schema(schema)
+          errors = list(Draft202012Validator(schema).iter_errors(m))
+          if errors:
+              for e in errors:
+                  print("[V8] " + e.json_path + ": " + e.message)
+              raise SystemExit(1)
+          scenes = m.get("timeline") or m.get("scenes")
+          ids = [s["scene_id"] for s in scenes]
+          if len(ids) != len(set(ids)):
+              raise SystemExit("[V8] Duplicate scene IDs")
+          if "total_scenes" in m and m["total_scenes"] != len(scenes):
+              raise SystemExit("[V8] Scene count mismatch")
+          if "timeline" in m and "scenes" in m and m["timeline"] != m["scenes"]:
+              raise SystemExit("[V8] Timeline/scenes mismatch")
+          duration = sum(s.get("duration_sec", s.get("duration")) for s in scenes)
+          if "total_duration_sec" in m and abs(duration - m["total_duration_sec"]) > 0.25:
+              raise SystemExit("[V8] Planned duration mismatch")
+          for s in scenes:
+              if "voice_end" in s and s["voice_end"] < s.get("voice_start", 0):
+                  raise SystemExit("[V8] Invalid voice interval: " + s["scene_id"])
+          lt = m["export_settings"].get("lower_third_config", {})
+          if lt.get("enabled") and "show_sec" in lt:
+              start, end = lt["show_sec"]
+              if end <= start or lt.get("anim_sec", 0) > (end-start)/2:
+                  raise SystemExit("[V8] Invalid lower third timing")
+          print(f"[V8] PASS: {len(scenes)} scenes, {duration:.3f}s planned")
           PY
       - name: Preflight Asset Check
         run: |
