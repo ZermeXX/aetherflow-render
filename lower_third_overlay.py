@@ -53,115 +53,67 @@ def _make_vertical_gradient(width, height, top_rgb, bot_rgb, alpha=255):
     return grad
 
 
+def _fit_font(draw, text, size, width, bold=True):
+    while size > 8:
+        font = _load_font(size, bold)
+        if draw.textlength(text, font=font) <= width:
+            return font
+        size -= 1
+    return _load_font(8, bold)
+
+
 def render_lower_third_frame(frame_w, frame_h, local_t, main_text, sub_text,
                              emblem_path="aether_art_150x150.png", show_start=0.5,
-                             show_end=5.5, anim_dur=0.55):
-    canvas = Image.new("RGBA", (frame_w, frame_h), (0, 0, 0, 0))
-    if not main_text or local_t < show_start or local_t > show_end:
+                             show_end=5.5, anim_dur=0.55, config=None):
+    cfg = config or {}
+    canvas = Image.new("RGBA", (frame_w, frame_h))
+    if not main_text or not show_start <= local_t < show_end:
         return canvas
     scale = frame_h / 2160.0
-    margin_x = int(round(120 * scale))
-    margin_bottom = int(round(96 * scale))
-    bar_w = frame_w - 2 * margin_x
-    top_h = int(round(92 * scale))
-    sub_h = int(round(52 * scale))
-    total_h = top_h + sub_h
-    badge_size = total_h
-    base_x = margin_x
-    base_y = frame_h - margin_bottom - total_h
-    appear_end = show_start + anim_dur
-    disappear_start = show_end - anim_dur
-    if local_t < appear_end:
-        p = _ease_out_cubic((local_t - show_start) / anim_dur)
-        wipe_p = _ease_out_cubic(max(0.0, (local_t - (show_start + 0.12)) / max(0.05, anim_dur - 0.12)))
-        badge_y_offset = int(round((1.0 - p) * 38 * scale))
-        badge_alpha = int(round(255 * p))
-        text_x_offset = int(round((1.0 - wipe_p) * 28 * scale))
-        text_alpha = int(round(255 * wipe_p))
-        sheen_pos = None
-    elif local_t <= disappear_start:
-        p = 1.0
-        wipe_p = 1.0
-        badge_y_offset = 0
-        badge_alpha = 255
-        text_x_offset = 0
-        text_alpha = 255
-        hold_elapsed = local_t - appear_end
-        sheen_pos = (hold_elapsed / 1.4) if hold_elapsed <= 1.4 else None
-    else:
-        out_p = _ease_in_cubic((local_t - disappear_start) / anim_dur)
-        p = 1.0 - out_p
-        wipe_p = 1.0 - _ease_in_cubic(min(1.0, out_p * 1.15))
-        badge_y_offset = int(round(out_p * 28 * scale))
-        badge_alpha = int(round(255 * p))
-        text_x_offset = int(round(out_p * 20 * scale))
-        text_alpha = int(round(255 * max(0.0, 1.0 - out_p * 1.4)))
-        sheen_pos = None
-    panel_x0 = base_x + badge_size
-    panel_full_w = max(1, bar_w - badge_size)
-    panel_cur_w = max(0, int(round(panel_full_w * wipe_p)))
-    if panel_cur_w > 2:
-        panel_layer = Image.new("RGBA", (panel_full_w, total_h), (0, 0, 0, 0))
-        p_draw = ImageDraw.Draw(panel_layer, "RGBA")
-        p_draw.rectangle([0, 0, panel_full_w, top_h], fill=(10, 14, 18, 218))
-        p_draw.rectangle([0, top_h, panel_full_w, total_h], fill=(7, 10, 14, 236))
-        p_draw.rectangle([0, top_h - 1, panel_full_w, top_h + 1], fill=(255, 255, 255, 42))
-        border_w = max(2, int(round(2 * scale)))
-        p_draw.rectangle([0, 0, panel_full_w, border_w], fill=(245, 158, 11, 160))
-        p_draw.rectangle([0, total_h - border_w, panel_full_w, total_h], fill=(153, 27, 27, 200))
-        amber_w = max(8, int(round(14 * scale)))
-        p_draw.rectangle([panel_full_w - amber_w, 0, panel_full_w, total_h], fill=(245, 158, 11, 235))
-        if sheen_pos is not None:
-            sweep_w = int(round(220 * scale))
-            sweep_x = int(round(-sweep_w + sheen_pos * (panel_full_w + sweep_w * 2)))
-            sheen = Image.new("RGBA", (sweep_w, total_h), (0, 0, 0, 0))
-            s_draw = ImageDraw.Draw(sheen, "RGBA")
-            for i in range(sweep_w):
-                dist = abs(i - sweep_w / 2) / (sweep_w / 2)
-                a = int(round(36 * max(0.0, 1.0 - dist) ** 2))
-                s_draw.line([(i, 0), (i, total_h)], fill=(255, 255, 255, a))
-            panel_layer.alpha_composite(sheen, (sweep_x, 0))
-        font_main = _load_font(int(round(46 * scale)), bold=True)
-        font_sub = _load_font(int(round(25 * scale)), bold=True)
-        txt_layer = Image.new("RGBA", (panel_full_w, total_h), (0, 0, 0, 0))
-        t_draw = ImageDraw.Draw(txt_layer, "RGBA")
-        pad_x = int(round(34 * scale)) + text_x_offset
-        main_y = int(round((top_h - 46 * scale) / 2)) - int(round(2 * scale))
-        t_draw.text((pad_x, main_y), main_text, font=font_main, fill=(255, 255, 255, text_alpha))
-        if sub_text:
-            sub_y = top_h + int(round((sub_h - 25 * scale) / 2)) - int(round(2 * scale))
-            t_draw.text((pad_x, sub_y), sub_text, font=font_sub, fill=(245, 158, 11, text_alpha))
-        panel_layer.alpha_composite(txt_layer, (0, 0))
-        cropped_panel = panel_layer.crop((0, 0, panel_cur_w, total_h))
-        canvas.alpha_composite(cropped_panel, (panel_x0, base_y + badge_y_offset))
-    if badge_alpha > 0:
-        badge_layer = _make_vertical_gradient(badge_size, badge_size,
-                                              top_rgb=(153, 27, 27), bot_rgb=(127, 29, 29), alpha=badge_alpha)
-        b_draw = ImageDraw.Draw(badge_layer, "RGBA")
-        b_border = max(2, int(round(3 * scale)))
-        b_draw.rectangle([0, 0, badge_size - 1, badge_size - 1],
-                         outline=(245, 158, 11, int(round(190 * (badge_alpha / 255.0)))), width=b_border)
-        if emblem_path and os.path.exists(emblem_path):
-            emblem = Image.open(emblem_path).convert("RGBA")
-            ew, eh = emblem.size
-            if eh > ew * 1.15:
-                emblem = emblem.crop((0, 0, ew, ew))
-            target_icon_sz = int(round(badge_size * 0.78))
-            emblem = emblem.resize((target_icon_sz, target_icon_sz), Image.Resampling.LANCZOS)
-            if badge_alpha < 255:
-                r, g, b, a = emblem.split()
-                a = a.point(lambda v: int(round(v * (badge_alpha / 255.0))))
-                emblem = Image.merge("RGBA", (r, g, b, a))
-            ix = (badge_size - target_icon_sz) // 2
-            iy = (badge_size - target_icon_sz) // 2
-            badge_layer.alpha_composite(emblem, (ix, iy))
-        canvas.alpha_composite(badge_layer, (base_x, base_y + badge_y_offset))
+    px = lambda n: max(1, round(n * scale))
+    mx, mb = px(cfg.get("margin_x_4k", 120)), px(cfg.get("margin_bottom_4k", 96))
+    height = px(180)
+    width = min(frame_w - 2 * mx, px(2700))
+    if width <= height:
+        return canvas
+    panel = Image.new("RGBA", (width, height))
+    d = ImageDraw.Draw(panel)
+    gold = (202, 166, 92, 255)
+    amber = (245, 158, 11, 255)
+    d.rectangle((0, 0, width-1, height-1), fill=tuple(cfg.get("bar_bg_rgba", [10,14,18,214])), outline=gold, width=px(2))
+    badge = _make_vertical_gradient(height, height, (153,27,27), (91,18,29))
+    panel.alpha_composite(badge)
+    d.rectangle((0,0,height-1,height-1), outline=gold, width=px(3))
+    if emblem_path and Path(emblem_path).is_file():
+        with Image.open(emblem_path) as source:
+            emblem = source.convert("RGBA")
+        emblem.thumbnail((px(140),px(140)), Image.Resampling.LANCZOS)
+        panel.alpha_composite(emblem, ((height-emblem.width)//2,(height-emblem.height)//2))
+    x = height + px(38)
+    available = width - x - px(40)
+    d.line((height,px(104),width-1,px(104)), fill=(202,166,92,110), width=px(2))
+    d.rectangle((width-px(8),0,width-1,height-1), fill=amber)
+    main = main_text.upper()
+    font = _fit_font(d,main,px(58),available)
+    d.text((x,px(52)),main,font=font,fill="white",anchor="lm")
+    parts = sub_text.upper().split(" • ",1)
+    sub = " • ".join(parts)
+    font = _fit_font(d,sub,px(36),available)
+    first = parts[0]
+    d.text((x,px(142)),first,font=font,fill=(235,235,235),anchor="lm")
+    if len(parts)>1:
+        d.text((x+d.textlength(first+" • ",font=font),px(142)),parts[1],font=font,fill=amber,anchor="lm")
+        d.text((x+d.textlength(first,font=font),px(142))," • ",font=font,fill=gold,anchor="lm")
+    anim = min(max(0.0,anim_dur),(show_end-show_start)/2)
+    opacity = min(_ease_out_cubic((local_t-show_start)/anim),_ease_out_cubic((show_end-local_t)/anim)) if anim else 1.0
+    panel.putalpha(panel.getchannel("A").point(lambda v: round(v*opacity)))
+    canvas.alpha_composite(panel,(mx,frame_h-mb-height+round(px(30)*(1-opacity))))
     return canvas
 
 
 def apply_lower_third_to_clip(input_video_path, output_video_path, text_overlay, fps=24,
                               emblem_path="aether_art_150x150.png", show_start=0.5,
-                              show_end=5.5, anim_dur=0.55, work_dir="./_overlay_tmp"):
+                              show_end=5.5, anim_dur=0.55, work_dir="./_overlay_tmp", config=None, crf=18, preset="veryfast", maxrate=0, bufsize=0):
     main_line, sub_line = _parse_text_overlay(text_overlay)
     if not main_line:
         return input_video_path
@@ -176,7 +128,7 @@ def apply_lower_third_to_clip(input_video_path, output_video_path, text_overlay,
     for idx, f_idx in enumerate(range(start_frame, end_frame + 1)):
         t_sec = f_idx / float(fps)
         img = render_lower_third_frame(w, h, t_sec, main_line, sub_line, emblem_path,
-                                       show_start, show_end, anim_dur)
+                                       show_start, show_end, anim_dur, config)
         img.save(os.path.join(work_dir, f"lt_{idx:05d}.png"))
     first_frame_sec = start_frame / float(fps)
     cmd = [
@@ -185,9 +137,11 @@ def apply_lower_third_to_clip(input_video_path, output_video_path, text_overlay,
         "-filter_complex",
         f"[1:v]setpts=PTS-STARTPTS+{first_frame_sec}/TB[ovr];[0:v][ovr]overlay=0:0:eof_action=pass[vout]",
         "-map", "[vout]", "-map", "0:a?",
-        "-c:v", "libx264", "-crf", "18", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+        "-c:v", "libx264", "-crf", str(crf), "-preset", preset, "-pix_fmt", "yuv420p",
         "-c:a", "copy", output_video_path,
     ]
+    if maxrate > 0:
+        cmd[-1:-1] = ["-maxrate", f"{maxrate}M", "-bufsize", f"{bufsize}M"]
     subprocess.run(cmd, check=True)
     shutil.rmtree(work_dir, ignore_errors=True)
     return output_video_path
