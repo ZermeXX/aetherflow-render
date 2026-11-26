@@ -74,9 +74,9 @@ def render_lower_third_frame(frame_w, frame_h, local_t, main_text, sub_text,
         return canvas
     scale = frame_h / 2160.0
     px = lambda n: max(1, round(n * scale))
-    mx, mb = px(cfg.get("margin_x_4k", 120)), px(cfg.get("margin_bottom_4k", 96))
-    height = px(180)
-    width = min(frame_w - 2 * mx, px(2700))
+    mx, mb = px(cfg.get("reference_margin_x_4k", 185)), px(cfg.get("reference_margin_bottom_4k", 155))
+    height = px(390)
+    width = frame_w - 2 * mx
     if width <= height:
         return canvas
     panel = Image.new("RGBA", (width, height))
@@ -84,29 +84,33 @@ def render_lower_third_frame(frame_w, frame_h, local_t, main_text, sub_text,
     gold = (202, 166, 92, 255)
     amber = (245, 158, 11, 255)
     d.rectangle((0, 0, width-1, height-1), fill=tuple(cfg.get("bar_bg_rgba", [10,14,18,214])), outline=gold, width=px(2))
-    badge = _make_vertical_gradient(height, height, (153,27,27), (91,18,29))
+    badge = _make_vertical_gradient(height, height, (175,45,25), (100,18,24))
     panel.alpha_composite(badge)
     d.rectangle((0,0,height-1,height-1), outline=gold, width=px(3))
     if emblem_path and Path(emblem_path).is_file():
         with Image.open(emblem_path) as source:
             emblem = source.convert("RGBA")
-        emblem.thumbnail((px(140),px(140)), Image.Resampling.LANCZOS)
+        emblem = emblem.resize((px(320),px(320)), Image.Resampling.LANCZOS)
         panel.alpha_composite(emblem, ((height-emblem.width)//2,(height-emblem.height)//2))
-    x = height + px(38)
+    x = height + px(65)
     available = width - x - px(40)
-    d.line((height,px(104),width-1,px(104)), fill=(202,166,92,110), width=px(2))
-    d.rectangle((width-px(8),0,width-1,height-1), fill=amber)
+    d.rectangle((height,px(215),width-1,height-1),fill=(8,12,15,238))
+    d.line((height,px(215),width-1,px(215)), fill=(202,166,92,150), width=px(4))
+    d.line((height,px(3),width-px(350),px(3)),fill=(225,225,215,210),width=px(4))
+    d.line((px(200),height-px(3),width-px(1250),height-px(3)),fill=(225,225,215,210),width=px(4))
+    d.rectangle((height,px(222),height+px(28),height-px(5)),fill=amber)
+    d.rectangle((width-px(48),px(222),width-px(5),height-px(5)), fill=amber)
     main = main_text.upper()
-    font = _fit_font(d,main,px(58),available)
-    d.text((x,px(52)),main,font=font,fill="white",anchor="lm")
+    font = _fit_font(d,main,px(155),available)
+    d.text((x,px(108)),main,font=font,fill="white",anchor="lm")
     parts = sub_text.upper().split(" • ",1)
     sub = " • ".join(parts)
-    font = _fit_font(d,sub,px(36),available)
+    font = _fit_font(d,sub,px(96),available)
     first = parts[0]
-    d.text((x,px(142)),first,font=font,fill=(235,235,235),anchor="lm")
+    d.text((x,px(303)),first,font=font,fill=(235,235,235),anchor="lm")
     if len(parts)>1:
-        d.text((x+d.textlength(first+" • ",font=font),px(142)),parts[1],font=font,fill=amber,anchor="lm")
-        d.text((x+d.textlength(first,font=font),px(142))," • ",font=font,fill=gold,anchor="lm")
+        d.text((x+d.textlength(first+" • ",font=font),px(303)),parts[1],font=font,fill=amber,anchor="lm")
+        d.text((x+d.textlength(first,font=font),px(303))," • ",font=font,fill=gold,anchor="lm")
     anim = min(max(0.0,anim_dur),(show_end-show_start)/2)
     opacity = min(_ease_out_cubic((local_t-show_start)/anim),_ease_out_cubic((show_end-local_t)/anim)) if anim else 1.0
     panel.putalpha(panel.getchannel("A").point(lambda v: round(v*opacity)))
@@ -118,23 +122,23 @@ def render_brand_identity(w, h, emblem_path, config):
     cfg = config.get("brand_identity") or {}
     canvas = Image.new("RGBA", (w,h))
     px = lambda n: max(1, round(n*h/2160))
-    bw, bh = min(px(760),w-px(240)), px(150)
+    bw, bh = min(px(675),w-px(370)), px(235)
     panel = Image.new("RGBA",(bw,bh))
     d = ImageDraw.Draw(panel)
     gold = (202,166,92,255)
-    d.rectangle((0,0,bw-1,bh-1),fill=(10,14,18,205),outline=gold,width=px(2))
+    d.rounded_rectangle((0,0,bw-1,bh-1),radius=px(18),fill=(38,43,43,155),outline=(220,220,210,155),width=px(3))
     x = px(24)
     if emblem_path and Path(emblem_path).is_file():
         with Image.open(emblem_path) as src:
             emblem = src.convert("RGBA")
-        emblem.thumbnail((px(112),px(112)),Image.Resampling.LANCZOS)
+        emblem = emblem.resize((px(170),px(170)),Image.Resampling.LANCZOS)
         panel.alpha_composite(emblem,(x,(bh-emblem.height)//2))
-        x += px(132)
+        x += px(185)
     name = str(cfg.get("name","HISTOVIVA")).upper()
     subtitle = str(cfg.get("episode_label","")).upper()
-    d.text((x,px(49)),name,font=_fit_font(d,name,px(46),bw-x-px(20)),fill=gold,anchor="lm")
-    d.text((x,px(105)),subtitle,font=_fit_font(d,subtitle,px(29),bw-x-px(20)),fill="white",anchor="lm")
-    canvas.alpha_composite(panel,(w-px(120)-bw,px(96)))
+    d.text((x,px(92)),name,font=_fit_font(d,name,px(78),bw-x-px(20)),fill=(235,235,230,255),anchor="lm")
+    d.text((x,px(173)),subtitle,font=_fit_font(d,subtitle,px(44),bw-x-px(20)),fill="white",anchor="lm")
+    canvas.alpha_composite(panel,(w-px(185)-bw,px(115)))
     return canvas
 
 
