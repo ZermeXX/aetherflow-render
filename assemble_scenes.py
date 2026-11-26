@@ -28,7 +28,7 @@ SECRET_KEYS = {
 }
 SEG_CACHE_DIR = Path("seg_cache")
 SEG_CACHE_REMOTE = "gdrive:_aether_segcache"
-CACHE_SCHEMA = 9
+CACHE_SCHEMA = 10
 
 try:
     from lower_third_overlay import apply_lower_third_to_clip
@@ -145,16 +145,16 @@ def guard_entries(entries, assets_dir, folder_id):
         raise SystemExit(1)
 
 
-def entry_duration(entry, vid_path):
+def entry_duration(entry, vid_path, voice_path=None, sentence_pad=0.35):
     dur = float(entry.get("duration_sec") or entry.get("duration") or 0)
     if dur <= 0:
         dur = probe(vid_path)["duration"] or 6.0
     voice_name = (entry.get("voiceover_file") or entry.get("audio_file")
                   or (entry.get("assets") or {}).get("voiceover_file"))
     if str(voice_name or "").strip():
-        vp = resolve_asset(voice_name, vid_path.parent, "")
+        vp = voice_path or resolve_asset(voice_name, vid_path.parent, "")
         if vp:
-            dur = max(dur, probe(vp)["duration"] + float(entry.get("voice_start", 0.2)) + 0.35)
+            dur = max(dur, probe(vp)["duration"] + float(entry.get("voice_start", 0.2)) + sentence_pad)
     return dur
 
 
@@ -272,7 +272,8 @@ def transition_filter(incoming, outgoing, dur):
 
 
 def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf,
-                  maxrate_mbps, bufsize_mbps, lt_cfg, tmp_dir, incoming=None, outgoing=None):
+                  maxrate_mbps, bufsize_mbps, lt_cfg, tmp_dir, incoming=None, outgoing=None,
+                  audio_bitrate=192, sentence_pad=0.35):
     fn = (entry.get("file_name") or entry.get("video_file")
           or (entry.get("assets") or {}).get("video_file")
           or (entry.get("assets") or {}).get("image_reference"))
@@ -283,15 +284,24 @@ def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf,
                   or (entry.get("assets") or {}).get("voiceover_file"))
     voice = resolve_asset(voice_name, assets_dir, folder_id) if str(voice_name or "").strip() else None
     ambient_name = entry.get("ambient_audio") or (entry.get("assets") or {}).get("ambient_audio")
+    ambient_cfg = ambient_name if isinstance(ambient_name, dict) else {}
+    ambient_name = ambient_cfg.get("file_name") if ambient_cfg else ambient_name
     ambient = resolve_asset(ambient_name, assets_dir, folder_id) if str(ambient_name or "").strip() else None
-
-    dur = entry_duration(entry, vid)
+    if voice_name and voice is None:
+        raise SystemExit(f"[AUDIO] Scene {idx}: missing voiceover {voice_name}")
+    if ambient_name and ambient is None:
+        raise SystemExit(f"[AUDIO] Scene {idx}: missing ambient {ambient_name}")
+    voice_gain = float(entry.get("voiceover_volume", 1.0))
+    ambient_gain = float(ambient_cfg.get("volume", entry.get("ambient_volume", 0.35)))
+    if not all(math.isfinite(g) and 0 <= g <= 4 for g in (voice_gain, ambient_gain)):
+        raise ValueError("Audio volume must be finite and between 0 and 4")
+    dur = entry_duration(entry, vid, voice, sentence_pad)
     text_overlay = (entry.get("text_overlay") or "").strip()
     lt_on = HAS_LT and bool(lt_cfg.get("enabled", True)) and bool(text_overlay)
 
     key = seg_cache_key(entry, vid, voice, ambient, w, h, fps, preset, crf, lt_on, dur, maxrate_mbps)
     transition = transition_filter(incoming, outgoing, dur)
-    key = hashlib.sha256(f'{key}|{transition}'.encode()).hexdigest()
+    key = hashlib.sha256(f'{key}|{transition}|{voice_gain}|{ambient_gain}|{audio_bitrate}|{sentence_pad}'.encode()).hexdigest()
     hit = cache_get(key)
     if hit:
         return hit, dur
@@ -316,14 +326,14 @@ def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf,
     a_parts, mix_inputs = [], []
     if voice is not None:
         a_parts.append(
-            f"[1:a]aresample=48000,adelay={delay_ms}|{delay_ms},apad,atrim=0:{dur},"
+            f"[1:a]{AUDIO_NORM},volume={voice_gain},adelay={delay_ms}:all=1,apad,atrim=0:{dur},"
             f"asetpts=PTS-STARTPTS,{AUDIO_NORM}[vox]"
         )
         mix_inputs.append("[vox]")
     if ambient is not None:
         aidx = 2 if voice is not None else 1
         a_parts.append(
-            f"[{aidx}:a]volume=0.5,aresample=48000,atrim=0:{dur},"
+            f"[{aidx}:a]volume={ambient_gain},aresample=48000,apad,atrim=0:{dur},"
             f"asetpts=PTS-STARTPTS,{AUDIO_NORM}[amb]"
         )
         mix_inputs.append("[amb]")
@@ -336,7 +346,7 @@ def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf,
     else:
         a_parts.append(
             f"{''.join(mix_inputs)}amix=inputs={len(mix_inputs)}:duration=first:"
-            f"dropout_transition=0,{AUDIO_NORM}[aout]"
+            f"dropout_transition=0:normalize=0,alimiter=limit=0.95:level=0:latency=1,{AUDIO_NORM}[aout]"
         )
         amix = "[aout]"
 
@@ -349,7 +359,7 @@ def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf,
     run(["ffmpeg", "-y"] + inputs + ["-filter_complex", fc, "-map", "[v]", "-map", amix,
          "-c:v", "libx264", "-preset", preset, "-crf", str(crf)] + rate_args +
         ["-pix_fmt", "yuv420p", "-g", str(fps * 2), "-keyint_min", str(fps * 2),
-         "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2", "-t", f"{dur}",
+         "-c:a", "aac", "-b:a", f"{audio_bitrate}k", "-ar", "48000", "-ac", "2", "-t", f"{dur}",
          "-movflags", "+faststart", str(out)])
     wall = (time.monotonic() - t_seg) / 60.0
 
@@ -430,6 +440,10 @@ def main():
     preset = str(export.get("preset", "ultrafast" if res_mode == "720p" else "veryfast"))
     crf = int(export.get("crf", 23 if preset == "ultrafast" else 20))
     lt_cfg = export.get("lower_third_config", {}) or {}
+    audio_bitrate = int(export.get("audio_bitrate_kbps", 192))
+    sentence_pad = float((manifest.get("anti_desync_locks") or {}).get("voiceover_sentence_pad_sec", 0.35))
+    if not 64 <= audio_bitrate <= 320 or not math.isfinite(sentence_pad) or sentence_pad < 0:
+        raise ValueError("Invalid audio bitrate or sentence padding")
 
     # Потолок битрейта: берём bitrate_mbps из манифеста с запасом x1.3 (по умолчанию 45M для 4K).
     default_cap = {3840: 45, 2560: 25, 1920: 16, 1280: 8}.get(w, 45)
@@ -482,7 +496,8 @@ def main():
             seg_path, dur = build_segment(entry, i, assets_dir, folder_id, w, h, fps,
                                           preset, crf, maxrate_mbps, bufsize_mbps, lt_cfg, tmp_dir,
                                           incoming=entries[i-2] if i > 1 else None,
-                                          outgoing=entry if i < len(entries) else None)
+                                          outgoing=entry if i < len(entries) else None,
+                                          audio_bitrate=audio_bitrate, sentence_pad=sentence_pad)
             actual_timings.append({
                 "scene_index": i,
                 "scene_start": round(cursor, 3),
@@ -531,7 +546,7 @@ def main():
 
         final_out = out_dir / f"{project_name}.mp4"
         final_cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list),
-                     "-map", "0:v", "-map", "0:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                     "-map", "0:v", "-map", "0:a", "-c:v", "copy", "-c:a", "aac", "-b:a", f"{audio_bitrate}k",
                      "-ar", "48000", "-ac", "2", "-af", ln, "-movflags", "+faststart", str(final_out)]
         try:
             run(final_cmd)
@@ -539,7 +554,7 @@ def main():
             print("[WARN] Двухпроходный loudnorm отклонён FFmpeg — повторяю финал в однопроходном режиме.",
                   flush=True)
             run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list),
-                 "-map", "0:v", "-map", "0:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                 "-map", "0:v", "-map", "0:a", "-c:v", "copy", "-c:a", "aac", "-b:a", f"{audio_bitrate}k",
                  "-ar", "48000", "-ac", "2", "-af", "loudnorm=I=-14:TP=-1:LRA=11",
                  "-movflags", "+faststart", str(final_out)])
 
