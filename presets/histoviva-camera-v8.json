@@ -1,0 +1,59 @@
+{
+  "configuration_version": "8.0",
+  "description": "Editorial camera presets; copy camera_movement and camera_zoom into each scene. Not a runtime global configuration.",
+  "defaults": {
+    "camera_movement": "static",
+    "camera_zoom": 1.12
+  },
+  "presets": {
+    "establishing": {
+      "camera_movement": "zoom_out",
+      "camera_zoom": 1.12
+    },
+    "discovery": {
+      "camera_movement": "zoom_in",
+      "camera_zoom": 1.15
+    },
+    "landscape_left": {
+      "camera_movement": "pan_left",
+      "camera_zoom": 1.12
+    },
+    "landscape_right": {
+      "camera_movement": "pan_right",
+      "camera_zoom": 1.12
+    },
+    "architecture_up": {
+      "camera_movement": "pan_up",
+      "camera_zoom": 1.1
+    },
+    "terrain_down": {
+      "camera_movement": "pan_down",
+      "camera_zoom": 1.1
+    },
+    "archive_static": {
+      "camera_movement": "static",
+      "camera_zoom": 1
+    }
+  },
+  "editorial_guidance": {
+    "short_scene_under_sec": 3,
+    "short_scene_recommendation": "archive_static",
+    "already_moving_footage": "archive_static",
+    "recommended_zoom_range": [
+      1.05,
+      1.15
+    ],
+    "avoid_repeated_direction": true
+  },
+  "renderer_contract": {
+    "easing": "cosine ease-in-out (fixed)",
+    "duration": "effective scene duration",
+    "pan_zoom": "constant",
+    "zoom_center": "center",
+    "audio": "unchanged",
+    "allowed_zoom": [
+      1,
+      1.5
+    ]
+  }
+}
