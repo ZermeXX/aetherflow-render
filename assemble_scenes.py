@@ -511,9 +511,20 @@ def main():
         (out_dir / "RELEASE_CARD.md").write_text(NL.join(card), encoding="utf-8")
 
         preview = out_dir / f"{project_name}_720p_preview.mp4"
-        run(["ffmpeg", "-y", "-i", str(final_out), "-t", "120", "-vf", "scale=1280:720",
-             "-c:v", "libx264", "-crf", "24", "-preset", "veryfast",
-             "-c:a", "copy", "-movflags", "+faststart", str(preview)])
+        preview_limit = export.get("preview_duration_sec")
+        preview_args = []
+        if preview_limit is not None:
+            try:
+                limit = float(preview_limit)
+                if not math.isfinite(limit) or limit < 0:
+                    raise ValueError("expected a finite non-negative duration")
+                if limit > 0:
+                    preview_args = ["-t", str(limit)]
+            except (TypeError, ValueError) as exc:
+                raise SystemExit(f"[PREVIEW] Invalid preview_duration_sec: {exc}") from exc
+        run(["ffmpeg", "-y", "-i", str(final_out)] + preview_args +
+            ["-vf", "scale=1280:720", "-c:v", "libx264", "-crf", "24",
+             "-preset", "veryfast", "-c:a", "copy", "-movflags", "+faststart", str(preview)])
 
         qc = {"duration_sec": round(total, 3), "duration_formatted": fmt_clock(total),
               "integrated_lufs": -14.0, "scenes": len(segments),
