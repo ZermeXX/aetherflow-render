@@ -28,7 +28,7 @@ SECRET_KEYS = {
 }
 SEG_CACHE_DIR = Path("seg_cache")
 SEG_CACHE_REMOTE = "gdrive:_aether_segcache"
-CACHE_SCHEMA = 8
+CACHE_SCHEMA = 9
 
 try:
     from lower_third_overlay import apply_lower_third_to_clip
@@ -246,8 +246,33 @@ def cinematic_camera_filter(entry, w, h, fps, dur):
             "format=yuv420p")
 
 
+def transition_filter(incoming, outgoing, dur):
+    """Non-overlapping dip transitions; audio and timeline remain untouched."""
+    def half(entry):
+        if not entry:
+            return 0.0, "black"
+        mode = str(entry.get("transition") or "cut").lower()
+        if mode in ("cut", "none", "hard_cut"):
+            return 0.0, "black"
+        if mode not in ("fade", "dip_to_black", "fade_black", "dip_to_white", "fade_white"):
+            raise ValueError(f"Unsupported transition: {mode}")
+        seconds = float(entry.get("transition_duration", 0.5))
+        if not math.isfinite(seconds) or seconds < 0:
+            raise ValueError("transition_duration must be finite and non-negative")
+        return seconds / 2, "white" if "white" in mode else "black"
+    a, ac = half(incoming)
+    b, bc = half(outgoing)
+    a, b = min(a, dur / 2), min(b, dur / 2)
+    filters = []
+    if a:
+        filters.append(f"fade=t=in:st=0:d={a}:color={ac}")
+    if b:
+        filters.append(f"fade=t=out:st={dur-b}:d={b}:color={bc}")
+    return ",".join(filters)
+
+
 def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf,
-                  maxrate_mbps, bufsize_mbps, lt_cfg, tmp_dir):
+                  maxrate_mbps, bufsize_mbps, lt_cfg, tmp_dir, incoming=None, outgoing=None):
     fn = (entry.get("file_name") or entry.get("video_file")
           or (entry.get("assets") or {}).get("video_file")
           or (entry.get("assets") or {}).get("image_reference"))
@@ -265,6 +290,8 @@ def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf,
     lt_on = HAS_LT and bool(lt_cfg.get("enabled", True)) and bool(text_overlay)
 
     key = seg_cache_key(entry, vid, voice, ambient, w, h, fps, preset, crf, lt_on, dur, maxrate_mbps)
+    transition = transition_filter(incoming, outgoing, dur)
+    key = hashlib.sha256(f'{key}|{transition}'.encode()).hexdigest()
     hit = cache_get(key)
     if hit:
         return hit, dur
@@ -284,8 +311,8 @@ def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf,
     camera = cinematic_camera_filter(entry, w, h, fps, dur)
     # Repeat at input level, avoiding an unbounded decoded-frame loop buffer.
     inputs = ["-stream_loop", "-1"] + inputs
-    v_chain = (f"[0:v]{camera or scale},trim=duration={dur},"
-               "setpts=PTS-STARTPTS[v]")
+    v_chain = (f"[0:v]{camera or scale},trim=duration={dur},setpts=PTS-STARTPTS"
+               + (f",{transition}" if transition else "") + "[v]")
     a_parts, mix_inputs = [], []
     if voice is not None:
         a_parts.append(
@@ -453,7 +480,9 @@ def main():
     try:
         for i, entry in enumerate(entries, 1):
             seg_path, dur = build_segment(entry, i, assets_dir, folder_id, w, h, fps,
-                                          preset, crf, maxrate_mbps, bufsize_mbps, lt_cfg, tmp_dir)
+                                          preset, crf, maxrate_mbps, bufsize_mbps, lt_cfg, tmp_dir,
+                                          incoming=entries[i-2] if i > 1 else None,
+                                          outgoing=entry if i < len(entries) else None)
             actual_timings.append({
                 "scene_index": i,
                 "scene_start": round(cursor, 3),
