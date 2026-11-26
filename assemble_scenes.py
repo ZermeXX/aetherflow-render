@@ -28,7 +28,7 @@ SECRET_KEYS = {
 }
 SEG_CACHE_DIR = Path("seg_cache")
 SEG_CACHE_REMOTE = "gdrive:_aether_segcache"
-CACHE_SCHEMA = 7
+CACHE_SCHEMA = 8
 
 try:
     from lower_third_overlay import apply_lower_third_to_clip
@@ -166,6 +166,8 @@ def seg_cache_key(entry, vid, voice, ambient, w, h, fps, preset, crf, lt_on, dur
         "ambient": [ambient.name, ambient.stat().st_size] if ambient else None,
         "dur": round(dur, 2),
         "vs": entry.get("voice_start", 0.2),
+        "camera_movement": entry.get("camera_movement", "static"),
+        "camera_zoom": entry.get("camera_zoom", 1.12),
         "w": w, "h": h, "fps": fps, "preset": preset, "crf": crf,
         "maxrate": maxrate,
         "lt": bool(lt_on),
@@ -210,6 +212,40 @@ def cache_put(key, path):
         pass
 
 
+def cinematic_camera_filter(entry, w, h, fps, dur):
+    """Apply explicitly requested camera motion, including image-derived MP4s."""
+    mode = str(entry.get("camera_movement") or "static").lower()
+    if mode in ("static", "none"):
+        return None
+    if mode not in ("zoom_in", "zoom_out", "pan_left", "pan_right", "pan_up", "pan_down"):
+        raise ValueError(f"Unsupported camera_movement: {mode}")
+    zoom = float(entry.get("camera_zoom", 1.12))
+    if not math.isfinite(zoom) or not 1.0 <= zoom <= 1.5:
+        raise ValueError("camera_zoom must be between 1.0 and 1.5")
+    frames = max(1, math.ceil(dur * fps) - 1)
+    p = f"(0.5-0.5*cos(PI*min(on/{frames},1)))"
+    z = str(zoom)
+    x, y = "(iw-iw/zoom)/2", "(ih-ih/zoom)/2"
+    if mode == "zoom_in":
+        z = f"1+{zoom-1}*{p}"
+    elif mode == "zoom_out":
+        z = f"{zoom}-{zoom-1}*{p}"
+    elif mode == "pan_left":
+        x = f"(iw-iw/zoom)*(1-{p})"
+    elif mode == "pan_right":
+        x = f"(iw-iw/zoom)*{p}"
+    elif mode == "pan_up":
+        y = f"(ih-ih/zoom)*(1-{p})"
+    elif mode == "pan_down":
+        y = f"(ih-ih/zoom)*{p}"
+    # Oversample to reduce integer crop-position jitter; d=1 preserves video motion.
+    sw, sh = w * 2, h * 2
+    return (f"scale={sw}:{sh}:force_original_aspect_ratio=increase,"
+            f"crop={sw}:{sh},setsar=1,fps={fps},"
+            f"zoompan=z='{z}':x='{x}':y='{y}':d=1:s={w}x{h}:fps={fps},"
+            "format=yuv420p")
+
+
 def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf,
                   maxrate_mbps, bufsize_mbps, lt_cfg, tmp_dir):
     fn = (entry.get("file_name") or entry.get("video_file")
@@ -245,7 +281,11 @@ def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf,
     if ambient is not None:
         inputs += ["-stream_loop", "-1", "-i", str(ambient)]
 
-    v_chain = f"[0:v]loop=loop=-1:size=32767:start=0,{scale},trim=duration={dur},setpts=PTS-STARTPTS[v]"
+    camera = cinematic_camera_filter(entry, w, h, fps, dur)
+    # Repeat at input level, avoiding an unbounded decoded-frame loop buffer.
+    inputs = ["-stream_loop", "-1"] + inputs
+    v_chain = (f"[0:v]{camera or scale},trim=duration={dur},"
+               "setpts=PTS-STARTPTS[v]")
     a_parts, mix_inputs = [], []
     if voice is not None:
         a_parts.append(
