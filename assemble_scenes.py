@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 assemble_scenes.py — повествовательный монтаж N сцен (documentary pipeline).
-v6: normalize ключей + stereo-аудио + валидация loudnorm + retry финала + cache probe.
+v7: потолок битрейта (maxrate/bufsize) + normalize ключей + stereo-аудио
+    + валидация loudnorm + retry финала + probe-валидация кэша + бюджетный guard.
 Вызов: python3 assemble_scenes.py manifest.json [--assets-dir assets] [--preflight]
 """
 import argparse
@@ -17,7 +18,7 @@ import time
 from pathlib import Path
 
 NL = chr(10)
-VERSION_BANNER = "[ASSEMBLE] v6: normalized keys + stereo audio + validated loudnorm + retry"
+VERSION_BANNER = "[ASSEMBLE] v7: bitrate cap + normalized keys + stereo audio + validated loudnorm"
 AUDIO_NORM = "aformat=sample_rates=48000:channel_layouts=stereo"
 
 SECRET_KEYS = {
@@ -27,7 +28,7 @@ SECRET_KEYS = {
 }
 SEG_CACHE_DIR = Path("seg_cache")
 SEG_CACHE_REMOTE = "gdrive:_aether_segcache"
-CACHE_SCHEMA = 6
+CACHE_SCHEMA = 7
 
 try:
     from lower_third_overlay import apply_lower_third_to_clip
@@ -75,7 +76,9 @@ def probe(path):
     data = json.loads(res.stdout)
     dur = float(data.get("format", {}).get("duration", 0) or 0)
     a = next((s for s in data.get("streams", []) if s.get("codec_type") == "audio"), None)
-    return {"duration": dur, "has_audio": a is not None}
+    v = next((s for s in data.get("streams", []) if s.get("codec_type") == "video"), {})
+    return {"duration": dur, "has_audio": a is not None,
+            "bit_rate": int(v.get("bit_rate") or (data.get("format") or {}).get("bit_rate") or 0)}
 
 
 def segment_is_valid(path):
@@ -155,7 +158,7 @@ def entry_duration(entry, vid_path):
     return dur
 
 
-def seg_cache_key(entry, vid, voice, ambient, w, h, fps, preset, crf, lt_on, dur):
+def seg_cache_key(entry, vid, voice, ambient, w, h, fps, preset, crf, lt_on, dur, maxrate):
     payload = {
         "ver": CACHE_SCHEMA,
         "vid": [vid.name, vid.stat().st_size],
@@ -164,6 +167,7 @@ def seg_cache_key(entry, vid, voice, ambient, w, h, fps, preset, crf, lt_on, dur
         "dur": round(dur, 2),
         "vs": entry.get("voice_start", 0.2),
         "w": w, "h": h, "fps": fps, "preset": preset, "crf": crf,
+        "maxrate": maxrate,
         "lt": bool(lt_on),
         "overlay": (entry.get("text_overlay") or "").strip()[:80],
     }
@@ -206,7 +210,8 @@ def cache_put(key, path):
         pass
 
 
-def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf, lt_cfg, tmp_dir):
+def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf,
+                  maxrate_mbps, bufsize_mbps, lt_cfg, tmp_dir):
     fn = (entry.get("file_name") or entry.get("video_file")
           or (entry.get("assets") or {}).get("video_file")
           or (entry.get("assets") or {}).get("image_reference"))
@@ -223,7 +228,7 @@ def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf, lt_
     text_overlay = (entry.get("text_overlay") or "").strip()
     lt_on = HAS_LT and bool(lt_cfg.get("enabled", True)) and bool(text_overlay)
 
-    key = seg_cache_key(entry, vid, voice, ambient, w, h, fps, preset, crf, lt_on, dur)
+    key = seg_cache_key(entry, vid, voice, ambient, w, h, fps, preset, crf, lt_on, dur, maxrate_mbps)
     hit = cache_get(key)
     if hit:
         return hit, dur
@@ -270,8 +275,13 @@ def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf, lt_
 
     fc = v_chain + ";" + ";".join(a_parts)
     t_seg = time.monotonic()
+    # CRF управляет качеством, maxrate/bufsize срезают пики битрейта от зерна.
+    rate_args = []
+    if maxrate_mbps > 0:
+        rate_args = ["-maxrate", f"{maxrate_mbps}M", "-bufsize", f"{bufsize_mbps}M"]
     run(["ffmpeg", "-y"] + inputs + ["-filter_complex", fc, "-map", "[v]", "-map", amix,
-         "-c:v", "libx264", "-preset", preset, "-crf", str(crf), "-pix_fmt", "yuv420p",
+         "-c:v", "libx264", "-preset", preset, "-crf", str(crf)] + rate_args +
+        ["-pix_fmt", "yuv420p", "-g", str(fps * 2), "-keyint_min", str(fps * 2),
          "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2", "-t", f"{dur}",
          "-movflags", "+faststart", str(out)])
     wall = (time.monotonic() - t_seg) / 60.0
@@ -291,7 +301,8 @@ def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf, lt_
         final_out = ov
     if not segment_is_valid(final_out):
         raise SystemExit(f"[P0-GUARD] Сегмент сцены #{idx} собран невалидно (нет видео/аудио).")
-    print(f"[SEG {idx}] {dur:.1f}s контента за {wall:.1f} мин wall "
+    mb = final_out.stat().st_size / (1024 * 1024)
+    print(f"[SEG {idx}] {dur:.1f}s контента за {wall:.1f} мин wall • {mb:.1f} MB "
           f"(speed {dur / 60.0 / max(wall, 0.01):.2f}x)", flush=True)
     cache_put(key, final_out)
     return final_out, dur
@@ -353,6 +364,14 @@ def main():
     crf = int(export.get("crf", 23 if preset == "ultrafast" else 20))
     lt_cfg = export.get("lower_third_config", {}) or {}
 
+    # Потолок битрейта: берём bitrate_mbps из манифеста с запасом x1.3 (по умолчанию 45M для 4K).
+    default_cap = {3840: 45, 2560: 25, 1920: 16, 1280: 8}.get(w, 45)
+    declared = float(export.get("bitrate_mbps") or 0)
+    maxrate_mbps = int(round(declared * 1.3)) if declared > 0 else default_cap
+    if str(export.get("bitrate_cap", "on")).lower() in ("off", "false", "0", "none"):
+        maxrate_mbps = 0
+    bufsize_mbps = max(2, maxrate_mbps * 2)
+
     folder_id = str(
         manifest.get("gdrive_folder_id")
         or (manifest.get("cloud_export") or {}).get("target_folder_id")
@@ -381,8 +400,11 @@ def main():
               or (e.get("assets") or {}).get("image_reference"))
         vp = resolve_asset(fn, assets_dir, folder_id)
         total_content += entry_duration(e, vp) if vp else float(e.get("duration_sec") or e.get("duration") or 6.0)
+    cap_label = f"{maxrate_mbps}M" if maxrate_mbps > 0 else "без потолка"
+    est_gb = (maxrate_mbps or 200) * 1e6 / 8 * total_content / 1e9
     print(f"[PLAN] Контента: {total_content / 60:.1f} мин • {w}x{h} {fps}fps "
-          f"{preset} crf{crf} • бюджет {budget_min:.0f} мин", flush=True)
+          f"{preset} crf{crf} • maxrate {cap_label} • ожидание ~{est_gb:.2f} GB • бюджет {budget_min:.0f} мин",
+          flush=True)
 
     t0 = time.monotonic()
     content_done = 0.0
@@ -391,7 +413,7 @@ def main():
     try:
         for i, entry in enumerate(entries, 1):
             seg_path, dur = build_segment(entry, i, assets_dir, folder_id, w, h, fps,
-                                          preset, crf, lt_cfg, tmp_dir)
+                                          preset, crf, maxrate_mbps, bufsize_mbps, lt_cfg, tmp_dir)
             actual_timings.append({
                 "scene_index": i,
                 "scene_start": round(cursor, 3),
@@ -453,7 +475,8 @@ def main():
                  "-movflags", "+faststart", str(final_out)])
 
         total = sum(t["duration"] for t in actual_timings)
-        print(f"[DONE] {final_out} | {fmt_clock(total)} | {len(segments)} сцен | "
+        size_mb = round(final_out.stat().st_size / (1024 * 1024), 2)
+        print(f"[DONE] {final_out} | {fmt_clock(total)} | {len(segments)} сцен | {size_mb} MB | "
               f"wall {(time.monotonic() - t0) / 60:.1f} мин", flush=True)
         (out_dir / "final_output_name.txt").write_text(final_out.name, encoding="utf-8")
 
@@ -479,7 +502,9 @@ def main():
         card = [f"# Release Card: {manifest.get('video_title', project_name)}", "",
                 f"- **Project:** `{project_name}`",
                 f"- **Duration:** `{total:.2f}s` (`{fmt_clock(total)}`)",
+                f"- **File Size:** `{size_mb} MB`",
                 f"- **Resolution:** `{w}x{h} @ {fps}fps`",
+                f"- **Bitrate cap:** `{cap_label}`",
                 f"- **Scenes:** `{len(segments)}`",
                 f"- **Loudness:** `-14 LUFS / -1 dBTP`", "",
                 "## Chapters", "", *chapters, ""]
@@ -492,7 +517,8 @@ def main():
 
         qc = {"duration_sec": round(total, 3), "duration_formatted": fmt_clock(total),
               "integrated_lufs": -14.0, "scenes": len(segments),
-              "resolution": f"{w}x{h}", "fps": fps,
+              "resolution": f"{w}x{h}", "fps": fps, "file_size_mb": size_mb,
+              "bitrate_cap_mbps": maxrate_mbps,
               "loudnorm_mode": "two-pass" if measured else "single-pass",
               "encode_speed_x": round((content_done / 60.0) / max((time.monotonic() - t0) / 60.0, 0.01), 3)}
         Path("qc_report.json").write_text(json.dumps(qc, ensure_ascii=False, indent=2), encoding="utf-8")
