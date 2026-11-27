@@ -66,7 +66,7 @@ def _fit_font(draw, text, size, width, bold=True):
 
 
 def render_lower_third_frame(frame_w, frame_h, local_t, main_text, sub_text,
-                             emblem_path="aether_art_150x150.png", show_start=0.5,
+                             emblem_path="histoviva_emblem_gold_v2.png", show_start=0.5,
                              show_end=5.5, anim_dur=0.55, config=None):
     cfg = config or {}
     canvas = Image.new("RGBA", (frame_w, frame_h))
@@ -143,7 +143,7 @@ def render_brand_identity(w, h, emblem_path, config):
 
 
 def apply_lower_third_to_clip(input_video_path, output_video_path, text_overlay, fps=24,
-                              emblem_path="aether_art_150x150.png", show_start=0.5,
+                              emblem_path="histoviva_emblem_gold_v2.png", show_start=0.5,
                               show_end=5.5, anim_dur=0.55, work_dir="./_overlay_tmp", config=None, crf=18, preset="veryfast", maxrate=0, bufsize=0):
     main_line, sub_line = _parse_text_overlay(text_overlay)
     config = config or {}
