@@ -28,7 +28,7 @@ SECRET_KEYS = {
 }
 SEG_CACHE_DIR = Path("seg_cache")
 SEG_CACHE_REMOTE = "gdrive:_aether_segcache"
-CACHE_SCHEMA = 13
+CACHE_SCHEMA = 14
 
 try:
     from lower_third_overlay import apply_lower_third_to_clip
@@ -222,6 +222,7 @@ def verify_assets(entries, assets_dir, folder_id, lt_cfg, sentence_pad, strict=F
                     errors.append(f"Scene {i}: duplicate video content from scene {seen_video[fingerprint]}")
                 seen_video.setdefault(fingerprint, i)
                 duration, sync = scene_timing(e, Path(video["path"]), Path(voice["path"]) if voice else None, sentence_pad)
+                sync["camera_policy"] = camera_policy(e, video["path"])
             except Exception as exc:
                 errors.append(f"Scene {i}: {exc}")
         report["planned_duration_sec"] += planned
@@ -307,6 +308,7 @@ def seg_cache_key(entry, vid, voice, ambient, w, h, fps, preset, crf, lt_on, dur
         "ambient": file_fingerprint(ambient),
         "dur": dur,
         "vs": entry.get("voice_start", 0.2),
+        "camera_policy": camera_policy(entry, vid),
         "camera_movement": entry.get("camera_movement", "static"),
         "camera_zoom": entry.get("camera_zoom", 1.12),
         "w": w, "h": h, "fps": fps, "preset": preset, "crf": crf,
@@ -356,6 +358,14 @@ def cache_put(key, path):
         print(f"[CACHE WARN] {exc}", flush=True)
     finally:
         partial.unlink(missing_ok=True)
+
+
+def camera_policy(entry, path):
+    still = Path(path).suffix.lower() in (".png", ".jpg", ".jpeg", ".webp", ".bmp")
+    policy = str(entry.get("camera_policy") or ("cinematic" if still else "native")).lower()
+    if policy not in ("native", "cinematic"):
+        raise ValueError("Unsupported camera_policy: " + policy)
+    return policy
 
 
 def cinematic_camera_filter(entry, w, h, fps, dur):
@@ -482,7 +492,9 @@ def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf,
     if ambient is not None:
         inputs += ["-stream_loop", "-1", "-i", str(ambient)]
 
-    camera = cinematic_camera_filter(entry, w, h, fps, dur)
+    policy = camera_policy(entry, vid)
+    camera = cinematic_camera_filter(entry, w, h, fps, dur) if policy == "cinematic" else None
+    print(f"[CAMERA] Scene {idx}: {policy}; filter={'cinematic' if camera else 'fit without crop'}", flush=True)
     # Never repeat source motion unless explicitly requested.
     mode = sync["mode"]
     source = probe(vid)
