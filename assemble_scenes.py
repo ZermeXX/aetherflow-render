@@ -28,7 +28,7 @@ SECRET_KEYS = {
 }
 SEG_CACHE_DIR = Path("seg_cache")
 SEG_CACHE_REMOTE = "gdrive:_aether_segcache"
-CACHE_SCHEMA = 12
+CACHE_SCHEMA = 13
 
 try:
     from lower_third_overlay import apply_lower_third_to_clip
@@ -194,6 +194,7 @@ def verify_assets(entries, assets_dir, folder_id, lt_cfg, sentence_pad, strict=F
                     if not math.isfinite(info["duration"]) or info["duration"] <= 0:
                         raise ValueError("invalid media duration")
                 info["file"] = str(name)
+                info["path"] = str(path.resolve())
             cache[key] = info
             return info
         except Exception as exc:
@@ -201,6 +202,7 @@ def verify_assets(entries, assets_dir, folder_id, lt_cfg, sentence_pad, strict=F
             cache[key] = None
             return None
     effective = 0.0
+    seen_video = {}
     for i, e in enumerate(entries, 1):
         assets = e.get("assets") or {}
         video = check(e.get("file_name") or e.get("video_file") or assets.get("video_file") or assets.get("image_reference"), "video")
@@ -211,12 +213,22 @@ def verify_assets(entries, assets_dir, folder_id, lt_cfg, sentence_pad, strict=F
             ambient = ambient.get("file_name")
         ambient_info = check(ambient, "ambient", False)
         planned = float(e.get("duration_sec") or e.get("duration") or (video or {}).get("duration") or 6)
-        duration = max(planned, voice["duration"] + float(e.get("voice_start", 0.2)) + sentence_pad) if voice else planned
+        duration = planned
+        sync = {}
+        if video:
+            try:
+                fingerprint = file_fingerprint(video["path"])["sha256"]
+                if fingerprint in seen_video and e.get("allow_video_reuse") is not True:
+                    errors.append(f"Scene {i}: duplicate video content from scene {seen_video[fingerprint]}")
+                seen_video.setdefault(fingerprint, i)
+                duration, sync = scene_timing(e, Path(video["path"]), Path(voice["path"]) if voice else None, sentence_pad)
+            except Exception as exc:
+                errors.append(f"Scene {i}: {exc}")
         report["planned_duration_sec"] += planned
         effective += duration
         report["scenes"].append({"scene_index": i, "scene_id": e.get("scene_id"), "video": video,
                                  "voice": voice, "ambient": ambient_info, "planned_duration_sec": planned,
-                                 "estimated_duration_sec": duration})
+                                 "estimated_duration_sec": duration, "sync": sync})
     if (lt_cfg.get("brand_identity") or {}).get("enabled") or (lt_cfg.get("enabled", True) and any(
             e.get("text_overlay") or e.get("lower_third") or e.get("location") or e.get("date_era") for e in entries)):
         before = len(errors)
@@ -235,17 +247,42 @@ def verify_assets(entries, assets_dir, folder_id, lt_cfg, sentence_pad, strict=F
     return effective
 
 
+def scene_timing(entry, vid_path, voice_path=None, sentence_pad=0.35):
+    still = vid_path.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp", ".bmp")
+    mode = str(entry.get("video_duration_mode") or ("freeze" if still else "native")).lower()
+    if mode not in ("native", "stretch", "freeze", "loop"):
+        raise ValueError("Unsupported video_duration_mode: " + mode)
+    info = probe(vid_path)
+    source = info["video_duration"] or info["duration"]
+    if mode == "native" and not still:
+        if not math.isfinite(source) or source <= 0:
+            raise ValueError("Invalid native video duration")
+        active_end = None
+        if voice_path:
+            audio = probe(voice_path)["duration"]
+            result = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", "-i", str(voice_path),
+                                     "-af", "silencedetect=noise=-40dB:d=0.15", "-f", "null", "-"],
+                                    check=True, capture_output=True, text=True)
+            starts = re.findall(r"silence_start: ([0-9.]+)", result.stderr)
+            ends = re.findall(r"silence_end: ([0-9.]+)", result.stderr)
+            active_end = audio
+            if starts and ends and float(ends[-1]) >= audio - 0.08:
+                active_end = float(starts[-1])
+            if active_end <= 0:
+                raise ValueError("Voiceover appears silent")
+            if active_end > source:
+                raise ValueError(f"Voice exceeds native video: {active_end:.3f}s > {source:.3f}s")
+        return source, {"mode": mode, "source_duration_sec": source, "voice_active_end_sec": active_end,
+                        "voice_start_sec": 0.0, "silence_threshold_db": -40}
+    dur = float(entry.get("duration_sec") or entry.get("duration") or source or 6.0)
+    if voice_path:
+        dur = max(dur, probe(voice_path)["duration"] + float(entry.get("voice_start", 0.2)) + sentence_pad)
+    return dur, {"mode": mode, "source_duration_sec": source,
+                 "voice_start_sec": float(entry.get("voice_start", 0.2))}
+
+
 def entry_duration(entry, vid_path, voice_path=None, sentence_pad=0.35):
-    dur = float(entry.get("duration_sec") or entry.get("duration") or 0)
-    if dur <= 0:
-        dur = probe(vid_path)["duration"] or 6.0
-    voice_name = (entry.get("voiceover_file") or entry.get("audio_file")
-                  or (entry.get("assets") or {}).get("voiceover_file"))
-    if str(voice_name or "").strip():
-        vp = voice_path or resolve_asset(voice_name, vid_path.parent, "")
-        if vp:
-            dur = max(dur, probe(vp)["duration"] + float(entry.get("voice_start", 0.2)) + sentence_pad)
-    return dur
+    return scene_timing(entry, vid_path, voice_path, sentence_pad)[0]
 
 
 def file_fingerprint(path):
@@ -404,7 +441,7 @@ def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf,
     ambient_gain = float(ambient_cfg.get("volume", entry.get("ambient_volume", 0.35)))
     if not all(math.isfinite(g) and 0 <= g <= 4 for g in (voice_gain, ambient_gain)):
         raise ValueError("Audio volume must be finite and between 0 and 4")
-    dur = entry_duration(entry, vid, voice, sentence_pad)
+    dur, sync = scene_timing(entry, vid, voice, sentence_pad)
     text_overlay = str(entry.get("text_overlay") or "").strip()
     lower = entry.get("lower_third") or {}
     if isinstance(lower, dict) and not text_overlay:
@@ -427,13 +464,13 @@ def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf,
 
     key = seg_cache_key(entry, vid, voice, ambient, w, h, fps, preset, crf, lt_on, dur, maxrate_mbps, lt_cfg, bufsize_mbps)
     transition = transition_filter(incoming, outgoing, dur)
-    key = hashlib.sha256(f'{key}|{transition}|{voice_gain}|{ambient_gain}|{audio_bitrate}|{sentence_pad}|{entry.get("video_duration_mode", "stretch")}'.encode()).hexdigest()
+    key = hashlib.sha256(f'{key}|{transition}|{voice_gain}|{ambient_gain}|{audio_bitrate}|{sentence_pad}|{sync["mode"]}'.encode()).hexdigest()
     expected = (dur, w, h, fps)
     hit = cache_get(key, expected)
     if hit:
-        return hit, dur
+        return hit, dur, sync["voice_start_sec"]
 
-    voice_start = float(entry.get("voice_start", 0.2))
+    voice_start = sync["voice_start_sec"]
     delay_ms = max(0, int(round(voice_start * 1000)))
     out = tmp_dir / f"seg_{idx:03d}.mp4"
     scale = (f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
@@ -447,9 +484,7 @@ def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf,
 
     camera = cinematic_camera_filter(entry, w, h, fps, dur)
     # Never repeat source motion unless explicitly requested.
-    mode = str(entry.get("video_duration_mode") or "stretch").lower()
-    if mode not in ("stretch", "freeze", "loop"):
-        raise ValueError("Unsupported video_duration_mode: " + mode)
+    mode = sync["mode"]
     source = probe(vid)
     source_dur = source.get("video_duration") or source["duration"]
     still = vid.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp", ".bmp")
@@ -526,7 +561,7 @@ def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf,
     print(f"[SEG {idx}] {dur:.1f}s контента за {wall:.1f} мин wall • {mb:.1f} MB "
           f"(speed {dur / 60.0 / max(wall, 0.01):.2f}x)", flush=True)
     cache_put(key, final_out)
-    return final_out, dur
+    return final_out, dur, voice_start
 
 
 def _is_finite(value):
@@ -639,7 +674,7 @@ def main():
     cursor = 0.0
     try:
         for i, entry in enumerate(entries, 1):
-            seg_path, dur = build_segment(entry, i, assets_dir, folder_id, w, h, fps,
+            seg_path, dur, actual_voice_start = build_segment(entry, i, assets_dir, folder_id, w, h, fps,
                                           preset, crf, maxrate_mbps, bufsize_mbps, lt_cfg, tmp_dir,
                                           incoming=entries[i-2] if i > 1 else None,
                                           outgoing=entry if i < len(entries) else None,
@@ -647,7 +682,7 @@ def main():
             actual_timings.append({
                 "scene_index": i,
                 "scene_start": round(cursor, 3),
-                "voice_start": round(cursor + float(entry.get("voice_start", 0.2)), 3),
+                "voice_start": round(cursor + actual_voice_start, 3),
                 "scene_end": round(cursor + dur, 3),
                 "duration": round(dur, 3),
             })
