@@ -28,7 +28,7 @@ SECRET_KEYS = {
 }
 SEG_CACHE_DIR = Path("seg_cache")
 SEG_CACHE_REMOTE = "gdrive:_aether_segcache"
-CACHE_SCHEMA = 18
+CACHE_SCHEMA = 19
 
 try:
     from lower_third_overlay import apply_lower_third_to_clip
@@ -164,7 +164,7 @@ def resolve_asset(name, assets_dir, folder_id):
     return None
 
 
-def verify_assets(entries, assets_dir, folder_id, lt_cfg, sentence_pad, strict=False):
+def verify_assets(entries, assets_dir, folder_id, lt_cfg, sentence_pad, strict=False, fps=24):
     report = {"status": "FAIL", "scenes": [], "errors": [], "warnings": [],
               "planned_duration_sec": 0.0, "estimated_effective_duration_sec": None}
     errors = report["errors"]
@@ -221,8 +221,12 @@ def verify_assets(entries, assets_dir, folder_id, lt_cfg, sentence_pad, strict=F
                 if fingerprint in seen_video and e.get("allow_video_reuse") is not True:
                     errors.append(f"Scene {i}: duplicate video content from scene {seen_video[fingerprint]}")
                 seen_video.setdefault(fingerprint, i)
-                duration, sync = scene_timing(e, Path(video["path"]), Path(voice["path"]) if voice else None, sentence_pad)
+                duration, sync = scene_timing(e, Path(video["path"]), Path(voice["path"]) if voice else None, sentence_pad, fps)
                 sync["camera_policy"] = camera_policy(e, video["path"])
+                if sync.get("extension_sec", 0) > 0:
+                    warning = f"Scene {i} ({video['file']}): {sync['extension_strategy']} +{sync['extension_sec']:.3f}s"
+                    report["warnings"].append(warning)
+                    print("[SYNC EXTENSION] " + warning, flush=True)
             except Exception as exc:
                 errors.append(f"Scene {i}: {exc}")
         report["planned_duration_sec"] += planned
@@ -248,14 +252,14 @@ def verify_assets(entries, assets_dir, folder_id, lt_cfg, sentence_pad, strict=F
     return effective
 
 
-def scene_timing(entry, vid_path, voice_path=None, sentence_pad=0.35):
+def scene_timing(entry, vid_path, voice_path=None, sentence_pad=0.35, fps=24):
     still = vid_path.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp", ".bmp")
-    mode = str(entry.get("video_duration_mode") or ("freeze" if still else "native")).lower()
-    if mode not in ("native", "stretch", "freeze", "loop"):
+    mode = str(entry.get("video_duration_mode") or ("freeze" if still else "hybrid")).lower()
+    if mode not in ("native", "hybrid", "stretch", "freeze", "loop"):
         raise ValueError("Unsupported video_duration_mode: " + mode)
     info = probe(vid_path)
     source = info["video_duration"] or info["duration"]
-    if mode == "native" and not still:
+    if mode in ("native", "hybrid") and not still:
         if not math.isfinite(source) or source <= 0:
             raise ValueError("Invalid native video duration")
         active_end = None
@@ -283,9 +287,20 @@ def scene_timing(entry, vid_path, voice_path=None, sentence_pad=0.35):
             if last == 0:
                 raise ValueError("Voiceover appears silent")
             active_end = min(decoded, last / 48000 + 0.05)
-            if active_end > source:
-                raise ValueError(f"Voice exceeds native video after PCM analysis: {active_end:.3f}s > {source:.3f}s (decoded={decoded:.3f}s; review source or explicitly select freeze)")
-        return source, {"mode": mode, "source_duration_sec": source, "voice_active_end_sec": active_end,
+            if active_end > source and mode == "native":
+                raise ValueError(f"Voice exceeds native video after PCM analysis: {active_end:.3f}s > {source:.3f}s")
+        if fps <= 0:
+            raise ValueError("Invalid output fps")
+        dur = math.ceil(max(source, active_end or 0) * fps - 1e-5) / fps
+        extension = max(0.0, dur - source)
+        limit = float(entry.get("max_extension_sec", 2.0))
+        if not math.isfinite(limit) or not 0 <= limit <= 2:
+            raise ValueError("max_extension_sec must be between 0 and 2")
+        if mode == "hybrid" and extension > limit + 1e-5:
+            raise ValueError(f"Hybrid extension {extension:.3f}s exceeds limit {limit:.3f}s")
+        strategy = "none" if extension < 1e-5 else "micro_hold" if extension <= .15 else "short_hold" if extension <= .8 else "long_hold_review"
+        return dur, {"mode": mode, "source_duration_sec": source, "voice_active_end_sec": active_end,
+                        "extension_sec": extension, "extension_strategy": strategy, "output_frames": round(dur*fps),
                         "voice_decoded_duration_sec": decoded, "voice_start_sec": 0.0,
                         "silence_threshold_db": -60, "voice_tail_guard_sec": 0.05}
     dur = float(entry.get("duration_sec") or entry.get("duration") or source or 6.0)
@@ -559,7 +574,7 @@ def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf,
     ambient_gain = float(ambient_cfg.get("volume", entry.get("ambient_volume", 0.35)))
     if not all(math.isfinite(g) and 0 <= g <= 4 for g in (voice_gain, ambient_gain)):
         raise ValueError("Audio volume must be finite and between 0 and 4")
-    dur, sync = scene_timing(entry, vid, voice, sentence_pad)
+    dur, sync = scene_timing(entry, vid, voice, sentence_pad, fps)
     adaptive = entry.get("adaptive_audio", True)
     ducking = entry.get("audio_ducking", True)
     if not isinstance(adaptive, bool) or not isinstance(ducking, bool):
@@ -660,8 +675,12 @@ def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf,
                 ratio *= 2
             factors.append(f"atempo={ratio:.9f}")
             tempo = "," + ",".join(factors)
+        tail_fade = ""
+        if mode == "hybrid" and dur - source_dur > .04:
+            fade = min(.25, source_dur / 2)
+            tail_fade = f",afade=t=out:st={source_dur-fade}:d={fade}"
         a_parts.append(
-            f"[0:a:0]aresample=48000:async=1:first_pts=0,{AUDIO_NORM}{tempo},"
+            f"[0:a:0]aresample=48000:async=1:first_pts=0,{AUDIO_NORM}{tempo}{tail_fade},"
             f"volume={source_gain},apad,atrim=0:{dur},asetpts=PTS-STARTPTS[srcenv]"
         )
         mix_inputs.append("[srcenv]")
@@ -826,7 +845,7 @@ def main():
     assets_dir = Path(args.assets_dir)
     assets_dir.mkdir(parents=True, exist_ok=True)
     total_content = verify_assets(entries, assets_dir, folder_id, lt_cfg, sentence_pad,
-                                  strict=str(manifest.get("manifest_version")) == "8.0")
+                                  strict=str(manifest.get("manifest_version")) == "8.0", fps=fps)
     if args.preflight:
         print(f"[PREFLIGHT] OK: {len(entries)} сцен, все ассеты найдены.", flush=True)
         return
