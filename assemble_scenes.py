@@ -28,7 +28,7 @@ SECRET_KEYS = {
 }
 SEG_CACHE_DIR = Path("seg_cache")
 SEG_CACHE_REMOTE = "gdrive:_aether_segcache"
-CACHE_SCHEMA = 22
+CACHE_SCHEMA = 23
 
 try:
     from lower_third_overlay import apply_lower_third_to_clip
@@ -645,17 +645,42 @@ def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf,
     transition = transition_filter(incoming, outgoing, dur)
     key = hashlib.sha256(f'{key}|{transition}|{voice_gain}|{ambient_gain}|{audio_bitrate}|{sentence_pad}|{sync["mode"]}|{source_on}|{source_gain}|{adaptive}|{ducking}|{json.dumps(cta,sort_keys=True)}'.encode()).hexdigest()
     expected = (dur, w, h, fps)
+    # Measure source tracks even on cache hits, so QC is reproducible.
+    audio_qc = {"scene_index": idx, "scene_id": entry.get("scene_id"),
+                "adaptive_audio": adaptive, "audio_ducking": ducking, "tracks": {}}
+    def prepare_track(label, path, enabled, manual, target):
+        measured = track_loudness(path, dur) if enabled and path is not None else None
+        gain = manual
+        if adaptive and measured is not None and manual > 0:
+            gain *= 10 ** (max(-24.0, min(18.0, target - measured)) / 20)
+        audio_qc["tracks"][label] = {
+            "enabled": bool(enabled), "input_lufs": measured, "target_lufs": target,
+            "manual_gain": manual, "applied_gain": gain if enabled else 0.0,
+            "estimated_pre_duck_lufs": measured + 20 * math.log10(gain)
+                if enabled and measured is not None and gain > 0 else None}
+        return gain
+    voice_gain = prepare_track("voice", voice, voice is not None and voice_gain > 0, voice_gain, -16.0)
+    source_gain = prepare_track("source_environment", vid, source_on, source_gain,
+                                -22.0 if ambient is None else -25.0)
+    ambient_gain = prepare_track("external_ambient", ambient, ambient is not None and ambient_gain > 0,
+                                 ambient_gain, -22.0 if not source_on else -25.0)
+    audio_qc["cta"] = {"enabled": cta_on and bool(cta.get("sfx_enabled", True)),
+                       "sfx_volume": cta.get("sfx_volume", 0.5) if cta_on else 0.0,
+                       "show_sec": cta.get("show_sec"), "click_sec": cta.get("click_sec"),
+                       "bell_sec": cta.get("bell_sec")}
+    vox_level = audio_qc["tracks"]["voice"]["estimated_pre_duck_lufs"]
+    audio_qc["warnings"] = []
+    for label in ("source_environment", "external_ambient"):
+        level = audio_qc["tracks"][label]["estimated_pre_duck_lufs"]
+        if level is not None and vox_level is not None:
+            if level > vox_level - 3:
+                audio_qc["warnings"].append(label + ": close to narration before ducking")
+            elif level < vox_level - 18:
+                audio_qc["warnings"].append(label + ": potentially too quiet before ducking")
     hit = cache_get(key, expected)
     if hit:
-        return hit, dur, sync["voice_start_sec"]
-
-    if adaptive:
-        if voice is not None:
-            voice_gain = adaptive_gain(voice, dur, -16.0, voice_gain)
-        if source_on:
-            source_gain = adaptive_gain(vid, dur, -22.0 if ambient is None else -25.0, source_gain)
-        if ambient is not None:
-            ambient_gain = adaptive_gain(ambient, dur, -22.0 if not source_on else -25.0, ambient_gain)
+        audio_qc["mixed_segment_lufs"] = track_loudness(hit, dur)
+        return hit, dur, sync["voice_start_sec"], audio_qc
     print(f"[ADAPTIVE AUDIO] Scene {idx}: voice={voice_gain:.3f} source={source_gain:.3f} ambient={ambient_gain:.3f} ducking={ducking}", flush=True)
     voice_start = sync["voice_start_sec"]
     delay_ms = max(0, int(round(voice_start * 1000)))
@@ -795,7 +820,8 @@ def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf,
     print(f"[SEG {idx}] {dur:.1f}s контента за {wall:.1f} мин wall • {mb:.1f} MB "
           f"(speed {dur / 60.0 / max(wall, 0.01):.2f}x)", flush=True)
     cache_put(key, final_out)
-    return final_out, dur, voice_start
+    audio_qc["mixed_segment_lufs"] = track_loudness(final_out, dur)
+    return final_out, dur, voice_start, audio_qc
 
 
 def _is_finite(value):
@@ -908,15 +934,16 @@ def main():
 
     t0 = time.monotonic()
     content_done = 0.0
-    segments, actual_timings = [], []
+    segments, actual_timings, audio_scene_qc = [], [], []
     cursor = 0.0
     try:
         for i, entry in enumerate(entries, 1):
-            seg_path, dur, actual_voice_start = build_segment(entry, i, assets_dir, folder_id, w, h, fps,
+            seg_path, dur, actual_voice_start, scene_audio_qc = build_segment(entry, i, assets_dir, folder_id, w, h, fps,
                                           preset, crf, maxrate_mbps, bufsize_mbps, lt_cfg, tmp_dir,
                                           incoming=entries[i-2] if i > 1 else None,
                                           outgoing=entry if i < len(entries) else None,
                                           audio_bitrate=audio_bitrate, sentence_pad=sentence_pad)
+            audio_scene_qc.append(scene_audio_qc)
             actual_timings.append({
                 "scene_index": i,
                 "scene_start": round(cursor, 3),
@@ -1054,6 +1081,8 @@ def main():
         qc = {"render_mode": "preview" if args.preview_only else "master", "duration_sec": round(total, 3), "duration_formatted": fmt_clock(total),
               "integrated_lufs": finite_level("input_i"), "true_peak_dbtp": finite_level("input_tp"),
               "loudness_range_lu": finite_level("input_lra"), "target_lufs": -14.0, "target_true_peak_dbtp": -1.5,
+              "scene_audio_qc": audio_scene_qc,
+              "audio_qc_note": "Source measurements and estimated pre-duck levels; mixed segment measured before master normalization.",
               "expected_video_frames": total_frames, "actual_video_frames": final_info["video_frames"],
               "video_duration_sec": final_info["video_duration"], "audio_duration_sec": final_info["audio_duration"],
               "av_delta_ms": round(av_delta * 1000, 3), "av_tolerance_ms": 1000 / fps,
