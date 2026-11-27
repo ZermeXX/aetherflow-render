@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 
 NL = chr(10)
-VERSION_BANNER = "[ASSEMBLE] v7: bitrate cap + normalized keys + stereo audio + validated loudnorm"
+VERSION_BANNER = "[ASSEMBLE] v8: asset verification + recursive Drive index + preflight report"
 AUDIO_NORM = "aformat=sample_rates=48000:channel_layouts=stereo"
 
 SECRET_KEYS = {
@@ -114,45 +114,121 @@ def fmt_srt(sec):
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
+DRIVE_INDEX = {}
+
 def resolve_asset(name, assets_dir, folder_id):
     clean = str(name or "").strip()
     if not clean:
         return None
+    relative = Path(clean)
+    if relative.is_absolute() or ".." in relative.parts or "\\" in clean:
+        raise ValueError("Unsafe asset path: " + clean)
     for c in (Path(assets_dir) / clean, Path(clean)):
         if c.is_file():
             return c
     ad = Path(assets_dir)
-    if ad.is_dir():
-        for f in ad.iterdir():
-            if f.name.lower() == clean.lower():
-                return f
+    local = [f for f in ad.rglob("*") if f.is_file() and
+             (f.relative_to(ad).as_posix().casefold() == clean.casefold()
+              if "/" in clean else f.name.casefold() == clean.casefold())]
+    if len(local) > 1:
+        raise ValueError("Ambiguous local asset: " + clean)
+    if local:
+        return local[0]
     if folder_id:
-        dst = Path(assets_dir) / clean
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        if try_run(["rclone", "copyto", f"gdrive:{clean}", str(dst),
-                    "--drive-root-folder-id", folder_id, "--transfers", "2"]):
-            if dst.is_file():
-                print(f"[DOWNLOAD] {clean} <- Google Drive", flush=True)
-                return dst
+        root = ["--drive-root-folder-id", folder_id]
+        if folder_id not in DRIVE_INDEX:
+            result = subprocess.run(["rclone", "lsjson", "gdrive:", "--recursive", "--files-only"] + root,
+                                    check=True, capture_output=True, text=True)
+            DRIVE_INDEX[folder_id] = [x["Path"] for x in json.loads(result.stdout)]
+        paths = DRIVE_INDEX[folder_id]
+        matches = [p for p in paths if (p.casefold() == clean.casefold()
+                   if "/" in clean else Path(p).name.casefold() == clean.casefold())]
+        if len(matches) > 1:
+            raise ValueError("Ambiguous Drive asset: " + clean + " -> " + ", ".join(matches))
+        if matches:
+            dst = ad / clean
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            partial = dst.with_name(dst.name + ".partial")
+            try:
+                if try_run(["rclone", "copyto", "gdrive:" + matches[0], str(partial)] + root):
+                    if partial.is_file():
+                        os.replace(partial, dst)
+                        print(f"[DOWNLOAD] {clean} <- Google Drive ({matches[0]})", flush=True)
+                        return dst
+            finally:
+                partial.unlink(missing_ok=True)
     return None
 
 
-def guard_entries(entries, assets_dir, folder_id):
-    missing = []
+def verify_assets(entries, assets_dir, folder_id, lt_cfg, sentence_pad, strict=False):
+    report = {"status": "FAIL", "scenes": [], "errors": [], "warnings": [],
+              "planned_duration_sec": 0.0, "estimated_effective_duration_sec": None}
+    errors = report["errors"]
+    cache = {}
+    def check(name, kind, required=True):
+        if not name:
+            if required:
+                errors.append(f"Missing {kind} reference")
+            return None
+        key = (str(name), kind)
+        if key in cache:
+            return cache[key]
+        try:
+            path = resolve_asset(name, assets_dir, folder_id)
+            if path is None:
+                raise ValueError("file not found")
+            if kind == "emblem":
+                from PIL import Image
+                with Image.open(path) as im:
+                    im.verify()
+                info = {"file": str(name)}
+            else:
+                info = probe(path)
+                if not info["has_video" if kind == "video" else "has_audio"]:
+                    raise ValueError("required stream missing")
+                if kind != "video" or path.suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp", ".bmp"):
+                    if not math.isfinite(info["duration"]) or info["duration"] <= 0:
+                        raise ValueError("invalid media duration")
+                info["file"] = str(name)
+            cache[key] = info
+            return info
+        except Exception as exc:
+            errors.append(f"{kind}: {name}: {exc}")
+            cache[key] = None
+            return None
+    effective = 0.0
     for i, e in enumerate(entries, 1):
-        fn = (e.get("file_name") or e.get("video_file")
-              or (e.get("assets") or {}).get("video_file")
-              or (e.get("assets") or {}).get("image_reference") or "")
-        if not str(fn).strip():
-            missing.append(f"Сцена #{i}: пустое file_name")
-            continue
-        if resolve_asset(fn, assets_dir, folder_id) is None:
-            missing.append(f"Сцена #{i}: файл не найден -> {fn}")
-    if missing:
-        print("[P0-GUARD] Отсутствие ассетов:", file=sys.stderr)
-        for m in missing:
-            print(f"  - {m}", file=sys.stderr)
+        assets = e.get("assets") or {}
+        video = check(e.get("file_name") or e.get("video_file") or assets.get("video_file") or assets.get("image_reference"), "video")
+        voice_name = e.get("voiceover_file") or e.get("audio_file") or assets.get("voiceover_file")
+        voice = check(voice_name, "voice", False)
+        ambient = e.get("ambient_audio") or assets.get("ambient_audio")
+        if isinstance(ambient, dict):
+            ambient = ambient.get("file_name")
+        ambient_info = check(ambient, "ambient", False)
+        planned = float(e.get("duration_sec") or e.get("duration") or (video or {}).get("duration") or 6)
+        duration = max(planned, voice["duration"] + float(e.get("voice_start", 0.2)) + sentence_pad) if voice else planned
+        report["planned_duration_sec"] += planned
+        effective += duration
+        report["scenes"].append({"scene_index": i, "scene_id": e.get("scene_id"), "video": video,
+                                 "voice": voice, "ambient": ambient_info, "planned_duration_sec": planned,
+                                 "estimated_duration_sec": duration})
+    if (lt_cfg.get("brand_identity") or {}).get("enabled") or (lt_cfg.get("enabled", True) and any(
+            e.get("text_overlay") or e.get("lower_third") or e.get("location") or e.get("date_era") for e in entries)):
+        before = len(errors)
+        report["emblem"] = check(lt_cfg.get("emblem_path") or "aether_art_150x150_A.png", "emblem")
+        if not strict and len(errors) > before:
+            report["warnings"].extend(errors[before:])
+            del errors[before:]
+    report["status"] = "FAIL" if errors else "PASS"
+    if not errors:
+        report["estimated_effective_duration_sec"] = round(effective, 3)
+    Path("preflight_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    if errors:
+        for error in errors:
+            print("[PREFLIGHT] " + error, file=sys.stderr)
         raise SystemExit(1)
+    return effective
 
 
 def entry_duration(entry, vid_path, voice_path=None, sentence_pad=0.35):
@@ -517,7 +593,8 @@ def main():
 
     assets_dir = Path(args.assets_dir)
     assets_dir.mkdir(parents=True, exist_ok=True)
-    guard_entries(entries, assets_dir, folder_id)
+    total_content = verify_assets(entries, assets_dir, folder_id, lt_cfg, sentence_pad,
+                                  strict=str(manifest.get("manifest_version")) == "8.0")
     if args.preflight:
         print(f"[PREFLIGHT] OK: {len(entries)} сцен, все ассеты найдены.", flush=True)
         return
@@ -530,13 +607,6 @@ def main():
     SEG_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
     budget_min = float(os.environ.get("AETHER_BUDGET_MINUTES", "330"))
-    total_content = 0.0
-    for e in entries:
-        fn = (e.get("file_name") or e.get("video_file")
-              or (e.get("assets") or {}).get("video_file")
-              or (e.get("assets") or {}).get("image_reference"))
-        vp = resolve_asset(fn, assets_dir, folder_id)
-        total_content += entry_duration(e, vp) if vp else float(e.get("duration_sec") or e.get("duration") or 6.0)
     cap_label = f"{maxrate_mbps}M" if maxrate_mbps > 0 else "без потолка"
     est_gb = (maxrate_mbps or 200) * 1e6 / 8 * total_content / 1e9
     print(f"[PLAN] Контента: {total_content / 60:.1f} мин • {w}x{h} {fps}fps "
