@@ -2,6 +2,7 @@
 
 # AETHERFLOW RENDER
 ### V8.1 · Cloud Rendering Engine
+**Stable Rendering Contract · AetherCombine V9.0 Ecosystem**
 
 **Облачный FFmpeg-раннер: собирает 4K-мастера и многочасовые ambience-лупы по манифесту из AetherCombine Studio**
 
@@ -12,11 +13,26 @@
 [![FFmpeg](https://img.shields.io/badge/FFmpeg-xfade%20·%20loudnorm-007808?logo=ffmpeg&logoColor=white)](#)
 [![rclone](https://img.shields.io/badge/rclone-Google%20Drive-3F79AD)](#)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](#)
-[![Access](https://img.shields.io/badge/repo-private-critical)](#)
+[![Baseline](https://img.shields.io/badge/Baseline-V8.1-D4A64E)](https://github.com/ZermeXX/aetherflow-render/tree/baseline/v8.1)
 
 [**🎛️ Пульт управления (Studio)**](https://github.com/ZermeXX/aethercombine-studio) · [**🌐 Live Studio**](https://zermexx.github.io/aethercombine-studio/)
 
 </div>
+
+---
+
+## Статус движка
+
+| Контур | Состояние на 27 ноября 2026 |
+|---|---|
+| Renderer | V8.1 — стабильный производственный контракт |
+| Studio | V9.0 foundation, развитие независимо от раннера |
+| Renderer regression | [Run #4 — PASS](https://github.com/ZermeXX/aetherflow-render/actions/runs/46045656633) |
+| General CI | [Run #63 — PASS](https://github.com/ZermeXX/aetherflow-render/actions/runs/46045656561) |
+| Production reference | [Run #41](https://github.com/ZermeXX/aetherflow-render/actions/runs/46027702158) — HISTOVIVA EP02 |
+
+> [!IMPORTANT]
+> V9.0 относится к развитию Studio. Этот репозиторий сохраняет контракт V8.1; новые интерфейсы и IndexedDB не требуют изменения FFmpeg-движка. CI не заменяет полноценную производственную и режиссёрскую приёмку.
 
 ---
 
@@ -65,13 +81,13 @@ flowchart LR
 
 Для повествовательного монтажа целевой loudnorm: −14 LUFS, −1.5 dBTP, LRA 11. Переходы fade/dip/cut не перекрывают дикторские дорожки; true cross-dissolve между сценами не заявлен. Hybrid Hold не является интерполяцией кадров.
 
-### HISTOVIVA EP02 · контрольный Preview #35
+### HISTOVIVA EP02 · контрольный Master / Run #41
 
 | Сцены | Разрешение | Кадры | A/V delta | LUFS | True Peak |
 |---:|---:|---:|---:|---:|---:|
-| 34 | 1280×720 | 7308/7308 | 0 ms | −14.15 | −1.41 dBTP |
+| 34 | 3840×2160 | 7308/7308 | 0 ms | −14.15 | −1.41 dBTP |
 
-Технический QC пройден. Финальная коррекция CTA и 4K Master ещё не приняты.
+Исторический эталон: 304.500 с, 24 FPS, Director Acceptance PASS по отчёту проекта. True Peak на 0.09 dB выше целевого −1.5 dBTP. Производственные файлы впоследствии удалены владельцем; повторная проверка медиаданных не выполнялась.
 
 ---
 
@@ -123,6 +139,7 @@ flowchart LR
 |---|---|---|
 | `render_loop.yml` | `workflow_dispatch` | Preflight → луп → Shorts → метаданные → Drive → Telegram |
 | `render_scenes.yml` | `workflow_dispatch` | Schema/Preflight → Preview или Master → QC → Drive |
+| `renderer-regression.yml` | push / PR в `main`, вручную | Python compile + отдельная регрессия V8.1 с FFmpeg и Pillow |
 | `ci.yml` | push / PR | `compileall` + YAML-lint + unit-тесты + FFmpeg-графы на `testsrc` |
 | `ai-fix.yml` | вручную | Gemini-агент читает `tasks/*.md`, правит код, открывает PR |
 
@@ -235,7 +252,7 @@ TELEGRAM_CHAT_ID
 GEMINI_API_KEY           # только для ai-fix.yml
 ```
 
-- Приватный ключ Service Account **никогда** не покидает GitHub Secrets — в браузер он не попадает.
+- Приватный ключ Service Account должен храниться в защищённой конфигурации раннера, а не в браузере, манифесте или Git.
 - Манифест из студии очищается от `bot_token`, `pat`, `access_token`, `private_key`, … перед записью на диск.
 - Логи и уведомления маскируют токены, `Authorization`-заголовки и signed-URL.
 
@@ -274,10 +291,11 @@ python -m unittest discover -s tests -p "test_*.py" -v
 
 | Тест | Что охраняет |
 |---|---|
+| `test_renderer_v81.py` | Контракт V8.1, синхронизация, графика, аудио и QC |
 | `test_time_math.py` | `slot_duration_sec` не подменяется дефолтом · сумма тел и мостов = 10800 · главы на стыках актов · чётность crop · окно End Screen · отсутствие `half_cf` в мостах · санитайз секретов в workflow |
 | `test_ffmpeg_graphs.py` | Реальный прогон `xfade`-бейка, моста актов и `concat -c copy` на `testsrc` 320×180 · `acrossfade` всегда с двумя входами · измерительный проход loudnorm |
 
-CI проверяет графы и тайм-математику; блокировка merge зависит от настроек защиты ветки.
+CI проверяет графы и тайм-математику; отдельный workflow проверяет V8.1. Ветка baseline/v8.1 фиксирует исходный эталон, но сама по себе не обеспечивает branch protection. Полный повторный 4K-рендер не является частью каждого CI.
 
 ---
 
@@ -288,6 +306,20 @@ CI проверяет графы и тайм-математику; блокир�
 - **Идемпотентность.** Повторный запуск того же манифеста не ломает результат: артефакты перезаписываются, промежуточные файлы удаляются.
 - **Экономия диска.** Освобождение `/usr/share/dotnet`, `android`, `ghc` перед стартом; удаление кусков сразу после склейки.
 - **Наблюдаемость.** Пошаговый прогресс читается студией каждые 5 с; артефакты QC сохраняются в Actions даже при падении.
+
+---
+
+## Совместимость и развитие
+
+| Направление | Политика |
+|---|---|
+| V8.0 / V8.1 manifests | Сохранять действующие контракты |
+| V9.0 Studio | Независимая эволюция UI, project storage и workspace profiles |
+| HISTOVIVA | Narrative pipeline · 4K24 |
+| The Whisker Trio | Ambient loop pipeline · 4K24 |
+| Regression protection | Не менять форматы, тайминг или QC без целевых тестов |
+
+При изменении манифеста необходимо согласованно проверить обе стороны контракта. Изменения Studio в Draft PR #3 не означают выпуск новой версии Renderer.
 
 ---
 
