@@ -1,0 +1,27 @@
+name: Renderer V8.1 Regression
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'assemble_scenes.py'
+      - 'lower_third_overlay.py'
+      - 'tests/test_renderer_v81.py'
+      - '.github/workflows/renderer-regression.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg fonts-dejavu-core
+          python3 -m pip install pillow
+      - name: Syntax check
+        run: python3 -m py_compile assemble_scenes.py lower_third_overlay.py tests/test_renderer_v81.py
+      - name: FFmpeg regression
+        run: python3 -m unittest discover -s tests -p test_renderer_v81.py -v
