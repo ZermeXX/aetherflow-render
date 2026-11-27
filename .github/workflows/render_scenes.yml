@@ -165,10 +165,11 @@ jobs:
           from pathlib import Path
           from jsonschema import Draft202012Validator
           m = json.loads(Path("manifest.json").read_text(encoding="utf-8"))
-          schema = json.loads(Path("schemas/histoviva-manifest-v8.schema.json").read_text(encoding="utf-8"))
-          if str(m.get("manifest_version")) != "8.0":
+          version = str(m.get("manifest_version"))
+          if version not in ("8.0", "8.1"):
               print("[V8] Legacy manifest: strict V8 validation skipped")
               raise SystemExit(0)
+          schema = json.loads(Path("schemas/histoviva-manifest-v81.schema.json" if version == "8.1" else "schemas/histoviva-manifest-v8.schema.json").read_text(encoding="utf-8"))
           Draft202012Validator.check_schema(schema)
           errors = list(Draft202012Validator(schema).iter_errors(m))
           if errors:
@@ -189,6 +190,18 @@ jobs:
           for s in scenes:
               if "voice_end" in s and s["voice_end"] < s.get("voice_start", 0):
                   raise SystemExit("[V8] Invalid voice interval: " + s["scene_id"])
+              if version == "8.1":
+                  c = s.get("cta_config") or {}
+                  if c.get("enabled"):
+                      import math
+                      d = s.get("duration_sec", s.get("duration"))
+                      start, end = c.get("show_sec", [1.0, min(8.2, d)])
+                      click = c.get("click_sec", start + (end-start)*0.35)
+                      bell = c.get("bell_sec", start + (end-start)*0.65)
+                      fps = 24 if __import__("os").environ.get("RENDER_MODE") == "preview" else m["export_settings"]["fps"]
+                      frames = [math.ceil(t*fps-1e-8) for t in (start, click, bell, end)]
+                      if not 0 <= start < click < bell < end or not all(a < b for a,b in zip(frames,frames[1:])):
+                          raise SystemExit("[V8.1] Invalid CTA timing: " + s["scene_id"])
           lt = m["export_settings"].get("lower_third_config", {})
           if lt.get("enabled") and "show_sec" in lt:
               start, end = lt["show_sec"]
