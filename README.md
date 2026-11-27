@@ -1,9 +1,12 @@
 <div align="center">
 
-# ⚙️ aetherflow-render
+# AETHERFLOW RENDER
+### V8.1 · Cloud Rendering Engine
 
 **Облачный FFmpeg-раннер: собирает 4K-мастера и многочасовые ambience-лупы по манифесту из AetherCombine Studio**
 
+[![Version](https://img.shields.io/badge/Renderer-V8.1-F59E0B?style=for-the-badge)](#)
+[![Regression](https://github.com/ZermeXX/aetherflow-render/actions/workflows/renderer-regression.yml/badge.svg)](https://github.com/ZermeXX/aetherflow-render/actions/workflows/renderer-regression.yml)
 [![CI](https://github.com/ZermeXX/aetherflow-render/actions/workflows/ci.yml/badge.svg)](https://github.com/ZermeXX/aetherflow-render/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)](#)
 [![FFmpeg](https://img.shields.io/badge/FFmpeg-xfade%20·%20loudnorm-007808?logo=ffmpeg&logoColor=white)](#)
@@ -17,6 +20,61 @@
 
 ---
 
+## V8.1 · Narrative Rendering Engine
+
+| Подсистема | Реализация |
+|---|---|
+| **Strict Manifest** | JSON Schema V8.0 / V8.1, проверка структуры и таймингов |
+| **Asset Preflight** | Поиск исходников на Drive, проверка потоков, дубликатов и эмблемы |
+| **Hybrid Sync** | Анализ декодированной речи, округление до кадров, ограниченное удержание последнего кадра |
+| **Native Camera** | Сохранение движения исходного MP4; cinematic zoom/pan для изображений или по выбору |
+| **Audio Mixer** | Исходное окружение, диктор, эмбиент, адаптивное усиление и sidechain ducking |
+| **Broadcast Graphics** | Lower Third, постоянный Brand Identity, Subscribe & Bell и синхронные SFX |
+| **Segment Cache** | Хэш содержимого исходников и настроек, проверка потоков и длительности |
+| **Frame Lock** | Контроль числа кадров, аудиосэмплов и финальной разницы A/V |
+| **Enhanced QC** | Измеренные LUFS/True Peak/LRA, диагностика каждой сцены и CTA |
+
+### Режимы запуска render_scenes.yml
+
+| Режим | Назначение |
+|---|---|
+| preflight_only | Проверка манифеста и исходников без финального рендера |
+| render_mode: preview | Прямой полный Preview 720p, ultrafast, CRF 24 |
+| render_mode: master | Мастер по export_settings и контрольное превью |
+
+В Actions выберите Run workflow, укажите manifest_gdrive_file или manifest_payload и нужный режим. Preview сохраняется отдельно от Master.
+
+```mermaid
+flowchart LR
+ A[Manifest] --> B[Schema and Assets]
+ B --> C[Frame and Voice Timing]
+ C --> D[Cached Segments]
+ D --> E[Concat and Loudnorm]
+ E --> F[Final QC]
+ F --> G[Google Drive]
+ F --> H[QC Artifact]
+```
+
+### Контракт и регрессия
+
+- [JSON Schema V8.0](schemas/histoviva-manifest-v8.schema.json)
+- [JSON Schema V8.1](schemas/histoviva-manifest-v81.schema.json)
+- [Редакционные пресеты](presets/)
+- [Renderer V8.1 regression](tests/test_renderer_v81.py)
+- [Regression workflow](.github/workflows/renderer-regression.yml)
+
+Для повествовательного монтажа целевой loudnorm: −14 LUFS, −1.5 dBTP, LRA 11. Переходы fade/dip/cut не перекрывают дикторские дорожки; true cross-dissolve между сценами не заявлен. Hybrid Hold не является интерполяцией кадров.
+
+### HISTOVIVA EP02 · контрольный Preview #35
+
+| Сцены | Разрешение | Кадры | A/V delta | LUFS | True Peak |
+|---:|---:|---:|---:|---:|---:|
+| 34 | 1280×720 | 7308/7308 | 0 ms | −14.15 | −1.41 dBTP |
+
+Технический QC пройден. Финальная коррекция CTA и 4K Master ещё не приняты.
+
+---
+
 ## 🔥 Что это
 
 Этот репозиторий — **исполняемая часть** продакшн-пайплайна. Браузерная студия собирает JSON-манифест, отправляет его через `workflow_dispatch` — и всё тяжёлое происходит здесь, на раннере GitHub Actions:
@@ -26,7 +84,7 @@
 - 📱 **Shorts-фабрика** — вертикальные 9:16 тизеры с хук-титрами по таймкодам врезок.
 - 📦 **Метаданные релиза** — `RELEASE_CARD.md`, `output_chapters.txt`, `qc_report.json`.
 
-> Ни один многогигабайтный мастер не проходит через компьютер пользователя: исходники и результаты живут на Google Drive, рендер — в облаке.
+> Для облачного рендера не требуется скачивать многогигабайтный мастер: исходники и результаты живут на Google Drive, рендер — в облаке.
 
 ---
 
@@ -53,7 +111,7 @@ flowchart LR
 | Файл | Назначение |
 |---|---|
 | **`build_timeline.py`** | Основной движок лупа: loop-baker, мосты актов, врезки `inserts[]`, главы, Auto-QC, stream-upload |
-| **`assemble_scenes.py`** | Повествовательный монтаж: N сцен, диктор + эмбиент, lower-thirds, `actual_timings.json` |
+| **`assemble_scenes.py`** | Повествовательный монтаж: N сцен, Hybrid Sync, адаптивный микшер, CTA, `actual_timings.json` |
 | **`lower_third_overlay.py`** | Анимированные документальные плашки (Pillow → PNG-секвенция → `overlay`) |
 | **`shorts_factory.py`** | Вертикальные Shorts 1080×1920 с панорамой, хуками и loudnorm |
 | **`assemble_pipeline.py`** | Однопроходный вариант лупа (piece-модель + 2 с чёрного в финале), без врезок |
@@ -64,7 +122,7 @@ flowchart LR
 | Workflow | Триггер | Что делает |
 |---|---|---|
 | `render_loop.yml` | `workflow_dispatch` | Preflight → луп → Shorts → метаданные → Drive → Telegram |
-| `render_scenes.yml` | `workflow_dispatch` | Preflight → сцены → SRT/главы → Shorts → 720p-превью → Drive |
+| `render_scenes.yml` | `workflow_dispatch` | Schema/Preflight → Preview или Master → QC → Drive |
 | `ci.yml` | push / PR | `compileall` + YAML-lint + unit-тесты + FFmpeg-графы на `testsrc` |
 | `ai-fix.yml` | вручную | Gemini-агент читает `tasks/*.md`, правит код, открывает PR |
 
@@ -99,7 +157,7 @@ acrossfade(head, tail, d = D)                  →  atrim[D : S]
 <details>
 <summary><b>🔊 Звук и диск</b></summary>
 
-- **Loudnorm:** измерительный проход (`print_format=json`) → второй проход с `measured_*` и `linear=true`. Цель по умолчанию `-16 LUFS / -3 dBTP / LRA 11` для ambience, `-14 / -1` для документального.
+- **Loudnorm:** измерительный проход (`print_format=json`) → второй проход с `measured_*` и `linear=true`. Цель по умолчанию `-16 LUFS / -3 dBTP / LRA 11` для ambience, `-14 / -1.5` для документального.
 - **Disk-guard:** локальный режим требует ≈ 2× вес мастера (промежуточный + финальный файл). Если прогноз не влезает — включается `--stream`: финал мультиплексируется в `pipe:1` → `rclone rcat`, и весь файл никогда не лежит на диске раннера.
 - **Оценка веса** учитывает тип контента: статичный ambience ≈ 3 Мбит/с, динамичное видео ≈ 18 Мбит/с.
 
@@ -159,7 +217,7 @@ acrossfade(head, tail, d = D)                  →  atrim[D : S]
 | `output/*.srt` · `output_chapters.txt` | Субтитры и главы повествовательного монтажа |
 | `*_720p_preview.mp4` | Лёгкая копия для быстрой проверки |
 
-**Auto-QC** валит сборку, если нет видео- или аудио-дорожки, либо длительность расходится с расчётной больше чем на 15 с. Громкость измеряется через `ebur128` с `-vn` (без декодирования 4K-видео).
+**Narrative Auto-QC V8.1** проверяет наличие потоков, точное число кадров и A/V delta в пределах одного кадра. Финальная громкость измеряется через loudnorm; правила ambience-пайплайна отличаются.
 
 ---
 
@@ -219,7 +277,7 @@ python -m unittest discover -s tests -p "test_*.py" -v
 | `test_time_math.py` | `slot_duration_sec` не подменяется дефолтом · сумма тел и мостов = 10800 · главы на стыках актов · чётность crop · окно End Screen · отсутствие `half_cf` в мостах · санитайз секретов в workflow |
 | `test_ffmpeg_graphs.py` | Реальный прогон `xfade`-бейка, моста актов и `concat -c copy` на `testsrc` 320×180 · `acrossfade` всегда с двумя входами · измерительный проход loudnorm |
 
-CI блокирует merge, если граф перестал собираться или тайм-математика поехала.
+CI проверяет графы и тайм-математику; блокировка merge зависит от настроек защиты ветки.
 
 ---
 
