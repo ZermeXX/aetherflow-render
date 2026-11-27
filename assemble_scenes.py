@@ -246,7 +246,7 @@ def verify_assets(entries, assets_dir, folder_id, lt_cfg, sentence_pad, strict=F
     if (lt_cfg.get("brand_identity") or {}).get("enabled") or (lt_cfg.get("enabled", True) and any(
             e.get("text_overlay") or e.get("lower_third") or e.get("location") or e.get("date_era") for e in entries)):
         before = len(errors)
-        report["emblem"] = check(lt_cfg.get("emblem_path") or "aether_art_150x150_A.png", "emblem")
+        report["emblem"] = check(lt_cfg.get("emblem_path") or "histoviva_emblem_gold_v2.png", "emblem")
         if not strict and len(errors) > before:
             report["warnings"].extend(errors[before:])
             del errors[before:]
@@ -632,9 +632,9 @@ def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf,
         raise SystemExit("[BRANDING] lower_third_overlay unavailable")
     lt_cfg = dict(lt_cfg)
     if lt_on:
-        emblem = resolve_asset(lt_cfg.get("emblem_path") or "aether_art_150x150_A.png", assets_dir, folder_id)
+        emblem = resolve_asset(lt_cfg.get("emblem_path") or "histoviva_emblem_gold_v2.png", assets_dir, folder_id)
         if emblem is None:
-            emblem = resolve_asset("aether_art_150x150_A.png", assets_dir, folder_id)
+            emblem = resolve_asset("histoviva_emblem_gold_v2.png", assets_dir, folder_id)
         if emblem is None:
             print("[BRANDING WARN] emblem missing; rendering text panel only", flush=True)
         lt_cfg["emblem_path"] = str(emblem) if emblem else ""
@@ -751,7 +751,7 @@ def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf,
         mix_inputs.append("[srcenv]")
     print(f"[SOURCE AUDIO] Scene {idx}: present={source['has_audio']} enabled={source_on} gain={source_gain}", flush=True)
     if cta_on:
-        emblem = resolve_asset(lt_cfg.get("emblem_path") or "aether_art_150x150_A.png", assets_dir, folder_id)
+        emblem = resolve_asset(lt_cfg.get("emblem_path") or "histoviva_emblem_gold_v2.png", assets_dir, folder_id)
         frames, fx = cta_assets(cta, dur, w, h, fps, tmp_dir / f"cta_{idx:03d}", emblem)
         cidx = 1 + int(voice is not None) + int(ambient is not None)
         inputs += ["-framerate", str(fps), "-i", str(frames), "-i", str(fx)]
