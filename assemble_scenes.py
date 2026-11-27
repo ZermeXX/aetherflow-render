@@ -28,7 +28,7 @@ SECRET_KEYS = {
 }
 SEG_CACHE_DIR = Path("seg_cache")
 SEG_CACHE_REMOTE = "gdrive:_aether_segcache"
-CACHE_SCHEMA = 11
+CACHE_SCHEMA = 12
 
 try:
     from lower_third_overlay import apply_lower_third_to_clip
@@ -77,7 +77,11 @@ def probe(path):
     dur = float(data.get("format", {}).get("duration", 0) or 0)
     a = next((s for s in data.get("streams", []) if s.get("codec_type") == "audio"), None)
     v = next((s for s in data.get("streams", []) if s.get("codec_type") == "video"), {})
-    return {"duration": dur, "has_audio": a is not None, "has_video": bool(v),
+    try:
+        video_duration = float(v.get("duration") or dur)
+    except (TypeError, ValueError):
+        video_duration = dur
+    return {"duration": dur, "video_duration": video_duration, "has_audio": a is not None, "has_video": bool(v),
             "width": v.get("width"), "height": v.get("height"),
             "fps": v.get("avg_frame_rate"),
             "bit_rate": int(v.get("bit_rate") or (data.get("format") or {}).get("bit_rate") or 0)}
@@ -423,7 +427,7 @@ def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf,
 
     key = seg_cache_key(entry, vid, voice, ambient, w, h, fps, preset, crf, lt_on, dur, maxrate_mbps, lt_cfg, bufsize_mbps)
     transition = transition_filter(incoming, outgoing, dur)
-    key = hashlib.sha256(f'{key}|{transition}|{voice_gain}|{ambient_gain}|{audio_bitrate}|{sentence_pad}'.encode()).hexdigest()
+    key = hashlib.sha256(f'{key}|{transition}|{voice_gain}|{ambient_gain}|{audio_bitrate}|{sentence_pad}|{entry.get("video_duration_mode", "stretch")}'.encode()).hexdigest()
     expected = (dur, w, h, fps)
     hit = cache_get(key, expected)
     if hit:
@@ -442,9 +446,25 @@ def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf,
         inputs += ["-stream_loop", "-1", "-i", str(ambient)]
 
     camera = cinematic_camera_filter(entry, w, h, fps, dur)
-    # Repeat at input level, avoiding an unbounded decoded-frame loop buffer.
-    inputs = ["-stream_loop", "-1"] + inputs
-    v_chain = (f"[0:v]{camera or scale},trim=duration={dur},setpts=PTS-STARTPTS"
+    # Never repeat source motion unless explicitly requested.
+    mode = str(entry.get("video_duration_mode") or "stretch").lower()
+    if mode not in ("stretch", "freeze", "loop"):
+        raise ValueError("Unsupported video_duration_mode: " + mode)
+    source = probe(vid)
+    source_dur = source.get("video_duration") or source["duration"]
+    still = vid.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp", ".bmp")
+    timing = "setpts=PTS-STARTPTS,"
+    if mode == "loop" and not still:
+        inputs = ["-stream_loop", "-1"] + inputs
+    elif still:
+        timing += f"tpad=stop_mode=clone:stop_duration={dur},"
+    elif not math.isfinite(source_dur) or source_dur <= 0:
+        raise ValueError("Invalid source video duration: " + str(vid))
+    elif source_dur < dur and mode == "stretch":
+        timing += f"setpts={dur/source_dur:.9f}*PTS,"
+    # Clone the final frame to cover rounding or an early stream end.
+    print(f"[VIDEO FIT] Scene {idx}: {source_dur:.3f}s -> {dur:.3f}s ({mode})", flush=True)
+    v_chain = (f"[0:v]{timing}{camera or scale},tpad=stop_mode=clone:stop_duration={dur},trim=duration={dur},setpts=PTS-STARTPTS"
                + (f",{transition}" if transition else "") + "[v]")
     a_parts, mix_inputs = [], []
     if voice is not None:
