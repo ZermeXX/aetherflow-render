@@ -28,7 +28,7 @@ SECRET_KEYS = {
 }
 SEG_CACHE_DIR = Path("seg_cache")
 SEG_CACHE_REMOTE = "gdrive:_aether_segcache"
-CACHE_SCHEMA = 14
+CACHE_SCHEMA = 15
 
 try:
     from lower_third_overlay import apply_lower_third_to_clip
@@ -447,6 +447,14 @@ def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf,
         raise SystemExit(f"[AUDIO] Scene {idx}: missing voiceover {voice_name}")
     if ambient_name and ambient is None:
         raise SystemExit(f"[AUDIO] Scene {idx}: missing ambient {ambient_name}")
+    source = probe(vid)
+    source_enabled = entry.get("source_audio_enabled", True)
+    if not isinstance(source_enabled, bool):
+        raise ValueError("source_audio_enabled must be boolean")
+    source_gain = float(entry.get("source_audio_volume", 0.7))
+    if not math.isfinite(source_gain) or not 0 <= source_gain <= 4:
+        raise ValueError("source_audio_volume must be finite and between 0 and 4")
+    source_on = source_enabled and source["has_audio"] and source_gain > 0
     voice_gain = float(entry.get("voiceover_volume", 1.0))
     ambient_gain = float(ambient_cfg.get("volume", entry.get("ambient_volume", 0.35)))
     if not all(math.isfinite(g) and 0 <= g <= 4 for g in (voice_gain, ambient_gain)):
@@ -474,7 +482,7 @@ def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf,
 
     key = seg_cache_key(entry, vid, voice, ambient, w, h, fps, preset, crf, lt_on, dur, maxrate_mbps, lt_cfg, bufsize_mbps)
     transition = transition_filter(incoming, outgoing, dur)
-    key = hashlib.sha256(f'{key}|{transition}|{voice_gain}|{ambient_gain}|{audio_bitrate}|{sentence_pad}|{sync["mode"]}'.encode()).hexdigest()
+    key = hashlib.sha256(f'{key}|{transition}|{voice_gain}|{ambient_gain}|{audio_bitrate}|{sentence_pad}|{sync["mode"]}|{source_on}|{source_gain}'.encode()).hexdigest()
     expected = (dur, w, h, fps)
     hit = cache_get(key, expected)
     if hit:
@@ -497,7 +505,6 @@ def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf,
     print(f"[CAMERA] Scene {idx}: {policy}; filter={'cinematic' if camera else 'fit without crop'}", flush=True)
     # Never repeat source motion unless explicitly requested.
     mode = sync["mode"]
-    source = probe(vid)
     source_dur = source.get("video_duration") or source["duration"]
     still = vid.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp", ".bmp")
     timing = "setpts=PTS-STARTPTS,"
@@ -527,11 +534,29 @@ def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf,
             f"asetpts=PTS-STARTPTS,{AUDIO_NORM}[amb]"
         )
         mix_inputs.append("[amb]")
+    if source_on:
+        # Preserve source audio timestamps relative to the video. Explicit stretch
+        # modes need matching audio tempo; native mode never changes tempo.
+        tempo = ""
+        if mode == "stretch" and not still and source_dur < dur:
+            ratio = source_dur / dur
+            factors = []
+            while ratio < 0.5:
+                factors.append("atempo=0.5")
+                ratio *= 2
+            factors.append(f"atempo={ratio:.9f}")
+            tempo = "," + ",".join(factors)
+        a_parts.append(
+            f"[0:a:0]aresample=48000:async=1:first_pts=0,{AUDIO_NORM}{tempo},"
+            f"volume={source_gain},apad,atrim=0:{dur},asetpts=PTS-STARTPTS[srcenv]"
+        )
+        mix_inputs.append("[srcenv]")
+    print(f"[SOURCE AUDIO] Scene {idx}: present={source['has_audio']} enabled={source_on} gain={source_gain}", flush=True)
     if not mix_inputs:
         a_parts.append(f"anullsrc=r=48000:cl=stereo,atrim=0:{dur},{AUDIO_NORM}[aout]")
         amix = "[aout]"
     elif len(mix_inputs) == 1:
-        a_parts[-1] = a_parts[-1].replace("[vox]", "[aout]").replace("[amb]", "[aout]")
+        a_parts[-1] = a_parts[-1].replace("[vox]", "[aout]").replace("[amb]", "[aout]").replace("[srcenv]", "[aout]")
         amix = "[aout]"
     else:
         a_parts.append(
