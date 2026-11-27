@@ -28,7 +28,7 @@ SECRET_KEYS = {
 }
 SEG_CACHE_DIR = Path("seg_cache")
 SEG_CACHE_REMOTE = "gdrive:_aether_segcache"
-CACHE_SCHEMA = 15
+CACHE_SCHEMA = 16
 
 try:
     from lower_third_overlay import apply_lower_third_to_clip
@@ -427,6 +427,28 @@ def transition_filter(incoming, outgoing, dur):
     return ",".join(filters)
 
 
+def track_loudness(path, duration):
+    result = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-nostats", "-i", str(path), "-map", "0:a:0",
+         "-t", str(duration), "-af", AUDIO_NORM + ",loudnorm=I=-16:TP=-1:LRA=11:print_format=json",
+         "-f", "null", "-"], capture_output=True, text=True, check=True)
+    matches = re.findall(r'\{[^{}]*"input_i"[^{}]*\}', result.stderr)
+    if not matches:
+        return None
+    value = float(json.loads(matches[-1])["input_i"])
+    return value if math.isfinite(value) and value > -70 else None
+
+
+def adaptive_gain(path, duration, target, manual):
+    if manual == 0:
+        return 0.0
+    measured = track_loudness(path, duration)
+    if measured is None:
+        return manual
+    db = max(-24.0, min(18.0, target - measured))
+    return manual * 10 ** (db / 20)
+
+
 def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf,
                   maxrate_mbps, bufsize_mbps, lt_cfg, tmp_dir, incoming=None, outgoing=None,
                   audio_bitrate=192, sentence_pad=0.35):
@@ -451,7 +473,7 @@ def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf,
     source_enabled = entry.get("source_audio_enabled", True)
     if not isinstance(source_enabled, bool):
         raise ValueError("source_audio_enabled must be boolean")
-    source_gain = float(entry.get("source_audio_volume", 0.7))
+    source_gain = float(entry.get("source_audio_volume", 1.0))
     if not math.isfinite(source_gain) or not 0 <= source_gain <= 4:
         raise ValueError("source_audio_volume must be finite and between 0 and 4")
     source_on = source_enabled and source["has_audio"] and source_gain > 0
@@ -460,6 +482,10 @@ def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf,
     if not all(math.isfinite(g) and 0 <= g <= 4 for g in (voice_gain, ambient_gain)):
         raise ValueError("Audio volume must be finite and between 0 and 4")
     dur, sync = scene_timing(entry, vid, voice, sentence_pad)
+    adaptive = entry.get("adaptive_audio", True)
+    ducking = entry.get("audio_ducking", True)
+    if not isinstance(adaptive, bool) or not isinstance(ducking, bool):
+        raise ValueError("adaptive_audio and audio_ducking must be boolean")
     text_overlay = str(entry.get("text_overlay") or "").strip()
     lower = entry.get("lower_third") or {}
     if isinstance(lower, dict) and not text_overlay:
@@ -482,12 +508,20 @@ def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf,
 
     key = seg_cache_key(entry, vid, voice, ambient, w, h, fps, preset, crf, lt_on, dur, maxrate_mbps, lt_cfg, bufsize_mbps)
     transition = transition_filter(incoming, outgoing, dur)
-    key = hashlib.sha256(f'{key}|{transition}|{voice_gain}|{ambient_gain}|{audio_bitrate}|{sentence_pad}|{sync["mode"]}|{source_on}|{source_gain}'.encode()).hexdigest()
+    key = hashlib.sha256(f'{key}|{transition}|{voice_gain}|{ambient_gain}|{audio_bitrate}|{sentence_pad}|{sync["mode"]}|{source_on}|{source_gain}|{adaptive}|{ducking}'.encode()).hexdigest()
     expected = (dur, w, h, fps)
     hit = cache_get(key, expected)
     if hit:
         return hit, dur, sync["voice_start_sec"]
 
+    if adaptive:
+        if voice is not None:
+            voice_gain = adaptive_gain(voice, dur, -16.0, voice_gain)
+        if source_on:
+            source_gain = adaptive_gain(vid, dur, -22.0 if ambient is None else -25.0, source_gain)
+        if ambient is not None:
+            ambient_gain = adaptive_gain(ambient, dur, -22.0 if not source_on else -25.0, ambient_gain)
+    print(f"[ADAPTIVE AUDIO] Scene {idx}: voice={voice_gain:.3f} source={source_gain:.3f} ambient={ambient_gain:.3f} ducking={ducking}", flush=True)
     voice_start = sync["voice_start_sec"]
     delay_ms = max(0, int(round(voice_start * 1000)))
     out = tmp_dir / f"seg_{idx:03d}.mp4"
@@ -552,11 +586,24 @@ def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf,
         )
         mix_inputs.append("[srcenv]")
     print(f"[SOURCE AUDIO] Scene {idx}: present={source['has_audio']} enabled={source_on} gain={source_gain}", flush=True)
+    if ducking and "[vox]" in mix_inputs and voice_gain > 0 and len(mix_inputs) > 1:
+        beds = [label for label in mix_inputs if label != "[vox]"]
+        a_parts.append("[vox]asplit=2[voice_main][voice_key]")
+        if len(beds) > 1:
+            a_parts.append(f"{''.join(beds)}amix=inputs={len(beds)}:duration=first:normalize=0[bed]")
+            bed = "[bed]"
+        else:
+            bed = beds[0]
+        a_parts.append(
+            f"{bed}[voice_key]sidechaincompress=threshold=0.025:ratio=2.5:"
+            "attack=25:release=450:knee=2.5:detection=rms[ducked]"
+        )
+        mix_inputs = ["[voice_main]", "[ducked]"]
     if not mix_inputs:
         a_parts.append(f"anullsrc=r=48000:cl=stereo,atrim=0:{dur},{AUDIO_NORM}[aout]")
         amix = "[aout]"
     elif len(mix_inputs) == 1:
-        a_parts[-1] = a_parts[-1].replace("[vox]", "[aout]").replace("[amb]", "[aout]").replace("[srcenv]", "[aout]")
+        a_parts.append(f"{mix_inputs[0]}alimiter=limit=0.95:level=0:latency=1,{AUDIO_NORM}[aout]")
         amix = "[aout]"
     else:
         a_parts.append(
