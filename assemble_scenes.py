@@ -28,7 +28,7 @@ SECRET_KEYS = {
 }
 SEG_CACHE_DIR = Path("seg_cache")
 SEG_CACHE_REMOTE = "gdrive:_aether_segcache"
-CACHE_SCHEMA = 21
+CACHE_SCHEMA = 22
 
 try:
     from lower_third_overlay import apply_lower_third_to_clip
@@ -81,7 +81,14 @@ def probe(path):
         video_duration = float(v.get("duration") or dur)
     except (TypeError, ValueError):
         video_duration = dur
-    return {"duration": dur, "video_duration": video_duration, "has_audio": a is not None, "has_video": bool(v),
+    def stream_duration(stream):
+        try:
+            value = float((stream or {}).get("duration", "nan"))
+            return value if math.isfinite(value) else None
+        except (ValueError, TypeError):
+            return None
+    return {"duration": dur, "video_duration": video_duration, "audio_duration": stream_duration(a),
+            "video_frames": int(v["nb_frames"]) if str(v.get("nb_frames", "")).isdigit() else None, "has_audio": a is not None, "has_video": bool(v),
             "width": v.get("width"), "height": v.get("height"),
             "fps": v.get("avg_frame_rate"),
             "bit_rate": int(v.get("bit_rate") or (data.get("format") or {}).get("bit_rate") or 0)}
@@ -96,7 +103,9 @@ def segment_is_valid(path, expected=None):
             return True
         dur, w, h, fps = expected
         num, den = map(int, info["fps"].split("/"))
-        return (abs(info["duration"] - dur) <= max(0.12, 2 / fps)
+        return (abs(info["video_duration"] - dur) <= 0.5 / fps
+                and (info["video_frames"] is None or info["video_frames"] == round(dur * fps))
+                and info["audio_duration"] is not None and abs(info["audio_duration"] - dur) <= 1 / fps
                 and (info["width"], info["height"]) == (w, h)
                 and den > 0 and abs(num / den - fps) < 0.05)
     except Exception:
@@ -596,6 +605,9 @@ def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf,
     if not all(math.isfinite(g) and 0 <= g <= 4 for g in (voice_gain, ambient_gain)):
         raise ValueError("Audio volume must be finite and between 0 and 4")
     dur, sync = scene_timing(entry, vid, voice, sentence_pad, fps)
+    dur = math.ceil(dur * fps - 1e-5) / fps
+    frame_count = round(dur * fps)
+    sample_count = round(frame_count * 48000 / fps)
     adaptive = entry.get("adaptive_audio", True)
     ducking = entry.get("audio_ducking", True)
     if not isinstance(adaptive, bool) or not isinstance(ducking, bool):
@@ -748,6 +760,8 @@ def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf,
         )
         amix = "[aout]"
 
+    a_parts.append(f"{amix}apad,atrim=end_sample={sample_count},asetpts=N/SR/TB[exactaudio]")
+    amix = "[exactaudio]"
     fc = v_chain + ";" + ";".join(a_parts)
     t_seg = time.monotonic()
     # CRF управляет качеством, maxrate/bufsize срезают пики битрейта от зерна.
@@ -757,7 +771,7 @@ def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf,
     run(["ffmpeg", "-y"] + inputs + ["-filter_complex", fc, "-map", "[v]", "-map", amix,
          "-c:v", "libx264", "-preset", preset, "-crf", str(crf)] + rate_args +
         ["-pix_fmt", "yuv420p", "-g", str(fps * 2), "-keyint_min", str(fps * 2),
-         "-c:a", "aac", "-b:a", f"{audio_bitrate}k", "-ar", "48000", "-ac", "2", "-t", f"{dur}",
+         "-c:a", "aac", "-b:a", f"{audio_bitrate}k", "-ar", "48000", "-ac", "2", "-frames:v", str(frame_count), "-t", f"{dur:.9f}",
          "-movflags", "+faststart", str(out)])
     wall = (time.monotonic() - t_seg) / 60.0
 
@@ -940,7 +954,12 @@ def main():
 
         concat_list = tmp_dir / "concat.txt"
         concat_list.write_text(
-            "".join(f"file '{p.resolve().as_posix()}'{NL}" for p in segments), encoding="utf-8")
+            "".join(f"file '{p.resolve().as_posix()}'{NL}duration {round(t['duration'] * fps) / fps:.9f}{NL}"
+                    for p, t in zip(segments, actual_timings)), encoding="utf-8")
+        total_frames = sum(round(t["duration"] * fps) for t in actual_timings)
+        total = total_frames / fps
+        final_samples = round(total_frames * 48000 / fps)
+        exact_tail = f",aresample=48000,apad,atrim=end_sample={final_samples},asetpts=N/SR/TB"
 
         measured = measure_loudness(concat_list)
         ln = "loudnorm=I=-14:TP=-1.5:LRA=11"
@@ -952,7 +971,7 @@ def main():
         final_out = out_dir / (f"{project_name}_720p_preview.mp4" if args.preview_only else f"{project_name}.mp4")
         final_cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list),
                      "-map", "0:v", "-map", "0:a", "-c:v", "copy", "-c:a", "aac", "-b:a", f"{audio_bitrate}k",
-                     "-ar", "48000", "-ac", "2", "-af", ln, "-movflags", "+faststart", str(final_out)]
+                     "-ar", "48000", "-ac", "2", "-af", ln + exact_tail, "-movflags", "+faststart", str(final_out)]
         loudnorm_mode = "two-pass" if measured else "single-pass"
         try:
             run(final_cmd)
@@ -962,10 +981,16 @@ def main():
                   flush=True)
             run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list),
                  "-map", "0:v", "-map", "0:a", "-c:v", "copy", "-c:a", "aac", "-b:a", f"{audio_bitrate}k",
-                 "-ar", "48000", "-ac", "2", "-af", "loudnorm=I=-14:TP=-1.5:LRA=11",
+                 "-ar", "48000", "-ac", "2", "-af", "loudnorm=I=-14:TP=-1.5:LRA=11" + exact_tail,
                  "-movflags", "+faststart", str(final_out)])
 
-        total = sum(t["duration"] for t in actual_timings)
+        final_info = probe(final_out)
+        av_delta = (final_info["audio_duration"] - final_info["video_duration"]
+                    if final_info["audio_duration"] is not None else None)
+        if (av_delta is None or abs(av_delta) > 1 / fps or
+                abs(final_info["video_duration"] - total) > 1 / fps or
+                (final_info["video_frames"] is not None and final_info["video_frames"] != total_frames)):
+            raise SystemExit(f"[AV SYNC] Output outside frame tolerance: {final_info}, expected {total_frames} frames")
         size_mb = round(final_out.stat().st_size / (1024 * 1024), 2)
         print(f"[DONE] {final_out} | {fmt_clock(total)} | {len(segments)} сцен | {size_mb} MB | "
               f"wall {(time.monotonic() - t0) / 60:.1f} мин", flush=True)
@@ -1029,6 +1054,9 @@ def main():
         qc = {"render_mode": "preview" if args.preview_only else "master", "duration_sec": round(total, 3), "duration_formatted": fmt_clock(total),
               "integrated_lufs": finite_level("input_i"), "true_peak_dbtp": finite_level("input_tp"),
               "loudness_range_lu": finite_level("input_lra"), "target_lufs": -14.0, "target_true_peak_dbtp": -1.5,
+              "expected_video_frames": total_frames, "actual_video_frames": final_info["video_frames"],
+              "video_duration_sec": final_info["video_duration"], "audio_duration_sec": final_info["audio_duration"],
+              "av_delta_ms": round(av_delta * 1000, 3), "av_tolerance_ms": 1000 / fps,
               "scenes": len(segments),
               "resolution": f"{w}x{h}", "fps": fps, "file_size_mb": size_mb,
               "bitrate_cap_mbps": maxrate_mbps,
