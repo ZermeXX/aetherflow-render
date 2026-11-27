@@ -760,6 +760,7 @@ def main():
     ap.add_argument("manifest", nargs="?", default="manifest.json")
     ap.add_argument("--assets-dir", default="assets")
     ap.add_argument("--preflight", action="store_true")
+    ap.add_argument("--preview-only", action="store_true", help="Render full timeline directly at 720p")
     args = ap.parse_args()
 
     path = Path(args.manifest)
@@ -771,7 +772,10 @@ def main():
     if not entries:
         raise SystemExit("[P0-GUARD] Манифест не содержит сцен (timeline/scenes пусты).")
 
-    export = manifest.get("export_settings") or {}
+    export = dict(manifest.get("export_settings") or {})
+    if args.preview_only:
+        export.update(resolution="720p", preset="ultrafast", crf=24, bitrate_mbps=6, bitrate_cap="on", preview_duration_sec=0)
+        print("[PREVIEW] Direct full timeline 720p; no 4K master", flush=True)
     res_mode = str(export.get("resolution", "4k")).lower()
     dims = {"720p": (1280, 720), "1080p": (1920, 1080), "2k": (2560, 1440), "4k": (3840, 2160)}
     w, h = dims.get(res_mode, (3840, 2160))
@@ -817,7 +821,7 @@ def main():
     project_name = manifest.get("project_name", "output")
     out_dir = Path("output")
     out_dir.mkdir(parents=True, exist_ok=True)
-    tmp_dir = out_dir / f"_build_{project_name}"
+    tmp_dir = out_dir / f"_build_{project_name}{'_preview' if args.preview_only else ''}"
     tmp_dir.mkdir(parents=True, exist_ok=True)
     SEG_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -885,7 +889,7 @@ def main():
                    f":measured_LRA={measured['input_lra']}:measured_thresh={measured['input_thresh']}"
                    f":offset={measured['target_offset']}:linear=true")
 
-        final_out = out_dir / f"{project_name}.mp4"
+        final_out = out_dir / (f"{project_name}_720p_preview.mp4" if args.preview_only else f"{project_name}.mp4")
         final_cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list),
                      "-map", "0:v", "-map", "0:a", "-c:v", "copy", "-c:a", "aac", "-b:a", f"{audio_bitrate}k",
                      "-ar", "48000", "-ac", "2", "-af", ln, "-movflags", "+faststart", str(final_out)]
@@ -947,11 +951,12 @@ def main():
                     preview_args = ["-t", str(limit)]
             except (TypeError, ValueError) as exc:
                 raise SystemExit(f"[PREVIEW] Invalid preview_duration_sec: {exc}") from exc
-        run(["ffmpeg", "-y", "-i", str(final_out)] + preview_args +
-            ["-vf", "scale=1280:720", "-c:v", "libx264", "-crf", "24",
-             "-preset", "veryfast", "-c:a", "copy", "-movflags", "+faststart", str(preview)])
+        if not args.preview_only:
+            run(["ffmpeg", "-y", "-i", str(final_out)] + preview_args +
+                ["-vf", "scale=1280:720", "-c:v", "libx264", "-crf", "24",
+                 "-preset", "veryfast", "-c:a", "copy", "-movflags", "+faststart", str(preview)])
 
-        qc = {"duration_sec": round(total, 3), "duration_formatted": fmt_clock(total),
+        qc = {"render_mode": "preview" if args.preview_only else "master", "duration_sec": round(total, 3), "duration_formatted": fmt_clock(total),
               "integrated_lufs": -14.0, "scenes": len(segments),
               "resolution": f"{w}x{h}", "fps": fps, "file_size_mb": size_mb,
               "bitrate_cap_mbps": maxrate_mbps,
