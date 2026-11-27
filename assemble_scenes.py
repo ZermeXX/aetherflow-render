@@ -28,7 +28,7 @@ SECRET_KEYS = {
 }
 SEG_CACHE_DIR = Path("seg_cache")
 SEG_CACHE_REMOTE = "gdrive:_aether_segcache"
-CACHE_SCHEMA = 16
+CACHE_SCHEMA = 17
 
 try:
     from lower_third_overlay import apply_lower_third_to_clip
@@ -449,6 +449,71 @@ def adaptive_gain(path, duration, target, manual):
     return manual * 10 ** (db / 20)
 
 
+def cta_assets(cfg, dur, w, h, fps, folder, emblem):
+    from PIL import Image, ImageDraw, ImageFont
+    import wave
+    import array
+    import random
+    start, end = map(float, cfg.get("show_sec", [1.0, min(8.2, dur)]))
+    click = float(cfg.get("click_sec", start + (end-start)*0.35))
+    bell = float(cfg.get("bell_sec", start + (end-start)*0.65))
+    if not 0 <= start < click < bell < end <= dur:
+        raise ValueError("CTA timing must fit native scene")
+    folder.mkdir(parents=True, exist_ok=True)
+    pw, ph = int(w*.76)//2*2, int(h*.13)//2*2
+    def font(size):
+        return ImageFont.truetype("DejaVuSans-Bold.ttf", max(10,int(size)))
+    logo = None
+    if emblem:
+        logo = Image.open(emblem).convert("RGBA")
+        logo.thumbnail((int(ph*.78),int(ph*.78)))
+    for i in range(math.ceil(dur*fps)):
+        t = i/fps
+        im = Image.new("RGBA",(pw,ph))
+        if start <= t < end:
+            d = ImageDraw.Draw(im)
+            d.rounded_rectangle((1,1,pw-2,ph-2),radius=int(ph*.15),fill=(18,20,22,235),outline="#CAA65C",width=max(2,ph//65))
+            if logo:
+                im.alpha_composite(logo,(int(ph*.12),(ph-logo.height)//2))
+            d.text((int(ph*1.05),int(ph*.17)),"HISTOVIVA",font=font(ph*.32),fill="white")
+            d.text((int(ph*1.05),int(ph*.60)),"DISCOVER HIDDEN HISTORY",font=font(ph*.13),fill="#CAA65C")
+            x=int(pw*.56); y=int(ph*.20); bw=int(pw*.30)
+            d.rounded_rectangle((x,y,x+bw,ph-y),radius=int(ph*.10),fill="#B91C1C" if t<click else "#276749")
+            d.text((x+bw//2,ph//2),"SUBSCRIBE" if t<click else "SUBSCRIBED",font=font(ph*.23),fill="white",anchor="mm")
+            bx=int(pw*.93); by=int(ph*.48); rad=int(ph*.19)
+            icon=Image.new("RGBA",(ph,ph)); q=ImageDraw.Draw(icon)
+            c="#EBC66C" if t>=bell else "#AAAAAA"
+            q.ellipse((ph//2-rad,ph//2-rad,ph//2+rad,ph//2+rad),fill=c)
+            q.rectangle((ph//2-rad,ph//2,ph//2+rad,ph//2+rad),fill=c)
+            q.rounded_rectangle((ph//2-rad-int(ph*.06),ph//2+rad-int(ph*.04),ph//2+rad+int(ph*.06),ph//2+rad+int(ph*.04)),radius=max(2,ph//30),fill=c)
+            q.ellipse((ph//2-ph//18,ph//2+rad+ph//18,ph//2+ph//18,ph//2+rad+ph//6),fill=c)
+            angle=15*math.sin((t-bell)*35)*math.exp(-5*(t-bell)) if bell<=t<bell+1 else 0
+            im.alpha_composite(icon.rotate(angle,resample=Image.Resampling.BICUBIC),(bx-ph//2,by-ph//2))
+            opacity=min(1,(t-start)/.3,(end-t)/.3)
+            im.putalpha(im.getchannel("A").point(lambda a: int(a*opacity)))
+        im.save(folder / f"cta_{i:06d}.png")
+    wav=folder/"cta.wav"
+    rng=random.Random(81)
+    samples=array.array("h")
+    gain=float(cfg.get("sfx_volume",0.5))
+    if not math.isfinite(gain) or not 0<=gain<=1:
+        raise ValueError("CTA sfx_volume must be 0..1")
+    for i in range(round(dur*48000)):
+        t=i/48000
+        a=t-start; b=t-click; c=t-bell
+        v=0.0
+        if 0<=a<.3:
+            v+=.09*math.sin(math.pi*a/.3)**2*(rng.uniform(-1,1)*.4+math.sin(2*math.pi*(180*a+900*a*a))*.6)
+        if 0<=b<.12:
+            v+=.18*math.exp(-40*b)*math.sin(2*math.pi*1200*b)
+        if 0<=c<1.2:
+            v+=.15*math.exp(-4*c)*(math.sin(2*math.pi*880*c)+.4*math.sin(2*math.pi*1760*c))
+        samples.append(int(max(-1,min(1,v*gain))*32767))
+    with wave.open(str(wav),"wb") as f:
+        f.setnchannels(1); f.setsampwidth(2); f.setframerate(48000); f.writeframes(samples.tobytes())
+    return folder/"cta_%06d.png", wav
+
+
 def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf,
                   maxrate_mbps, bufsize_mbps, lt_cfg, tmp_dir, incoming=None, outgoing=None,
                   audio_bitrate=192, sentence_pad=0.35):
@@ -507,8 +572,10 @@ def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf,
         lt_cfg["emblem_path"] = str(emblem) if emblem else ""
 
     key = seg_cache_key(entry, vid, voice, ambient, w, h, fps, preset, crf, lt_on, dur, maxrate_mbps, lt_cfg, bufsize_mbps)
+    cta = entry.get("cta_config") or {}
+    cta_on = cta.get("enabled") is True and cta.get("style") == "subscribe_bell"
     transition = transition_filter(incoming, outgoing, dur)
-    key = hashlib.sha256(f'{key}|{transition}|{voice_gain}|{ambient_gain}|{audio_bitrate}|{sentence_pad}|{sync["mode"]}|{source_on}|{source_gain}|{adaptive}|{ducking}'.encode()).hexdigest()
+    key = hashlib.sha256(f'{key}|{transition}|{voice_gain}|{ambient_gain}|{audio_bitrate}|{sentence_pad}|{sync["mode"]}|{source_on}|{source_gain}|{adaptive}|{ducking}|{json.dumps(cta,sort_keys=True)}'.encode()).hexdigest()
     expected = (dur, w, h, fps)
     hit = cache_get(key, expected)
     if hit:
@@ -586,6 +653,15 @@ def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf,
         )
         mix_inputs.append("[srcenv]")
     print(f"[SOURCE AUDIO] Scene {idx}: present={source['has_audio']} enabled={source_on} gain={source_gain}", flush=True)
+    if cta_on:
+        emblem = resolve_asset(lt_cfg.get("emblem_path") or "aether_art_150x150_A.png", assets_dir, folder_id)
+        frames, fx = cta_assets(cta, dur, w, h, fps, tmp_dir / f"cta_{idx:03d}", emblem)
+        cidx = 1 + int(voice is not None) + int(ambient is not None)
+        inputs += ["-framerate", str(fps), "-i", str(frames), "-i", str(fx)]
+        v_chain = v_chain[:-3] + "[base];" + f"[base][{cidx}:v]overlay=x=(W-w)/2:y=H-h-H*0.08:eof_action=pass[v]"
+        if cta.get("sfx_enabled", True):
+            a_parts.append(f"[{cidx+1}:a]{AUDIO_NORM},apad,atrim=0:{dur}[ctafx]")
+            mix_inputs.append("[ctafx]")
     if ducking and "[vox]" in mix_inputs and voice_gain > 0 and len(mix_inputs) > 1:
         beds = [label for label in mix_inputs if label != "[vox]"]
         a_parts.append("[vox]asplit=2[voice_main][voice_key]")
