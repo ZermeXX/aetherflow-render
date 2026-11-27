@@ -28,7 +28,7 @@ SECRET_KEYS = {
 }
 SEG_CACHE_DIR = Path("seg_cache")
 SEG_CACHE_REMOTE = "gdrive:_aether_segcache"
-CACHE_SCHEMA = 20
+CACHE_SCHEMA = 21
 
 try:
     from lower_third_overlay import apply_lower_third_to_clip
@@ -487,8 +487,14 @@ def cta_assets(cfg, dur, w, h, fps, folder, emblem):
     bell = float(cfg.get("bell_sec", start + (end-start)*0.65))
     if not 0 <= start < click < bell < end <= dur:
         raise ValueError("CTA timing must fit native scene")
+    # Quantize visual and audio events to the same output frame clock.
+    start, click, bell, end = (math.ceil(t*fps-1e-8)/fps for t in (start, click, bell, end))
+    end = min(end, dur)
+    if not 0 <= start < click < bell < end <= dur:
+        raise ValueError("CTA events must occupy distinct output frames")
+    print(f"[CTA SYNC] start={start:.6f} click={click:.6f} bell={bell:.6f} end={end:.6f} fps={fps}", flush=True)
     folder.mkdir(parents=True, exist_ok=True)
-    pw, ph = int(w*.76)//2*2, int(h*.13)//2*2
+    pw, ph = int(w*.76)//2*2, int(h*.15)//2*2
     def font(size):
         return ImageFont.truetype("DejaVuSans-Bold.ttf", max(10,int(size)))
     logo = None
@@ -506,7 +512,9 @@ def cta_assets(cfg, dur, w, h, fps, folder, emblem):
             d.text((int(ph*1.05),int(ph*.17)),"HISTOVIVA",font=font(ph*.32),fill="white")
             d.text((int(ph*1.05),int(ph*.60)),"DISCOVER HIDDEN HISTORY",font=font(ph*.13),fill="#CAA65C")
             x=int(pw*.56); y=int(ph*.20); bw=int(pw*.30)
-            d.rounded_rectangle((x,y,x+bw,ph-y),radius=int(ph*.10),fill="#B91C1C" if t<click else "#276749")
+            pulse = math.sin(math.pi*min(1,max(0,(t-click)/.22))) if t>=click else 0
+            inset = int(ph*.045*pulse)
+            d.rounded_rectangle((x+inset,y+inset,x+bw-inset,ph-y-inset),radius=int(ph*.10),fill="#B91C1C" if t<click else "#276749")
             d.text((x+bw//2,ph//2),"SUBSCRIBE" if t<click else "SUBSCRIBED",font=font(ph*.23),fill="white",anchor="mm")
             bx=int(pw*.93); by=int(ph*.48); rad=int(ph*.19)
             icon=Image.new("RGBA",(ph,ph)); q=ImageDraw.Draw(icon)
@@ -517,13 +525,25 @@ def cta_assets(cfg, dur, w, h, fps, folder, emblem):
             q.ellipse((ph//2-ph//18,ph//2+rad+ph//18,ph//2+ph//18,ph//2+rad+ph//6),fill=c)
             angle=15*math.sin((t-bell)*35)*math.exp(-5*(t-bell)) if bell<=t<bell+1 else 0
             im.alpha_composite(icon.rotate(angle,resample=Image.Resampling.BICUBIC),(bx-ph//2,by-ph//2))
-            opacity=min(1,(t-start)/.3,(end-t)/.3)
+            if bell <= t < bell+.65:
+                ring = (t-bell)/.65
+                rr = int(rad*(1.5+ring*.65))
+                ring_layer = Image.new("RGBA", (pw,ph))
+                rd = ImageDraw.Draw(ring_layer)
+                for a0,a1 in ((-50,50),(130,230)):
+                    rd.arc((bx-rr,by-rr,bx+rr,by+rr),a0,a1,fill=(235,198,108,int(220*(1-ring))),width=max(2,ph//45))
+                im.alpha_composite(ring_layer)
+            progress=max(0,min(1,(t-start)/.30,(end-t)/.30))
+            opacity=progress*progress*(3-2*progress)
             im.putalpha(im.getchannel("A").point(lambda a: int(a*opacity)))
+            shifted=Image.new("RGBA",(pw,ph))
+            shifted.alpha_composite(im,(0,int(ph*.18*(1-opacity))))
+            im=shifted
         im.save(folder / f"cta_{i:06d}.png")
     wav=folder/"cta.wav"
     rng=random.Random(81)
     samples=array.array("h")
-    gain=float(cfg.get("sfx_volume",0.5))
+    gain=float(cfg.get("sfx_volume",0.5)) if cfg.get("sfx_enabled", True) else 0.0
     if not math.isfinite(gain) or not 0<=gain<=1:
         raise ValueError("CTA sfx_volume must be 0..1")
     for i in range(round(dur*48000)):
@@ -535,7 +555,8 @@ def cta_assets(cfg, dur, w, h, fps, folder, emblem):
         if 0<=b<.12:
             v+=.18*math.exp(-40*b)*math.sin(2*math.pi*1200*b)
         if 0<=c<1.2:
-            v+=.15*math.exp(-4*c)*(math.sin(2*math.pi*880*c)+.4*math.sin(2*math.pi*1760*c))
+            v+=.15*min(1,c/.008)*math.exp(-4*c)*(math.sin(2*math.pi*880*c)+.4*math.sin(2*math.pi*1760*c)+.15*math.sin(2*math.pi*2640*c))
+        v *= max(0,min(1,(end-t)/.08))
         samples.append(int(max(-1,min(1,v*gain))*32767))
     with wave.open(str(wav),"wb") as f:
         f.setnchannels(1); f.setsampwidth(2); f.setframerate(48000); f.writeframes(samples.tobytes())
