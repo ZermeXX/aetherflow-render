@@ -28,7 +28,7 @@ SECRET_KEYS = {
 }
 SEG_CACHE_DIR = Path("seg_cache")
 SEG_CACHE_REMOTE = "gdrive:_aether_segcache"
-CACHE_SCHEMA = 17
+CACHE_SCHEMA = 18
 
 try:
     from lower_third_overlay import apply_lower_third_to_clip
@@ -259,22 +259,35 @@ def scene_timing(entry, vid_path, voice_path=None, sentence_pad=0.35):
         if not math.isfinite(source) or source <= 0:
             raise ValueError("Invalid native video duration")
         active_end = None
+        decoded = None
         if voice_path:
-            audio = probe(voice_path)["duration"]
-            result = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", "-i", str(voice_path),
-                                     "-af", "silencedetect=noise=-40dB:d=0.15", "-f", "null", "-"],
-                                    check=True, capture_output=True, text=True)
-            starts = re.findall(r"silence_start: ([0-9.]+)", result.stderr)
-            ends = re.findall(r"silence_end: ([0-9.]+)", result.stderr)
-            active_end = audio
-            if starts and ends and float(ends[-1]) >= audio - 0.08:
-                active_end = float(starts[-1])
-            if active_end <= 0:
+            # Decode to PCM: container duration can include MP3 encoder padding.
+            import array
+            raw = subprocess.check_output(["ffmpeg", "-v", "error", "-i", str(voice_path),
+                                           "-map", "0:a:0", "-ac", "1", "-ar", "48000",
+                                           "-f", "f32le", "-"])
+            samples = array.array("f")
+            samples.frombytes(raw)
+            if sys.byteorder != "little":
+                samples.byteswap()
+            decoded = len(samples) / 48000
+            # Conservative -60 dBFS peak threshold, 10 ms blocks.
+            # Keep a 50 ms tail after the last detected signal where available.
+            threshold = 10 ** (-60 / 20)
+            last = len(samples)
+            while last > 0:
+                first = max(0, last - 480)
+                if any(abs(x) >= threshold for x in samples[first:last]):
+                    break
+                last = first
+            if last == 0:
                 raise ValueError("Voiceover appears silent")
+            active_end = min(decoded, last / 48000 + 0.05)
             if active_end > source:
-                raise ValueError(f"Voice exceeds native video: {active_end:.3f}s > {source:.3f}s")
+                raise ValueError(f"Voice exceeds native video after PCM analysis: {active_end:.3f}s > {source:.3f}s (decoded={decoded:.3f}s; review source or explicitly select freeze)")
         return source, {"mode": mode, "source_duration_sec": source, "voice_active_end_sec": active_end,
-                        "voice_start_sec": 0.0, "silence_threshold_db": -40}
+                        "voice_decoded_duration_sec": decoded, "voice_start_sec": 0.0,
+                        "silence_threshold_db": -60, "voice_tail_guard_sec": 0.05}
     dur = float(entry.get("duration_sec") or entry.get("duration") or source or 6.0)
     if voice_path:
         dur = max(dur, probe(voice_path)["duration"] + float(entry.get("voice_start", 0.2)) + sentence_pad)
