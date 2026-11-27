@@ -28,7 +28,7 @@ SECRET_KEYS = {
 }
 SEG_CACHE_DIR = Path("seg_cache")
 SEG_CACHE_REMOTE = "gdrive:_aether_segcache"
-CACHE_SCHEMA = 19
+CACHE_SCHEMA = 20
 
 try:
     from lower_third_overlay import apply_lower_third_to_clip
@@ -587,6 +587,13 @@ def build_segment(entry, idx, assets_dir, folder_id, w, h, fps, preset, crf,
         title = str(lower.get("title") or "").strip()
         text_overlay = location + "\n" + " • ".join(x for x in (era, title) if x)
         text_overlay = text_overlay.strip()
+    lt_cfg = dict(lt_cfg)
+    brand_cfg = dict(lt_cfg.get("brand_identity") or {})
+    brand_visible = entry.get("brand_identity_visible", Path(vid).stem.casefold() != "histoviva_bumper")
+    if not isinstance(brand_visible, bool):
+        raise ValueError("brand_identity_visible must be boolean")
+    brand_cfg["enabled"] = bool(brand_cfg.get("enabled", False)) and brand_visible
+    lt_cfg["brand_identity"] = brand_cfg
     lt_on = (bool(lt_cfg.get("enabled", True)) and bool(text_overlay)) or bool((lt_cfg.get("brand_identity") or {}).get("enabled", False))
     if lt_on and not HAS_LT:
         raise SystemExit("[BRANDING] lower_third_overlay unavailable")
@@ -767,7 +774,7 @@ def measure_loudness(concat_list):
     """Первый проход loudnorm. None, если измерения невалидны или вырождены."""
     res = subprocess.run(
         ["ffmpeg", "-f", "concat", "-safe", "0", "-i", str(concat_list),
-         "-map", "0:a", "-af", "loudnorm=I=-14:TP=-1:LRA=11:print_format=json", "-f", "null", "-"],
+         "-map", "0:a", "-af", "loudnorm=I=-14:TP=-1.5:LRA=11:print_format=json", "-f", "null", "-"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     m = re.findall(r"\{[^{}]*\"input_i\"[^{}]*\}", res.stderr)
     if not m:
@@ -915,7 +922,7 @@ def main():
             "".join(f"file '{p.resolve().as_posix()}'{NL}" for p in segments), encoding="utf-8")
 
         measured = measure_loudness(concat_list)
-        ln = "loudnorm=I=-14:TP=-1:LRA=11"
+        ln = "loudnorm=I=-14:TP=-1.5:LRA=11"
         if measured:
             ln += (f":measured_I={measured['input_i']}:measured_TP={measured['input_tp']}"
                    f":measured_LRA={measured['input_lra']}:measured_thresh={measured['input_thresh']}"
@@ -925,14 +932,16 @@ def main():
         final_cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list),
                      "-map", "0:v", "-map", "0:a", "-c:v", "copy", "-c:a", "aac", "-b:a", f"{audio_bitrate}k",
                      "-ar", "48000", "-ac", "2", "-af", ln, "-movflags", "+faststart", str(final_out)]
+        loudnorm_mode = "two-pass" if measured else "single-pass"
         try:
             run(final_cmd)
         except subprocess.CalledProcessError:
+            loudnorm_mode = "single-pass"
             print("[WARN] Двухпроходный loudnorm отклонён FFmpeg — повторяю финал в однопроходном режиме.",
                   flush=True)
             run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list),
                  "-map", "0:v", "-map", "0:a", "-c:v", "copy", "-c:a", "aac", "-b:a", f"{audio_bitrate}k",
-                 "-ar", "48000", "-ac", "2", "-af", "loudnorm=I=-14:TP=-1:LRA=11",
+                 "-ar", "48000", "-ac", "2", "-af", "loudnorm=I=-14:TP=-1.5:LRA=11",
                  "-movflags", "+faststart", str(final_out)])
 
         total = sum(t["duration"] for t in actual_timings)
@@ -967,7 +976,7 @@ def main():
                 f"- **Resolution:** `{w}x{h} @ {fps}fps`",
                 f"- **Bitrate cap:** `{cap_label}`",
                 f"- **Scenes:** `{len(segments)}`",
-                f"- **Loudness:** `-14 LUFS / -1 dBTP`", "",
+                f"- **Loudness target:** `-14 LUFS / -1.5 dBTP`", "",
                 "## Chapters", "", *chapters, ""]
         (out_dir / "RELEASE_CARD.md").write_text(NL.join(card), encoding="utf-8")
 
@@ -988,11 +997,21 @@ def main():
                 ["-vf", "scale=1280:720", "-c:v", "libx264", "-crf", "24",
                  "-preset", "veryfast", "-c:a", "copy", "-movflags", "+faststart", str(preview)])
 
+        final_measure = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", "-i", str(final_out),
+                                        "-map", "0:a:0", "-af", "loudnorm=I=-14:TP=-1.5:LRA=11:print_format=json",
+                                        "-f", "null", "-"], capture_output=True, text=True, check=True)
+        final_matches = re.findall(r'\{[^{}]*"input_i"[^{}]*\}', final_measure.stderr)
+        final_levels = json.loads(final_matches[-1]) if final_matches else {}
+        def finite_level(key):
+            value = float(final_levels.get(key, "nan"))
+            return value if math.isfinite(value) else None
         qc = {"render_mode": "preview" if args.preview_only else "master", "duration_sec": round(total, 3), "duration_formatted": fmt_clock(total),
-              "integrated_lufs": -14.0, "scenes": len(segments),
+              "integrated_lufs": finite_level("input_i"), "true_peak_dbtp": finite_level("input_tp"),
+              "loudness_range_lu": finite_level("input_lra"), "target_lufs": -14.0, "target_true_peak_dbtp": -1.5,
+              "scenes": len(segments),
               "resolution": f"{w}x{h}", "fps": fps, "file_size_mb": size_mb,
               "bitrate_cap_mbps": maxrate_mbps,
-              "loudnorm_mode": "two-pass" if measured else "single-pass",
+              "loudnorm_mode": loudnorm_mode,
               "encode_speed_x": round((content_done / 60.0) / max((time.monotonic() - t0) / 60.0, 0.01), 3)}
         Path("qc_report.json").write_text(json.dumps(qc, ensure_ascii=False, indent=2), encoding="utf-8")
     finally:
