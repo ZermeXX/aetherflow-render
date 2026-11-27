@@ -2,11 +2,8 @@ name: Renderer V8.1 Regression
 on:
   push:
     branches: [main]
-    paths:
-      - 'assemble_scenes.py'
-      - 'lower_third_overlay.py'
-      - 'tests/test_renderer_v81.py'
-      - '.github/workflows/renderer-regression.yml'
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 permissions:
   contents: read
