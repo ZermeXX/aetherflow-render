@@ -10,6 +10,13 @@ on:
         description: 'Optional manifest JSON filename on Google Drive (fallback if payload omitted)'
         required: false
         default: 'manifest.json'
+      render_mode:
+        description: 'Direct 720p preview or full master render'
+        type: choice
+        options:
+          - master
+          - preview
+        default: master
       preflight_only:
         description: 'Run asset preflight verification only'
         required: false
@@ -18,6 +25,7 @@ permissions:
   contents: read
 env:
   PYTHONUNBUFFERED: '1'
+  RENDER_MODE: ${{ inputs.render_mode || 'master' }}
   AETHER_BUDGET_MINUTES: '330'
 jobs:
   render:
@@ -52,7 +60,7 @@ jobs:
           ffmpeg -hide_banner -encoders > /tmp/aether-encoders.txt
           grep -q libx264 /tmp/aether-encoders.txt
           ffmpeg -hide_banner -filters > /tmp/aether-filters.txt
-          for filter in zoompan overlay loudnorm alimiter fade; do
+          for filter in zoompan overlay loudnorm alimiter fade sidechaincompress silencedetect; do
             grep -wq "$filter" /tmp/aether-filters.txt
           done
       - name: Setup Personal Rclone Config
@@ -194,7 +202,11 @@ jobs:
       - name: Assemble Scenes with FFmpeg
         if: ${{ github.event.inputs.preflight_only != 'true' }}
         run: |
-          python3 assemble_scenes.py manifest.json --assets-dir assets
+          if [ "$RENDER_MODE" = preview ]; then
+            python3 assemble_scenes.py manifest.json --assets-dir assets --preview-only
+          else
+            python3 assemble_scenes.py manifest.json --assets-dir assets
+          fi
       - name: Run Auto-QC, SRT, Chapters, Shorts & Release Card
         if: ${{ github.event.inputs.preflight_only != 'true' }}
         run: |
@@ -206,7 +218,9 @@ jobs:
           project_name = str(manifest.get("project_name") or "output").strip()
           out_dir = Path("output")
           out_dir.mkdir(parents=True, exist_ok=True)
-          final_video = out_dir / f"{project_name}.mp4"
+          import os
+          preview_only = os.environ.get("RENDER_MODE") == "preview"
+          final_video = out_dir / (f"{project_name}_720p_preview.mp4" if preview_only else f"{project_name}.mp4")
           if not final_video.is_file():
               raise SystemExit(f"[AUTO-QC] Output video not found: {final_video}")
           chapters = manifest.get("chapters_youtube") or []
@@ -245,7 +259,9 @@ jobs:
               ["ffprobe", "-v", "error", "-show_entries", "format=duration",
                "-of", "default=noprint_wrappers=1:nokey=1", str(preview)], text=True))
           limit = float((manifest.get("export_settings") or {}).get("preview_duration_sec") or 0)
-          expected_preview = min(dur_sec, limit) if limit > 0 else dur_sec
+          expected_preview = min(dur_sec, limit) if limit > 0 and not preview_only else dur_sec
+          if preview_only and (video.get("width"), video.get("height")) != (1280, 720):
+              raise SystemExit("[AUTO-QC] Direct preview must be 1280x720")
           if abs(preview_duration - expected_preview) > 0.25:
               raise SystemExit("[AUTO-QC] Preview duration mismatch")
           size_mb = round(final_video.stat().st_size / (1024 * 1024), 2)
@@ -270,6 +286,7 @@ jobs:
           PROJECT_NAME=$(python3 -c 'import json; print(json.load(open("manifest.json"))["project_name"])')
           FOLDER_ID=$(python3 -c 'import json, os; m=json.load(open("manifest.json")); print((m.get("gdrive_folder_id") or (m.get("cloud_export") or {}).get("target_folder_id") or os.environ.get("DEFAULT_FOLDER_ID", "")).strip())')
           DEST_DIR="gdrive:_RENDER_OUTPUT_${PROJECT_NAME}"
+          if [ "$RENDER_MODE" = preview ]; then DEST_DIR="${DEST_DIR}_PREVIEW"; fi
           ROOT_ARGS=()
           if [ -n "$FOLDER_ID" ]; then ROOT_ARGS=(--drive-root-folder-id "$FOLDER_ID"); fi
           # Pacing против Google anti-bot троттлинга: 1 transfer, лимит tps, крупный chunk.
@@ -303,7 +320,7 @@ jobs:
             echo "[UPLOAD] WARN: optional metadata not uploaded (non-fatal): $src"
             return 0
           }
-          upload "output/${PROJECT_NAME}.mp4" 1
+          if [ "$RENDER_MODE" != preview ]; then upload "output/${PROJECT_NAME}.mp4" 1; fi
           upload "output/${PROJECT_NAME}_720p_preview.mp4" 1
           upload "output/${PROJECT_NAME}_EN.srt" 0
           upload "output/${PROJECT_NAME}_RU.srt" 0
@@ -349,7 +366,7 @@ jobs:
               qc = json.loads(Path("qc_report.json").read_text(encoding="utf-8"))
               qc_info = f"\n⏱ Длительность: {qc.get('duration_formatted', '?')} | 📦 Размер: {qc.get('file_size_mb', '?')} MB | 🎬 Сцен: {qc.get('scenes', '?')}"
           icon = "✅" if status == "success" else "❌"
-          msg = f"{icon} AetherFlow Render ({status}) для {project}.{qc_info}\n🔗 {run_url}"
+          msg = f"{icon} AetherFlow Render [{os.environ.get('RENDER_MODE', 'master')}] ({status}) для {project}.{qc_info}\n🔗 {run_url}"
           payload = json.dumps({"chat_id": chat, "text": msg}).encode("utf-8")
           req = urllib.request.Request(
               f"https://api.telegram.org/bot{bot}/sendMessage",
