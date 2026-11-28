@@ -20,3 +20,11 @@ class RunnerIdentityTests(unittest.TestCase):
         for patch in ({"EXPECTED_SHA":"0"*40},{"GITHUB_SHA":"0"*40},{"EXPECTED_SHA":""},{"REQUEST_ID":"invalid"},{"PREFLIGHT_ONLY":"false"}):
             with self.subTest(patch=patch):
                 self.assertNotEqual(run(patch).returncode,0)
+
+    def test_strict_preflight_has_no_publication_side_effects(self):
+        workflow=yaml.safe_load(Path(".github/workflows/render_loop.yml").read_text())
+        steps={s["name"]:s for s in workflow["jobs"]["render_and_upload"]["steps"]}
+        for name in ("Upload QC artifacts","Send Telegram Notification"):
+            self.assertEqual(steps[name]["if"],"always() && inputs.strict_project_contract != 'true'")
+        for name in ("Build and Run FFmpeg Pipeline","Generate Vertical Shorts & Release Card","Upload Output Video, Shorts & Metadata to Google Drive"):
+            self.assertEqual(steps[name]["if"],"github.event.inputs.preflight_only != 'true'")
