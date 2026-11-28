@@ -10,6 +10,10 @@ on:
         description: 'JSON or Base64 payload from Web Studio'
         required: false
         default: '{}'
+      strict_project_contract:
+        description: 'Require explicit project manifest and folder (V9)'
+        required: false
+        default: 'false'
       preflight_only:
         description: 'Check assets on Google Drive without rendering'
         required: false
@@ -56,6 +60,7 @@ jobs:
       - name: Parse and Sanitize Studio Manifest Payload
         env:
           RAW_PAYLOAD: ${{ github.event.inputs.manifest_payload }}
+          STRICT_PROJECT: ${{ github.event.inputs.strict_project_contract }}
         run: |
           python3 - << 'EOF'
           import os, base64, json, shutil, subprocess
@@ -79,6 +84,12 @@ jobs:
                       print("Received Base64 manifest from Web Studio.")
                   except Exception:
                       data = None
+          strict = os.environ.get("STRICT_PROJECT") == "true"
+          if strict:
+              if not isinstance(data, dict) or not data:
+                  raise RuntimeError("Strict project contract requires explicit manifest")
+              from strict_project_contract import validate_manifest
+              validate_manifest(data)
           if data is None:
               if os.path.exists("assembly_manifest_metel_3h.json"):
                   shutil.copy("assembly_manifest_metel_3h.json", "manifest.json")
@@ -103,9 +114,11 @@ jobs:
           EOF
           ls -lh manifest.json
       - name: Preflight Asset Check
+        env:
+          STRICT_PROJECT: ${{ github.event.inputs.strict_project_contract }}
         run: |
           python3 - << 'EOF'
-          import json, subprocess
+          import json, subprocess, os
           m = json.load(open("manifest.json", encoding="utf-8"))
           folder_id = (m.get("cloud_export") or {}).get("target_folder_id", "1OuuxKa85KAR-zz9TFXv6Ccg99fZ6JpuK")
           slots = m.get("timeline_slots") or []
@@ -123,6 +136,9 @@ jobs:
           if empty:
               raise SystemExit(f"P0-GUARD: пустые file_name в слотах {empty}. Заполните их в Studio.")
           out = subprocess.check_output(["rclone","lsf","gdrive:","--drive-root-folder-id",folder_id]).decode().splitlines()
+          if os.environ.get('STRICT_PROJECT') == 'true':
+              from strict_project_contract import validate_listing
+              validate_listing(needed, out)
           existing = {x.strip().lower() for x in out if x.strip()}
           missing = sorted(n for n in needed if n.lower() not in existing)
           if missing:
