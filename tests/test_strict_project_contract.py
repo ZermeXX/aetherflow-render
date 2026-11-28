@@ -17,3 +17,34 @@ class StrictProjectContractTests(unittest.TestCase):
     def test_listing_rejects_case_and_duplicates(self):
         for listing in (["BASE.mp4","insert.mp4"],["base.mp4","base.mp4","insert.mp4"],["base.mp4","BASE.mp4","insert.mp4"],["base.mp4"]):
             with self.assertRaises(ValueError): validate_listing({"base.mp4","insert.mp4"},listing)
+
+class DownloadedAssetTests(unittest.TestCase):
+    def test_every_asset_probed_and_invalid_media_rejected(self):
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from strict_project_contract import verify_downloaded_assets
+        with TemporaryDirectory() as directory:
+            root=Path(directory)
+            for name in ("base.mp4","insert.mp4"):
+                (root/name).write_bytes(b"fixture")
+            seen=[]
+            def probe(path):
+                seen.append(path.name)
+                return {"format":{"duration":"1.0"},"streams":[{"codec_type":"video"}]}
+            self.assertEqual(verify_downloaded_assets({"base.mp4","insert.mp4"},root,probe),2)
+            self.assertEqual(seen,["base.mp4","insert.mp4"])
+            for info in ({"format":{"duration":"nan"},"streams":[{"codec_type":"video"}]},
+                         {"format":{"duration":"0"},"streams":[{"codec_type":"video"}]},
+                         {"format":{"duration":"1"},"streams":[{"codec_type":"audio"}]}):
+                with self.assertRaises(ValueError):
+                    verify_downloaded_assets({"insert.mp4"},root,lambda _:info)
+            (root/"insert.mp4").unlink()
+            with self.assertRaises(ValueError):
+                verify_downloaded_assets({"insert.mp4"},root,probe)
+            (root/"insert.mp4").write_bytes(b"")
+            with self.assertRaises(ValueError):
+                verify_downloaded_assets({"insert.mp4"},root,probe)
+            (root/"insert.mp4").unlink()
+            (root/"insert.mp4").symlink_to(root/"base.mp4")
+            with self.assertRaises(ValueError):
+                verify_downloaded_assets({"insert.mp4"},root,probe)
