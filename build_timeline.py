@@ -276,7 +276,10 @@ def build_smart_concat(built_slots, raw_concat_out, fps, v_codec, preset, crf, a
     with open(master_list, "w", encoding="utf-8") as f:
         for p in concat_parts:
             f.write(f"file '{os.path.abspath(p)}'\n")
-    run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", master_list, "-c", "copy", raw_concat_out])
+    # Independently encoded AAC segments can overlap at concat boundaries.
+    # Rebuild the audio sample clock before muxing; keep the video stream untouched.
+    run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", master_list,
+         "-c:v", "copy", "-af", "asetpts=N/SR/TB"] + aenc + [raw_concat_out])
     for p in concat_parts:
         safe_remove(p)
     safe_remove(master_list)
