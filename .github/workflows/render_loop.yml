@@ -289,7 +289,7 @@ jobs:
           echo "QC_SUMMARY=$QC_SUMMARY" >> $GITHUB_ENV
           echo "SHORTS_COUNT=$SHORTS_COUNT" >> $GITHUB_ENV
       - name: Upload QC artifacts
-        if: always()
+        if: always() && inputs.strict_project_contract != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: render-metadata
@@ -300,7 +300,7 @@ jobs:
             generated_shorts.txt
           if-no-files-found: ignore
       - name: Send Telegram Notification
-        if: always()
+        if: always() && inputs.strict_project_contract != 'true'
         env:
           JOB_STATUS: ${{ job.status }}
           PREFLIGHT: ${{ github.event.inputs.preflight_only }}
