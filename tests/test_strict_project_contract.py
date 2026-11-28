@@ -48,3 +48,20 @@ class DownloadedAssetTests(unittest.TestCase):
             (root/"insert.mp4").symlink_to(root/"base.mp4")
             with self.assertRaises(ValueError):
                 verify_downloaded_assets({"insert.mp4"},root,probe)
+
+    def test_real_ffprobe_video_and_audio_only(self):
+        import subprocess
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from strict_project_contract import verify_downloaded_assets
+        with TemporaryDirectory() as directory:
+            root=Path(directory)
+            for name in ("base.mp4","insert.mp4"):
+                subprocess.run(["ffmpeg","-v","error","-y","-f","lavfi","-i","color=c=blue:s=64x64:r=24:d=1","-c:v","libx264","-pix_fmt","yuv420p",str(root/name)],check=True)
+            self.assertEqual(verify_downloaded_assets({"base.mp4","insert.mp4"},root),2)
+            subprocess.run(["ffmpeg","-v","error","-y","-f","lavfi","-i","sine=frequency=440:duration=1","-c:a","aac",str(root/"audio.mp4")],check=True)
+            with self.assertRaises(ValueError):
+                verify_downloaded_assets({"audio.mp4"},root)
+            (root/"corrupt.mp4").write_bytes(b"not a video")
+            with self.assertRaises(subprocess.CalledProcessError):
+                verify_downloaded_assets({"corrupt.mp4"},root)
