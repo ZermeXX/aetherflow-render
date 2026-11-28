@@ -31,3 +31,27 @@ def validate_listing(needed,listing):
     for name in needed:
         if exact[name]!=1 or counts[name.casefold()]!=1:
             raise ValueError("Missing or ambiguous exact Drive asset: "+name)
+
+def verify_downloaded_assets(needed, directory, probe=None):
+    """Verify exact local names and media metadata; never substitute another file."""
+    import json
+    import math
+    import subprocess
+    from pathlib import Path
+    root=Path(directory)
+    if probe is None:
+        def probe(path):
+            return json.loads(subprocess.check_output(
+                ["ffprobe","-v","error","-show_entries","format=duration:stream=codec_type",
+                 "-of","json",str(path)], text=True))
+    for name in sorted(needed):
+        validate_name(name)
+        path=root/name
+        if not path.is_file() or path.is_symlink() or path.stat().st_size<=0:
+            raise ValueError("Missing or empty downloaded asset: "+name)
+        info=probe(path)
+        duration=float(info.get("format",{}).get("duration",0))
+        if not math.isfinite(duration) or duration<=0 or not any(
+                s.get("codec_type")=="video" for s in info.get("streams",[])):
+            raise ValueError("Invalid video asset: "+name)
+    return len(needed)
