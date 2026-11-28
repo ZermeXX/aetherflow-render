@@ -149,14 +149,29 @@ jobs:
           print(f"✅ All {len(needed)} source clips and inserts verified on Google Drive!")
           EOF
       - name: Download Source Clips (only needed files)
+        env:
+          STRICT_PROJECT: ${{ github.event.inputs.strict_project_contract }}
         run: |
           FOLDER_ID=$(jq -r '.cloud_export.target_folder_id // "1OuuxKa85KAR-zz9TFXv6Ccg99fZ6JpuK"' manifest.json)
           mkdir -p input_clips
+          CASE_FLAGS=()
+          if [ "$STRICT_PROJECT" != "true" ]; then CASE_FLAGS+=(--ignore-case); fi
           rclone copy gdrive: ./input_clips --drive-root-folder-id "$FOLDER_ID" \
-            --include-from needed_assets.txt --ignore-case --transfers 4 --tpslimit 4 -v
+            --include-from needed_assets.txt "${CASE_FLAGS[@]}" --transfers 4 --tpslimit 4 -v
           ls -lh input_clips
+      - name: Strict Project Media Verification
+        if: github.event.inputs.strict_project_contract == 'true'
+        run: |
+          python3 - << 'EOF'
+          import json
+          from strict_project_contract import validate_manifest, verify_downloaded_assets
+          with open("manifest.json", encoding="utf-8") as f:
+              names = validate_manifest(json.load(f))
+          count = verify_downloaded_assets(names, "input_clips")
+          print(f"STRICT_PROJECT_MEDIA_PASS {count}")
+          EOF
       - name: Preflight Probe (local sources)
-        if: github.event.inputs.preflight_only == 'true'
+        if: github.event.inputs.preflight_only == 'true' && github.event.inputs.strict_project_contract != 'true'
         run: |
           python3 - << 'EOF'
           import json, os, subprocess
