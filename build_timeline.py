@@ -141,6 +141,7 @@ def apply_inserts_surgical(base_video, inserts, slot_start_sec, out_video, width
         os.replace(base_video, out_video)
         return
     current_vid = base_video
+    segment_encode = ["-c:v", v_codec, "-preset", preset, "-crf", crf, "-pix_fmt", "yuv420p", "-g", str(fps * 2), "-keyint_min", str(fps * 2), "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", a_bitrate]
     for idx, ins in enumerate(inserts):
         ins_file = ensure_asset(ins["file_name"], folder_id)
         ins_has_audio = has_audio_stream(ins_file)
@@ -164,7 +165,7 @@ def apply_inserts_surgical(base_video, inserts, slot_start_sec, out_video, width
         step_out = os.path.join(WORK_DIR, f"ins_{idx}_{os.path.basename(out_video)}")
         concat_segments = []
         if win_start > 0.5:
-            run(["ffmpeg", "-y", "-ss", "0", "-to", f"{win_start:.3f}", "-i", current_vid, "-c", "copy", part_pre])
+            run(["ffmpeg", "-y", "-ss", "0", "-to", f"{win_start:.3f}", "-i", current_vid] + segment_encode + [part_pre])
             concat_segments.append(part_pre)
         else:
             win_start = 0.0
@@ -177,7 +178,7 @@ def apply_inserts_surgical(base_video, inserts, slot_start_sec, out_video, width
         ])
         v_chain = (
             f"[1:v]scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},"
-            f"fps={fps},format=yuva420p"
+            f"fps={fps},trim=duration={ins_dur},setpts=PTS-STARTPTS,format=yuva420p"
         )
         if fade_in > 0:
             v_chain += f",fade=t=in:st=0:d={fade_in}:alpha=1"
@@ -186,7 +187,7 @@ def apply_inserts_surgical(base_video, inserts, slot_start_sec, out_video, width
         v_chain += f",setpts=PTS-STARTPTS+{local_offset:.3f}/TB[ov_v];"
         delay_ms = int(local_offset * 1000)
         if ins_has_audio:
-            a_chain = "[1:a]aresample=48000"
+            a_chain = f"[1:a]aresample=48000,atrim=duration={ins_dur},asetpts=PTS-STARTPTS"
             if fade_in > 0:
                 a_chain += f",afade=t=in:st=0:d={fade_in}"
             if fade_out > 0:
@@ -212,7 +213,7 @@ def apply_inserts_surgical(base_video, inserts, slot_start_sec, out_video, width
         run(mid_cmd)
         concat_segments.append(part_mid_ov)
         if base_dur - win_end > 0.5:
-            run(["ffmpeg", "-y", "-ss", f"{win_end:.3f}", "-to", f"{base_dur:.3f}", "-i", current_vid, "-c", "copy", part_post])
+            run(["ffmpeg", "-y", "-ss", f"{win_end:.3f}", "-to", f"{base_dur:.3f}", "-i", current_vid] + segment_encode + [part_post])
             concat_segments.append(part_post)
         seg_list = os.path.join(WORK_DIR, f"seg_{idx}_{os.path.basename(out_video)}.txt")
         with open(seg_list, "w", encoding="utf-8") as f:
@@ -237,7 +238,7 @@ def build_smart_concat(built_slots, raw_concat_out, fps, v_codec, preset, crf, a
     aenc = ["-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", a_bitrate]
     for i in range(n):
         path, _, cf_out = built_slots[i]
-        actual_dur = durations[i]
+        actual_dur = min(durations[i], built_slots[i][1])
         cf_before = built_slots[i - 1][2] if i > 0 else 0.0
         cf_after = cf_out if i < n - 1 else 0.0
         body_start = cf_before
@@ -387,7 +388,7 @@ def main():
     free = shutil.disk_usage(".").free
     est = expected_total_sec * (3.0 if manifest.get("content_profile", "ambience") == "ambience" else 18.0) * 1e6 / 8
     ln = "loudnorm=I=-16.0:TP=-3.0:LRA=11.0"
-    base = ["ffmpeg", "-y", "-i", raw_master, "-c:v", "copy", "-af", ln,
+    base = ["ffmpeg", "-y", "-i", raw_master, "-c:v", "copy", "-af", "aresample=async=1:first_pts=0," + ln,
             "-c:a", "aac", "-b:a", a_bitrate, "-ar", "48000"]
     streamed = False
     if est > free * 0.7:
