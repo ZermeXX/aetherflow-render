@@ -1,4 +1,5 @@
 name: Render Loop Pipeline
+run-name: ${{ inputs.strict_project_contract == 'true' && format('Strict preflight {0}', inputs.request_id) || 'Render Loop Pipeline' }}
 on:
   workflow_dispatch:
     inputs:
@@ -14,6 +15,14 @@ on:
         description: 'Require explicit project manifest and folder (V9)'
         required: false
         default: 'false'
+      expected_renderer_sha:
+        description: 'Expected immutable renderer commit for strict V9 request'
+        required: false
+        default: ''
+      request_id:
+        description: 'Unique V9 preflight request identifier'
+        required: false
+        default: ''
       preflight_only:
         description: 'Check assets on Google Drive without rendering'
         required: false
@@ -30,6 +39,20 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+      - name: Strict Project Dispatch Identity Guard
+        if: inputs.strict_project_contract == 'true'
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_renderer_sha }}
+          REQUEST_ID: ${{ inputs.request_id }}
+          PREFLIGHT_ONLY: ${{ inputs.preflight_only }}
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$REQUEST_ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]
+          [[ "$EXPECTED_SHA" == "$GITHUB_SHA" ]]
+          [[ "$EXPECTED_SHA" == "$(git rev-parse HEAD)" ]]
+          [[ "$PREFLIGHT_ONLY" == "true" ]]
+          echo "STRICT_DISPATCH_IDENTITY_PASS $REQUEST_ID"
       - name: Record Start Time
         run: echo "START_TS=$(date +%s)" >> $GITHUB_ENV
       - name: Free Disk Space on Runner
